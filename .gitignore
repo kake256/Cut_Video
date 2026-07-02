@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 生成データ (インデックス・プレビュー・切り抜き)
+data/
+clips/
+
+# 入力動画 (サイズが大きいため各自配置)
+video/
+
+# OS
+Thumbs.db
+.DS_Store
+.claude/

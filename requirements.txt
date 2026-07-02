@@ -1,0 +1,9 @@
+faster-whisper>=1.0.0
+FlagEmbedding>=1.2.10
+# pyarrow>=21はWindowsでimport時にaccess violationを起こすため固定 (datasetsも整合バージョンに)
+pyarrow==16.1.0
+datasets==3.6.0
+faiss-cpu>=1.8.0
+numpy>=1.26
+gradio>=6.0
+torch>=2.1

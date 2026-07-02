@@ -1,0 +1,455 @@
+#!/usr/bin/env python
+"""動画シーン検索GUI (Gradio)。
+
+    python app.py
+
+「検索・切り抜き」タブ: 検索 → 結果選択 → プレビュー → 手動調整 → 保存。
+「動画の追加」タブ: 新規動画の文字起こし〜インデックス化をWebUIから実行。
+"""
+import threading
+from pathlib import Path
+
+import gradio as gr
+
+from cut_clip import cut_clip
+from index_video import IndexError_, run_indexing
+from moment_retrieval import config, db, utils
+from moment_retrieval.embedder import TextEmbedder
+from moment_retrieval.refine import expand_to_speech_boundary
+from moment_retrieval.vector_index import VectorIndex
+
+PREVIEW_DIR = Path("data/previews")
+DEFAULT_CLIPS_DIR = "clips"
+
+ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
+
+_embedder = None
+_index_lock = threading.Lock()
+
+
+def get_embedder() -> TextEmbedder:
+    global _embedder
+    if _embedder is None:
+        _embedder = TextEmbedder()
+    return _embedder
+
+
+# ---------- ネイティブのファイル/フォルダ選択ダイアログ (ローカルアプリ前提) ----------
+
+def _tk_dialog(kind: str) -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        if kind == "folder":
+            path = filedialog.askdirectory(title="保存先フォルダを選択")
+        else:
+            path = filedialog.askopenfilename(
+                title="動画ファイルを選択",
+                filetypes=[("動画", "*.mp4 *.mkv *.webm *.mov *.avi *.ts *.m4a *.mp3 *.wav"), ("すべて", "*.*")],
+            )
+    finally:
+        root.destroy()
+    return path or ""
+
+
+def browse_folder(current: str) -> str:
+    path = _tk_dialog("folder")
+    return path if path else current
+
+
+def browse_video(current: str) -> str:
+    path = _tk_dialog("file")
+    return path if path else current
+
+
+# ---------- 検索・切り抜き ----------
+
+def list_video_choices() -> list:
+    conn = db.get_conn()
+    db.init_db(conn)
+    videos = db.list_videos(conn)
+    conn.close()
+    choices = ["(すべての動画)"]
+    for v in videos:
+        name = Path(v["path"]).name
+        choices.append(f"{v['video_id']}  ({name}, {utils.format_timestamp(v['duration'])})")
+    return choices
+
+
+def parse_video_choice(choice: str) -> str:
+    if not choice or choice.startswith("("):
+        return None
+    return choice.split()[0]
+
+
+def region_transcript(conn, video_id: str, start: float, end: float) -> str:
+    rows = conn.execute(
+        "SELECT text FROM asr_segments WHERE video_id = ? AND end_sec > ? AND start_sec < ? "
+        "ORDER BY start_sec",
+        (video_id, start, end),
+    ).fetchall()
+    return " ".join(r["text"] for r in rows)
+
+
+def do_search(query: str, video_choice: str, top_k: int, min_score: float):
+    if not query.strip():
+        return [], gr.update(choices=[], value=None), []
+    if not config.TEXT_INDEX_PATH.exists():
+        raise gr.Error("インデックスがありません。「動画の追加」タブで動画を登録してください。")
+
+    video_filter = parse_video_choice(video_choice)
+
+    conn = db.get_conn()
+    db.init_db(conn)
+
+    query_vec = get_embedder().encode([query])
+    vindex = VectorIndex.load(config.TEXT_INDEX_PATH, query_vec.shape[1])
+    fetch_k = int(top_k) * 5 if video_filter else int(top_k)
+    scores, ids = vindex.search(query_vec, top_k=fetch_k)
+
+    chunks = db.get_chunks_by_ids(conn, [int(i) for i in ids if i != -1])
+
+    results = []
+    for cid, score in zip(ids, scores):
+        cid = int(cid)
+        if cid == -1 or cid not in chunks or float(score) < min_score:
+            continue
+        c = chunks[cid]
+        if video_filter and c["video_id"] != video_filter:
+            continue
+        results.append(
+            {
+                "video_id": c["video_id"],
+                "start": c["start_sec"],
+                "end": c["end_sec"],
+                "score": float(score),
+                "text": c["text"],
+            }
+        )
+        if len(results) >= int(top_k):
+            break
+
+    conn.close()
+    if not results:
+        gr.Info("該当するシーンが見つかりませんでした。")
+        return [], gr.update(choices=[], value=None), []
+
+    table = [
+        [
+            i + 1,
+            r["video_id"],
+            utils.format_timestamp(r["start"]),
+            utils.format_timestamp(r["end"]),
+            f"{r['score']:.3f}",
+            r["text"][:60] + ("..." if len(r["text"]) > 60 else ""),
+        ]
+        for i, r in enumerate(results)
+    ]
+    choices = [
+        f"{i + 1}. {utils.format_timestamp(r['start'])} {r['text'][:30]}"
+        for i, r in enumerate(results)
+    ]
+    return table, gr.update(choices=choices, value=choices[0]), results
+
+
+def make_preview(video_path: str, start: float, end: float, duration: float) -> str:
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    out = PREVIEW_DIR / f"preview_{int(start * 10)}_{int(end * 10)}.mp4"
+    if not out.exists():
+        cut_clip(Path(video_path), start, end, out, pad=0.0, precise=False, duration=duration)
+    return str(out)
+
+
+def on_select(selection: str, results: list):
+    if not selection or not results:
+        return None, gr.update(), gr.update(), gr.update(), gr.update(), None, "", ""
+    idx = int(selection.split(".")[0]) - 1
+    r = results[idx]
+
+    conn = db.get_conn()
+    video = db.get_video(conn, r["video_id"])
+    start, end = expand_to_speech_boundary(conn, r["video_id"], r["start"], r["end"])
+    if not video:
+        conn.close()
+        raise gr.Error(f"動画が見つかりません: {r['video_id']}")
+    transcript = region_transcript(conn, r["video_id"], start, end)
+    conn.close()
+
+    duration = video["duration"]
+    preview = make_preview(video["path"], start, end, duration)
+    info = (
+        f"動画: {video['path']}\n"
+        f"ヒット区間: {utils.format_timestamp(r['start'])} - {utils.format_timestamp(r['end'])}\n"
+        f"拡張後: {utils.format_timestamp(start)} - {utils.format_timestamp(end)} "
+        f"(長さ {end - start:.1f} 秒)"
+    )
+    ctx = {"video_path": video["path"], "duration": duration, "video_id": r["video_id"]}
+    return (
+        preview,
+        round(start, 1),
+        round(end, 1),
+        gr.update(minimum=0, maximum=round(duration, 1), value=round(start, 1)),
+        gr.update(minimum=0, maximum=round(duration, 1), value=round(end, 1)),
+        ctx,
+        info,
+        transcript,
+    )
+
+
+def refresh_preview(start: float, end: float, ctx: dict):
+    if not ctx:
+        raise gr.Error("先に検索結果を選択してください。")
+    if end <= start:
+        raise gr.Error("終了は開始より後にしてください。")
+    preview = make_preview(ctx["video_path"], start, end, ctx["duration"])
+    conn = db.get_conn()
+    transcript = region_transcript(conn, ctx["video_id"], start, end)
+    conn.close()
+    info = (
+        f"動画: {ctx['video_path']}\n"
+        f"区間: {utils.format_timestamp(start)} - {utils.format_timestamp(end)} "
+        f"(長さ {end - start:.1f} 秒)"
+    )
+    return preview, info, transcript
+
+
+def adjust_time(value: float, ctx: dict, delta: float):
+    hi = ctx["duration"] if ctx else None
+    v = (value or 0) + delta
+    v = max(0.0, v)
+    if hi is not None:
+        v = min(v, hi)
+    return round(v, 1)
+
+
+def maybe_refresh(auto: bool, start: float, end: float, ctx: dict):
+    if not auto or not ctx or end <= start:
+        return gr.update(), gr.update(), gr.update()
+    return refresh_preview(start, end, ctx)
+
+
+def always_refresh(start: float, end: float, ctx: dict):
+    """シークバー用: 選択済みなら常にプレビューを更新する。"""
+    if not ctx or end <= start:
+        return gr.update(), gr.update(), gr.update()
+    return refresh_preview(start, end, ctx)
+
+
+def on_save(start: float, end: float, ctx: dict, precise: bool, out_dir: str, filename: str):
+    if not ctx:
+        raise gr.Error("先に検索結果を選択してください。")
+    if end <= start:
+        raise gr.Error("終了は開始より後にしてください。")
+
+    out_dir = Path(out_dir.strip() or DEFAULT_CLIPS_DIR)
+    name = filename.strip()
+    if not name:
+        name = f"{ctx['video_id']}_{int(start)}_{int(end)}"
+    if not name.lower().endswith(".mp4"):
+        name += ".mp4"
+
+    out = out_dir / name
+    if out.exists():
+        raise gr.Error(f"既に存在します: {out} (ファイル名を変えてください)")
+
+    cut_clip(
+        Path(ctx["video_path"]), start, end, out,
+        pad=0.0, precise=precise, duration=ctx["duration"],
+    )
+    gr.Info(f"保存しました: {out}")
+    return str(out.resolve())
+
+
+# ---------- 動画の追加 (インデックス作成) ----------
+
+def do_index(video_path: str, asr_model: str, force: bool):
+    """新規動画をインデックス化する。進捗ログをストリーミング表示する。"""
+    if not video_path.strip():
+        raise gr.Error("動画ファイルを指定してください。")
+    if not _index_lock.acquire(blocking=False):
+        raise gr.Error("別のインデックス処理が実行中です。完了までお待ちください。")
+
+    log_lines = ["インデックス処理を開始します。ASRモデルの初回ロードには数分かかることがあります。"]
+    try:
+        yield "\n".join(log_lines), gr.update()
+        for msg in run_indexing(
+            video=Path(video_path.strip()), force=force, asr_model=asr_model
+        ):
+            log_lines.append(msg)
+            yield "\n".join(log_lines), gr.update()
+        gr.Info("インデックス作成が完了しました。")
+        yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+    except IndexError_ as e:
+        log_lines.append(f"エラー: {e}")
+        yield "\n".join(log_lines), gr.update()
+    finally:
+        _index_lock.release()
+
+
+def build_adjust_row(label: str, target_number, ctx_state, auto_chk, preview_io, slider):
+    with gr.Row():
+        gr.Markdown(f"**{label}**")
+        for step in [-s for s in reversed(ADJUST_STEPS)] + ADJUST_STEPS:
+            btn = gr.Button(f"{step:+g}", size="sm", min_width=40)
+            btn.click(
+                adjust_time,
+                inputs=[target_number, ctx_state, gr.State(step)],
+                outputs=[target_number],
+            ).then(
+                lambda v: gr.update(value=v), inputs=[target_number], outputs=[slider]
+            ).then(
+                maybe_refresh,
+                inputs=[auto_chk] + preview_io["inputs"],
+                outputs=preview_io["outputs"],
+            )
+
+
+with gr.Blocks(title="動画シーン検索") as demo:
+    gr.Markdown("# 動画シーン検索・切り抜き")
+
+    with gr.Tab("検索・切り抜き"):
+        results_state = gr.State([])
+        ctx_state = gr.State(None)
+
+        with gr.Row():
+            video_select = gr.Dropdown(
+                choices=list_video_choices(),
+                value="(すべての動画)",
+                label="検索対象の動画",
+                scale=3,
+            )
+            reload_btn = gr.Button("動画リスト更新", scale=1)
+
+        with gr.Row():
+            query_box = gr.Textbox(
+                label="検索クエリ", placeholder="例: 奨学金について話しているところ", scale=4
+            )
+            search_btn = gr.Button("検索", variant="primary", scale=1)
+        with gr.Row():
+            top_k = gr.Slider(1, 20, value=5, step=1, label="候補数")
+            min_score = gr.Slider(0.0, 1.0, value=config.MIN_SCORE, step=0.01, label="類似度閾値")
+
+        result_table = gr.Dataframe(
+            headers=["#", "動画", "開始", "終了", "スコア", "テキスト"],
+            interactive=False,
+            label="検索結果",
+        )
+        result_select = gr.Radio(choices=[], label="切り抜く候補を選択")
+
+        preview_video = gr.Video(label="プレビュー", autoplay=True)
+
+        info_box = gr.Textbox(label="選択中の区間", interactive=False, lines=3)
+        transcript_box = gr.Textbox(label="区間の文字起こし", interactive=False, lines=4)
+
+        start_slider = gr.Slider(0, 1, value=0, step=0.1, label="開始 (シークバー)")
+        end_slider = gr.Slider(0, 1, value=1, step=0.1, label="終了 (シークバー)")
+
+        with gr.Row():
+            start_num = gr.Number(value=0, label="開始 (秒)", precision=1)
+            end_num = gr.Number(value=0, label="終了 (秒)", precision=1)
+            auto_chk = gr.Checkbox(value=False, label="調整で自動プレビュー更新")
+
+        preview_io = {
+            "inputs": [start_num, end_num, ctx_state],
+            "outputs": [preview_video, info_box, transcript_box],
+        }
+        build_adjust_row("開始を調整", start_num, ctx_state, auto_chk, preview_io, start_slider)
+        build_adjust_row("終了を調整", end_num, ctx_state, auto_chk, preview_io, end_slider)
+
+        update_btn = gr.Button("プレビュー更新")
+
+        gr.Markdown("### 保存")
+        with gr.Row():
+            out_dir_box = gr.Textbox(value=DEFAULT_CLIPS_DIR, label="保存先フォルダ", scale=3)
+            folder_btn = gr.Button("フォルダ参照", scale=1)
+        with gr.Row():
+            filename_box = gr.Textbox(
+                value="", label="ファイル名 (空なら自動)", placeholder="my_clip.mp4", scale=2
+            )
+            precise_chk = gr.Checkbox(value=True, label="フレーム精度で保存 (再エンコード)")
+            save_btn = gr.Button("クリップ保存", variant="primary")
+        saved_path = gr.Textbox(label="保存先", interactive=False)
+
+        # --- イベント配線 ---
+        search_btn.click(
+            do_search,
+            inputs=[query_box, video_select, top_k, min_score],
+            outputs=[result_table, result_select, results_state],
+        )
+        query_box.submit(
+            do_search,
+            inputs=[query_box, video_select, top_k, min_score],
+            outputs=[result_table, result_select, results_state],
+        )
+        reload_btn.click(lambda: gr.update(choices=list_video_choices()), outputs=[video_select])
+        result_select.change(
+            on_select,
+            inputs=[result_select, results_state],
+            outputs=[
+                preview_video, start_num, end_num, start_slider, end_slider,
+                ctx_state, info_box, transcript_box,
+            ],
+        )
+        # シークバー(ユーザーが離した時のみ発火)→数値欄へ反映→自動プレビュー
+        start_slider.release(
+            lambda v: round(v, 1), inputs=[start_slider], outputs=[start_num]
+        ).then(
+            always_refresh,
+            inputs=preview_io["inputs"],
+            outputs=preview_io["outputs"],
+        )
+        end_slider.release(
+            lambda v: round(v, 1), inputs=[end_slider], outputs=[end_num]
+        ).then(
+            always_refresh,
+            inputs=preview_io["inputs"],
+            outputs=preview_io["outputs"],
+        )
+        # 数値欄の直接編集もシークバーに反映
+        start_num.input(lambda v: gr.update(value=v), inputs=[start_num], outputs=[start_slider])
+        end_num.input(lambda v: gr.update(value=v), inputs=[end_num], outputs=[end_slider])
+
+        update_btn.click(
+            refresh_preview,
+            inputs=[start_num, end_num, ctx_state],
+            outputs=[preview_video, info_box, transcript_box],
+        )
+        folder_btn.click(browse_folder, inputs=[out_dir_box], outputs=[out_dir_box])
+        save_btn.click(
+            on_save,
+            inputs=[start_num, end_num, ctx_state, precise_chk, out_dir_box, filename_box],
+            outputs=[saved_path],
+        )
+
+    with gr.Tab("動画の追加"):
+        gr.Markdown(
+            "新規動画を文字起こしして検索対象に追加します。"
+            "動画の長さに応じて数分かかります(処理中はこのページを開いたままにしてください)。"
+        )
+        with gr.Row():
+            new_video_box = gr.Textbox(label="動画ファイルのパス", scale=3)
+            video_browse_btn = gr.Button("ファイル参照", scale=1)
+        with gr.Row():
+            asr_model_dd = gr.Dropdown(
+                choices=["large-v3", "large-v3-turbo", "medium"],
+                value=config.ASR_MODEL_SIZE,
+                label="ASRモデル (turbo/mediumは高速・低精度)",
+            )
+            force_chk = gr.Checkbox(value=False, label="再インデックス (既存を削除して作り直す)")
+            index_btn = gr.Button("インデックス作成", variant="primary")
+        index_log = gr.Textbox(label="進捗ログ", interactive=False, lines=10)
+
+        video_browse_btn.click(browse_video, inputs=[new_video_box], outputs=[new_video_box])
+        index_btn.click(
+            do_index,
+            inputs=[new_video_box, asr_model_dd, force_chk],
+            outputs=[index_log, video_select],
+        )
+
+
+if __name__ == "__main__":
+    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)

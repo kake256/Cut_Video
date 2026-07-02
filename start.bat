@@ -2,14 +2,22 @@
 cd /d "%~dp0"
 title Auto_Cut - video scene search
 
-REM ---- check Python ----
+REM ---- check Python (try winget install if missing) ----
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] Python not found. Install Python 3.10+ from
-    echo         https://www.python.org/downloads/
-    echo         and check "Add python.exe to PATH" during install.
+    echo [INFO] Python not found. Trying to install via winget...
+    winget install --id Python.Python.3.12 -e --accept-source-agreements --accept-package-agreements
+    if errorlevel 1 (
+        echo [ERROR] Auto-install failed. Install Python 3.10+ manually from
+        echo         https://www.python.org/downloads/
+        echo         and check "Add python.exe to PATH" during install.
+        pause
+        exit /b 1
+    )
+    echo [INFO] Python installed. Close this window and run start.bat again
+    echo        so that PATH changes take effect.
     pause
-    exit /b 1
+    exit /b 0
 )
 
 REM ---- check ffmpeg (try winget install if missing) ----

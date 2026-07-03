@@ -75,6 +75,8 @@ def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
         db.insert_video(conn, video_id, str(video.resolve()), duration)
         conn.commit()
 
+    yield ("  モデルをロードし音声を解析中... "
+           "(長い動画では文字起こし開始まで数分〜十数分かかります)")
     seg_iter, info, used_batch_size = transcribe_stream(
         audio_src, model_size=asr_model, device=device,
         compute_type=compute_type, language=language, start_offset=start_offset,

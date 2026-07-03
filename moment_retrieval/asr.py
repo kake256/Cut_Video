@@ -39,7 +39,9 @@ def detect_batch_size(device: str) -> int:
         free_mb = int(out.stdout.strip().splitlines()[0])
     except Exception:
         return 1
-    batch = (free_mb - 6000) // 700
+    # 6000MB=モデル+作業領域。さらに1500MBは検索(BGE-M3)用に空けておく
+    # (インデックス処理中に検索してもVRAMが衝突しないように)
+    batch = (free_mb - 7500) // 700
     return max(1, min(int(batch), 16))
 
 

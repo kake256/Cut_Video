@@ -33,6 +33,8 @@ ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
 
 _embedder = None
 _index_lock = threading.Lock()
+# 実行中のインデックス処理サブプロセス (停止ボタン用)
+_index_state = {"proc": None, "stopped": False}
 
 
 def get_embedder() -> TextEmbedder:
@@ -119,7 +121,14 @@ def do_search(query: str, video_choice: str, top_k: int, min_score: float):
     conn = db.get_conn()
     db.init_db(conn)
 
-    query_vec = get_embedder().encode([query])
+    try:
+        query_vec = get_embedder().encode([query])
+    except Exception as e:
+        raise gr.Error(
+            "検索用モデルのロードに失敗しました。インデックス処理の実行中は"
+            "VRAMが不足することがあります。処理の完了を待つか停止してから"
+            f"再試行してください。({type(e).__name__}: {e})"
+        )
     vindex = VectorIndex.load(config.TEXT_INDEX_PATH, query_vec.shape[1])
     fetch_k = int(top_k) * 5 if video_filter else int(top_k)
     scores, ids = vindex.search(query_vec, top_k=fetch_k)
@@ -383,6 +392,8 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
         )
         # 残留ジョブ掃除用にPIDを記録 (アプリごと落ちた場合、次回起動時に停止される)
         INDEX_JOB_PIDFILE.write_text(str(proc.pid), encoding="utf-8")
+        _index_state["proc"] = proc
+        _index_state["stopped"] = False
         # `for line in proc.stdout` は先読みバッファで表示が遅延するためreadlineで読む
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
@@ -406,11 +417,32 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
         if code == 0:
             gr.Info("インデックス作成が完了しました。")
             yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+        elif _index_state["stopped"]:
+            log_lines.append(
+                "処理を停止しました。文字起こしは途中保存されているため、"
+                "同じ動画で再実行すれば続きから再開されます。"
+            )
+            yield "\n".join(log_lines), gr.update()
         else:
             log_lines.append(f"エラー: インデックス処理が異常終了しました (exit code {code})")
             yield "\n".join(log_lines), gr.update()
     finally:
+        _index_state["proc"] = None
         _index_lock.release()
+
+
+def stop_indexing():
+    """実行中のインデックス処理サブプロセスを停止する(子プロセスごと)。"""
+    import subprocess
+
+    proc = _index_state.get("proc")
+    if proc is None or proc.poll() is not None:
+        raise gr.Error("実行中のインデックス処理はありません。")
+    _index_state["stopped"] = True
+    subprocess.run(
+        ["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True
+    )
+    gr.Info("インデックス処理を停止しました。")
 
 
 # ---------- インデックスの共有 (エクスポート/インポート) ----------
@@ -631,6 +663,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 label="バッチ並列推論 (高速。切り出し境界がやや粗くなる)",
             )
             index_btn = gr.Button("インデックス作成", variant="primary")
+            stop_btn = gr.Button("処理を停止", variant="stop")
         index_log = gr.Textbox(label="進捗ログ", interactive=False, lines=10)
 
         video_browse_btn.click(browse_video, inputs=[new_video_box], outputs=[new_video_box])
@@ -639,6 +672,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             inputs=[new_video_box, asr_model_dd, force_chk, batch_infer_chk],
             outputs=[index_log, video_select],
         )
+        stop_btn.click(stop_indexing)
 
     with gr.Tab("インデックスの共有"):
         gr.Markdown(

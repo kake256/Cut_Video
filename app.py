@@ -247,6 +247,60 @@ def on_select(selection: str, results: list):
     )
 
 
+def manual_load(video_choice: str):
+    """検索せずに動画を直接読み込み、時間指定だけで切り抜ける状態にする。"""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("動画を選択してください(「すべての動画」は指定できません)。")
+
+    conn = db.get_conn()
+    video = db.get_video(conn, video_id)
+    if not video:
+        conn.close()
+        raise gr.Error(f"動画が見つかりません: {video_id}")
+
+    duration = video["duration"]
+    start, end = 0.0, min(30.0, duration)
+    transcript = region_transcript(conn, video_id, start, end)
+    sents = get_region_sentences(conn, video_id, 0.0, end + 90.0)
+    conn.close()
+
+    preview = make_preview(video["path"], start, end, duration)
+    info = (
+        f"動画: {video['path']}\n"
+        f"区間: {utils.format_timestamp(start)} - {utils.format_timestamp(end)} "
+        f"(長さ {end - start:.1f} 秒) ※検索なしの手動指定モード"
+    )
+    ctx = {"video_path": video["path"], "duration": duration, "video_id": video_id}
+    choices = _sentence_choices(sents)
+    return (
+        preview,
+        round(start, 1),
+        round(end, 1),
+        gr.update(minimum=0, maximum=round(duration, 1), value=round(start, 1)),
+        gr.update(minimum=0, maximum=round(duration, 1), value=round(end, 1)),
+        ctx,
+        info,
+        transcript,
+        sents,
+        gr.update(choices=choices, value=None),
+        gr.update(choices=choices, value=None),
+    )
+
+
+def refresh_sentences(start: float, end: float, ctx: dict):
+    """現在の区間の前後90秒で文リストを取り直す。"""
+    if not ctx:
+        raise gr.Error("先に動画を読み込むか検索結果を選択してください。")
+    conn = db.get_conn()
+    sents = get_region_sentences(
+        conn, ctx["video_id"], max(0.0, start - 90.0), end + 90.0
+    )
+    conn.close()
+    choices = _sentence_choices(sents)
+    return sents, gr.update(choices=choices, value=None), gr.update(choices=choices, value=None)
+
+
 def refresh_preview(start: float, end: float, ctx: dict):
     if not ctx:
         raise gr.Error("先に検索結果を選択してください。")
@@ -508,6 +562,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 scale=3,
             )
             reload_btn = gr.Button("動画リスト更新", scale=1)
+            manual_btn = gr.Button("検索せずにこの動画を切り抜く", scale=1)
 
         with gr.Row():
             query_box = gr.Textbox(
@@ -525,7 +580,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         result_select = gr.Radio(choices=[], label="切り抜く候補を選択")
 
-        preview_video = gr.Video(label="プレビュー", autoplay=True)
+        preview_video = gr.Video(label="プレビュー", autoplay=False)
 
         info_box = gr.Textbox(label="選択中の区間", interactive=False, lines=3)
         transcript_box = gr.Textbox(label="区間の文字起こし", interactive=False, lines=4)
@@ -533,8 +588,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
         sentences_state = gr.State([])
         gr.Markdown("**文字起こしの文で区間を調整** (文を選ぶと開始/終了がその文に合います)")
         with gr.Row():
-            start_sent_dd = gr.Dropdown(choices=[], label="この文から (開始)")
-            end_sent_dd = gr.Dropdown(choices=[], label="この文まで (終了)")
+            start_sent_dd = gr.Dropdown(choices=[], label="この文から (開始)", scale=2)
+            end_sent_dd = gr.Dropdown(choices=[], label="この文まで (終了)", scale=2)
+            refresh_sents_btn = gr.Button("この区間周辺の文を再取得", scale=1)
 
         start_slider = gr.Slider(0, 1, value=0, step=0.1, label="開始 (シークバー)")
         end_slider = gr.Slider(0, 1, value=1, step=0.1, label="終了 (シークバー)")
@@ -576,6 +632,20 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[result_table, result_select, results_state],
         )
         reload_btn.click(lambda: gr.update(choices=list_video_choices()), outputs=[video_select])
+        manual_btn.click(
+            manual_load,
+            inputs=[video_select],
+            outputs=[
+                preview_video, start_num, end_num, start_slider, end_slider,
+                ctx_state, info_box, transcript_box,
+                sentences_state, start_sent_dd, end_sent_dd,
+            ],
+        )
+        refresh_sents_btn.click(
+            refresh_sentences,
+            inputs=[start_num, end_num, ctx_state],
+            outputs=[sentences_state, start_sent_dd, end_sent_dd],
+        )
         result_select.change(
             on_select,
             inputs=[result_select, results_state],

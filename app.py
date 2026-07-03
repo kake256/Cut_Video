@@ -175,9 +175,26 @@ def make_preview(video_path: str, start: float, end: float, duration: float) -> 
     return str(out)
 
 
+def get_region_sentences(conn, video_id: str, lo: float, hi: float) -> list:
+    rows = conn.execute(
+        "SELECT start_sec, end_sec, text FROM asr_segments "
+        "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
+        (video_id, lo, hi),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _sentence_choices(sents: list) -> list:
+    return [
+        f"{i + 1}. [{utils.format_timestamp(s['start_sec'])}] {s['text'][:28]}"
+        for i, s in enumerate(sents)
+    ]
+
+
 def on_select(selection: str, results: list):
     if not selection or not results:
-        return None, gr.update(), gr.update(), gr.update(), gr.update(), None, "", ""
+        return (None, gr.update(), gr.update(), gr.update(), gr.update(),
+                None, "", "", [], gr.update(), gr.update())
     idx = int(selection.split(".")[0]) - 1
     r = results[idx]
 
@@ -188,6 +205,10 @@ def on_select(selection: str, results: list):
         conn.close()
         raise gr.Error(f"動画が見つかりません: {r['video_id']}")
     transcript = region_transcript(conn, r["video_id"], start, end)
+    # 文字起こしベースの調整用: 区間の前後90秒の文一覧
+    sents = get_region_sentences(
+        conn, r["video_id"], max(0.0, start - 90.0), end + 90.0
+    )
     conn.close()
 
     duration = video["duration"]
@@ -199,6 +220,7 @@ def on_select(selection: str, results: list):
         f"(長さ {end - start:.1f} 秒)"
     )
     ctx = {"video_path": video["path"], "duration": duration, "video_id": r["video_id"]}
+    choices = _sentence_choices(sents)
     return (
         preview,
         round(start, 1),
@@ -208,6 +230,9 @@ def on_select(selection: str, results: list):
         ctx,
         info,
         transcript,
+        sents,
+        gr.update(choices=choices, value=None),
+        gr.update(choices=choices, value=None),
     )
 
 
@@ -237,17 +262,23 @@ def adjust_time(value: float, ctx: dict, delta: float):
     return round(v, 1)
 
 
-def maybe_refresh(auto: bool, start: float, end: float, ctx: dict):
-    if not auto or not ctx or end <= start:
-        return gr.update(), gr.update(), gr.update()
-    return refresh_preview(start, end, ctx)
-
-
 def always_refresh(start: float, end: float, ctx: dict):
-    """シークバー用: 選択済みなら常にプレビューを更新する。"""
+    """選択済みならプレビュー・区間情報・文字起こしを更新する。"""
     if not ctx or end <= start:
         return gr.update(), gr.update(), gr.update()
     return refresh_preview(start, end, ctx)
+
+
+def pick_sentence(sel: str, sents: list, which: str):
+    """文ドロップダウンの選択から開始/終了秒を返す。"""
+    if not sel or not sents:
+        return gr.update(), gr.update()
+    idx = int(sel.split(".")[0]) - 1
+    if idx < 0 or idx >= len(sents):
+        return gr.update(), gr.update()
+    s = sents[idx]
+    v = round(s["start_sec"] if which == "start" else s["end_sec"], 1)
+    return v, gr.update(value=v)
 
 
 def on_save(start: float, end: float, ctx: dict, precise: bool, out_dir: str, filename: str):
@@ -402,7 +433,7 @@ def do_import(zip_file):
         yield "\n".join(log_lines), gr.update()
 
 
-def build_adjust_row(label: str, target_number, ctx_state, auto_chk, preview_io, slider):
+def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider):
     with gr.Row():
         gr.Markdown(f"**{label}**")
         for step in [-s for s in reversed(ADJUST_STEPS)] + ADJUST_STEPS:
@@ -414,8 +445,8 @@ def build_adjust_row(label: str, target_number, ctx_state, auto_chk, preview_io,
             ).then(
                 lambda v: gr.update(value=v), inputs=[target_number], outputs=[slider]
             ).then(
-                maybe_refresh,
-                inputs=[auto_chk] + preview_io["inputs"],
+                always_refresh,
+                inputs=preview_io["inputs"],
                 outputs=preview_io["outputs"],
             )
 
@@ -457,20 +488,25 @@ with gr.Blocks(title="動画シーン検索") as demo:
         info_box = gr.Textbox(label="選択中の区間", interactive=False, lines=3)
         transcript_box = gr.Textbox(label="区間の文字起こし", interactive=False, lines=4)
 
+        sentences_state = gr.State([])
+        gr.Markdown("**文字起こしの文で区間を調整** (文を選ぶと開始/終了がその文に合います)")
+        with gr.Row():
+            start_sent_dd = gr.Dropdown(choices=[], label="この文から (開始)")
+            end_sent_dd = gr.Dropdown(choices=[], label="この文まで (終了)")
+
         start_slider = gr.Slider(0, 1, value=0, step=0.1, label="開始 (シークバー)")
         end_slider = gr.Slider(0, 1, value=1, step=0.1, label="終了 (シークバー)")
 
         with gr.Row():
             start_num = gr.Number(value=0, label="開始 (秒)", precision=1)
             end_num = gr.Number(value=0, label="終了 (秒)", precision=1)
-            auto_chk = gr.Checkbox(value=False, label="調整で自動プレビュー更新")
 
         preview_io = {
             "inputs": [start_num, end_num, ctx_state],
             "outputs": [preview_video, info_box, transcript_box],
         }
-        build_adjust_row("開始を調整", start_num, ctx_state, auto_chk, preview_io, start_slider)
-        build_adjust_row("終了を調整", end_num, ctx_state, auto_chk, preview_io, end_slider)
+        build_adjust_row("開始を調整", start_num, ctx_state, preview_io, start_slider)
+        build_adjust_row("終了を調整", end_num, ctx_state, preview_io, end_slider)
 
         update_btn = gr.Button("プレビュー更新")
 
@@ -504,7 +540,27 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[
                 preview_video, start_num, end_num, start_slider, end_slider,
                 ctx_state, info_box, transcript_box,
+                sentences_state, start_sent_dd, end_sent_dd,
             ],
+        )
+        # 文字起こしの文ベースの区間調整
+        start_sent_dd.change(
+            pick_sentence,
+            inputs=[start_sent_dd, sentences_state, gr.State("start")],
+            outputs=[start_num, start_slider],
+        ).then(
+            always_refresh,
+            inputs=preview_io["inputs"],
+            outputs=preview_io["outputs"],
+        )
+        end_sent_dd.change(
+            pick_sentence,
+            inputs=[end_sent_dd, sentences_state, gr.State("end")],
+            outputs=[end_num, end_slider],
+        ).then(
+            always_refresh,
+            inputs=preview_io["inputs"],
+            outputs=preview_io["outputs"],
         )
         # シークバー(ユーザーが離した時のみ発火)→数値欄へ反映→自動プレビュー
         start_slider.release(
@@ -524,6 +580,13 @@ with gr.Blocks(title="動画シーン検索") as demo:
         # 数値欄の直接編集もシークバーに反映
         start_num.input(lambda v: gr.update(value=v), inputs=[start_num], outputs=[start_slider])
         end_num.input(lambda v: gr.update(value=v), inputs=[end_num], outputs=[end_slider])
+        # 数値を直接入力してEnterで確定した場合もプレビューへ反映
+        start_num.submit(
+            always_refresh, inputs=preview_io["inputs"], outputs=preview_io["outputs"]
+        )
+        end_num.submit(
+            always_refresh, inputs=preview_io["inputs"], outputs=preview_io["outputs"]
+        )
 
         update_btn.click(
             refresh_preview,

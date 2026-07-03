@@ -24,13 +24,16 @@ def cut_clip(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if precise:
-        # -ssを-iの後に置き、再エンコードしてフレーム精度で切り出す(遅いが正確)
+        # -ssを-iの前に置く入力シーク + 再エンコード。
+        # 再エンコード時は入力シークでもフレーム精度が保たれ、かつ
+        # 目的位置まで瞬間シークするため長時間動画でも数秒で切り出せる
+        # (-ssを-iの後に置くと先頭から全デコードになり12時間動画では数十分かかる)
         cmd = [
             "ffmpeg", "-y",
-            "-i", str(video_path),
             "-ss", f"{s:.3f}",
+            "-i", str(video_path),
             "-t", f"{length:.3f}",
-            "-c:v", "libx264", "-c:a", "aac",
+            "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
             str(output_path),
         ]
     else:

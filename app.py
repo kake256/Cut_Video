@@ -26,6 +26,8 @@ from moment_retrieval.vector_index import VectorIndex
 
 PREVIEW_DIR = Path("data/previews")
 DEFAULT_CLIPS_DIR = "clips"
+APP_PORT = 7860
+INDEX_JOB_PIDFILE = Path("data/index_job.pid")
 
 ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
 
@@ -379,6 +381,8 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
             env=env,
             cwd=str(Path(__file__).parent),
         )
+        # 残留ジョブ掃除用にPIDを記録 (アプリごと落ちた場合、次回起動時に停止される)
+        INDEX_JOB_PIDFILE.write_text(str(proc.pid), encoding="utf-8")
         # `for line in proc.stdout` は先読みバッファで表示が遅延するためreadlineで読む
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
@@ -398,6 +402,7 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
                 log_lines.append(line)
             yield "\n".join(log_lines), gr.update()
         code = proc.wait()
+        INDEX_JOB_PIDFILE.unlink(missing_ok=True)
         if code == 0:
             gr.Info("インデックス作成が完了しました。")
             yield "\n".join(log_lines), gr.update(choices=list_video_choices())
@@ -668,5 +673,49 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
 
 
+def _already_running(port: int = APP_PORT) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _cleanup_stale_index_job() -> None:
+    """前回の異常終了で残ったインデックス処理のサブプロセスを停止する。
+
+    ASRは途中保存されるため、停止しても次回は続きから再開できる。
+    """
+    import subprocess
+
+    if not INDEX_JOB_PIDFILE.exists():
+        return
+    try:
+        pid = int(INDEX_JOB_PIDFILE.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+        return
+
+    # PIDが使い回されて別プロセスを殺さないよう、python.exeであることを確認する
+    check = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True,
+    )
+    if "python" in check.stdout.lower():
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        print(f"前回の残留インデックス処理 (PID {pid}) を停止しました。"
+              "文字起こしは途中保存から再開できます。")
+    INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+    if _already_running():
+        import webbrowser
+
+        print(f"アプリは既に起動しています: http://127.0.0.1:{APP_PORT}")
+        print("(二重起動を防ぐため、このプロセスは終了します)")
+        webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
+        raise SystemExit(0)
+
+    _cleanup_stale_index_job()
+    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True)

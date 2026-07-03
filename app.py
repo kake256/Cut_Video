@@ -375,12 +375,17 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
             text=True,
             encoding="utf-8",
             errors="replace",
+            bufsize=1,  # 行バッファ
             env=env,
             cwd=str(Path(__file__).parent),
         )
-        for line in proc.stdout:
+        # `for line in proc.stdout` は先読みバッファで表示が遅延するためreadlineで読む
+        for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
             if not line:
+                continue
+            # ライブラリのプログレスバーや警告はログに出さない
+            if "it/s]" in line or "Warning" in line or line.startswith(("Fetching", "Loading weights", "pre tokenize", "Inference Embeddings")):
                 continue
             # 進捗行(文字起こし中... XX%)は追記せず最終行を置き換える
             if (

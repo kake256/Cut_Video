@@ -485,6 +485,25 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
         _index_lock.release()
 
 
+def shutdown_app():
+    """実行中のジョブを停止してアプリ本体(サーバープロセス)を終了する。"""
+    import os
+    import subprocess
+
+    proc = _index_state.get("proc")
+    if proc is not None and proc.poll() is None:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True
+        )
+    INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+    # このレスポンスを返してからプロセスを終了する
+    threading.Timer(3.0, lambda: os._exit(0)).start()
+    return gr.update(
+        visible=True,
+        value="**アプリを終了しました。このタブは閉じてください。**",
+    )
+
+
 def stop_indexing():
     """実行中のインデックス処理サブプロセスを停止する(子プロセスごと)。"""
     import subprocess
@@ -548,7 +567,24 @@ def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider):
 
 
 with gr.Blocks(title="動画シーン検索") as demo:
-    gr.Markdown("# 動画シーン検索・切り抜き")
+    with gr.Row():
+        gr.Markdown("# 動画シーン検索・切り抜き")
+        quit_btn = gr.Button("アプリを終了", variant="stop", scale=0, min_width=120)
+        quit_confirm_btn = gr.Button(
+            "本当に終了する (実行中の処理も停止)", variant="stop", visible=False, scale=0
+        )
+        quit_cancel_btn = gr.Button("キャンセル", visible=False, scale=0, min_width=100)
+    quit_msg = gr.Markdown(visible=False)
+
+    quit_btn.click(
+        lambda: (gr.update(visible=True), gr.update(visible=True), gr.update(visible=False)),
+        outputs=[quit_confirm_btn, quit_cancel_btn, quit_btn],
+    )
+    quit_cancel_btn.click(
+        lambda: (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)),
+        outputs=[quit_confirm_btn, quit_cancel_btn, quit_btn],
+    )
+    quit_confirm_btn.click(shutdown_app, outputs=[quit_msg])
 
     with gr.Tab("検索・切り抜き"):
         results_state = gr.State([])

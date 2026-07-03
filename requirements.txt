@@ -7,3 +7,4 @@ faiss-cpu>=1.8.0
 numpy>=1.26
 gradio>=6.0
 torch>=2.1
+yt-dlp>=2024.10.0

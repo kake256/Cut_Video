@@ -6,16 +6,22 @@
 「検索・切り抜き」タブ: 検索 → 結果選択 → プレビュー → 手動調整 → 保存。
 「動画の追加」タブ: 新規動画の文字起こし〜インデックス化をWebUIから実行。
 """
+import faulthandler
 import threading
 from pathlib import Path
 
 import gradio as gr
 
+# ネイティブ層のクラッシュ(access violation等)の原因追跡用
+_crash_log = open("data/crash_trace.log", "a", encoding="utf-8", errors="replace")
+faulthandler.enable(file=_crash_log)
+
 from cut_clip import cut_clip
-from index_video import IndexError_, run_indexing
 from moment_retrieval import config, db, utils
+from moment_retrieval.downloader import DownloadError, download_video
 from moment_retrieval.embedder import TextEmbedder
 from moment_retrieval.refine import expand_to_speech_boundary
+from moment_retrieval.share import ShareError, export_index, import_index
 from moment_retrieval.vector_index import VectorIndex
 
 PREVIEW_DIR = Path("data/previews")
@@ -78,6 +84,11 @@ def list_video_choices() -> list:
         name = Path(v["path"]).name
         choices.append(f"{v['video_id']}  ({name}, {utils.format_timestamp(v['duration'])})")
     return choices
+
+
+def list_video_choices_only() -> list:
+    """「(すべての動画)」を除いた個別動画の選択肢一覧(共有タブ用)。"""
+    return [c for c in list_video_choices() if not c.startswith("(")]
 
 
 def parse_video_choice(choice: str) -> str:
@@ -266,28 +277,129 @@ def on_save(start: float, end: float, ctx: dict, precise: bool, out_dir: str, fi
 
 # ---------- 動画の追加 (インデックス作成) ----------
 
-def do_index(video_path: str, asr_model: str, force: bool):
-    """新規動画をインデックス化する。進捗ログをストリーミング表示する。"""
-    if not video_path.strip():
-        raise gr.Error("動画ファイルを指定してください。")
+def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = True):
+    """新規動画をインデックス化する。進捗ログをストリーミング表示する。
+
+    video_pathがhttp(s)://で始まる場合は、先にダウンロードしてからインデックス化する。
+    """
+    video_path = video_path.strip()
+    if not video_path:
+        raise gr.Error("動画ファイルのパスまたはURLを指定してください。")
     if not _index_lock.acquire(blocking=False):
         raise gr.Error("別のインデックス処理が実行中です。完了までお待ちください。")
 
     log_lines = ["インデックス処理を開始します。ASRモデルの初回ロードには数分かかることがあります。"]
     try:
         yield "\n".join(log_lines), gr.update()
-        for msg in run_indexing(
-            video=Path(video_path.strip()), force=force, asr_model=asr_model
-        ):
-            log_lines.append(msg)
+
+        if video_path.lower().startswith(("http://", "https://")):
+            log_lines.append(f"URLを検出しました。動画をダウンロードします: {video_path}")
             yield "\n".join(log_lines), gr.update()
-        gr.Info("インデックス作成が完了しました。")
-        yield "\n".join(log_lines), gr.update(choices=list_video_choices())
-    except IndexError_ as e:
-        log_lines.append(f"エラー: {e}")
-        yield "\n".join(log_lines), gr.update()
+            try:
+                local_path = None
+                for msg, path in download_video(video_path):
+                    # 進捗行(ダウンロード中...)は追記せず最終行を置き換える
+                    if (
+                        msg.startswith("  ダウンロード中")
+                        and log_lines
+                        and log_lines[-1].startswith("  ダウンロード中")
+                    ):
+                        log_lines[-1] = msg
+                    else:
+                        log_lines.append(msg)
+                    yield "\n".join(log_lines), gr.update()
+                    if path is not None:
+                        local_path = path
+                if local_path is None:
+                    log_lines.append("エラー: ダウンロードに失敗しました(ファイルパスを取得できませんでした)。")
+                    yield "\n".join(log_lines), gr.update()
+                    return
+                video_path = str(local_path)
+            except DownloadError as e:
+                log_lines.append(f"エラー: {e}")
+                yield "\n".join(log_lines), gr.update()
+                return
+
+        # インデックス処理はサブプロセスで実行する。
+        # (Gradioワーカースレッド内でのWhisperモデルロードはaccess violationで
+        #  プロセスごと落ちるため、隔離して実行する)
+        import os
+        import subprocess
+        import sys
+
+        cmd = [
+            sys.executable, "index_video.py",
+            "--video", str(video_path),
+            "--asr-model", asr_model,
+        ]
+        if force:
+            cmd.append("--force")
+        if not batch_infer:
+            cmd += ["--batch-size", "1"]
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=str(Path(__file__).parent),
+        )
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            # 進捗行(文字起こし中... XX%)は追記せず最終行を置き換える
+            if (
+                line.startswith("  文字起こし中")
+                and log_lines
+                and log_lines[-1].startswith("  文字起こし中")
+            ):
+                log_lines[-1] = line
+            else:
+                log_lines.append(line)
+            yield "\n".join(log_lines), gr.update()
+        code = proc.wait()
+        if code == 0:
+            gr.Info("インデックス作成が完了しました。")
+            yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+        else:
+            log_lines.append(f"エラー: インデックス処理が異常終了しました (exit code {code})")
+            yield "\n".join(log_lines), gr.update()
     finally:
         _index_lock.release()
+
+
+# ---------- インデックスの共有 (エクスポート/インポート) ----------
+
+def do_export(video_choice: str):
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("エクスポートする動画を選択してください。")
+    try:
+        out_path = export_index(video_id)
+    except ShareError as e:
+        raise gr.Error(str(e))
+    gr.Info(f"エクスポートしました: {out_path}")
+    return str(out_path), f"保存先: {out_path.resolve()}"
+
+
+def do_import(zip_file):
+    if zip_file is None:
+        yield "インポートするzipファイルを選択してください。", gr.update()
+        return
+    log_lines = []
+    try:
+        for msg in import_index(Path(zip_file.name if hasattr(zip_file, "name") else zip_file)):
+            log_lines.append(msg)
+            yield "\n".join(log_lines), gr.update()
+        gr.Info("インポートが完了しました。")
+        yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+    except ShareError as e:
+        log_lines.append(f"エラー: {e}")
+        yield "\n".join(log_lines), gr.update()
 
 
 def build_adjust_row(label: str, target_number, ctx_state, auto_chk, preview_io, slider):
@@ -431,7 +543,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "動画の長さに応じて数分かかります(処理中はこのページを開いたままにしてください)。"
         )
         with gr.Row():
-            new_video_box = gr.Textbox(label="動画ファイルのパス", scale=3)
+            new_video_box = gr.Textbox(label="動画ファイルのパス または URL", scale=3)
             video_browse_btn = gr.Button("ファイル参照", scale=1)
         with gr.Row():
             asr_model_dd = gr.Dropdown(
@@ -440,14 +552,51 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 label="ASRモデル (turbo/mediumは高速・低精度)",
             )
             force_chk = gr.Checkbox(value=False, label="再インデックス (既存を削除して作り直す)")
+        with gr.Row():
+            batch_infer_chk = gr.Checkbox(
+                value=True,
+                label="バッチ並列推論 (高速。切り出し境界がやや粗くなる)",
+            )
             index_btn = gr.Button("インデックス作成", variant="primary")
         index_log = gr.Textbox(label="進捗ログ", interactive=False, lines=10)
 
         video_browse_btn.click(browse_video, inputs=[new_video_box], outputs=[new_video_box])
         index_btn.click(
             do_index,
-            inputs=[new_video_box, asr_model_dd, force_chk],
+            inputs=[new_video_box, asr_model_dd, force_chk, batch_infer_chk],
             outputs=[index_log, video_select],
+        )
+
+    with gr.Tab("インデックスの共有"):
+        gr.Markdown(
+            "文字起こし済みのインデックスをzipファイルとして書き出し/読み込みし、"
+            "他のPCと再文字起こしなしで共有できます。"
+        )
+        with gr.Row():
+            gr.Markdown("### エクスポート")
+        with gr.Row():
+            export_video_select = gr.Dropdown(
+                choices=list_video_choices_only(), label="エクスポートする動画", scale=3
+            )
+            export_reload_btn = gr.Button("動画リスト更新", scale=1)
+        export_btn = gr.Button("エクスポート", variant="primary")
+        export_file = gr.File(label="ダウンロード", interactive=False)
+        export_path_box = gr.Textbox(label="保存先パス", interactive=False)
+
+        with gr.Row():
+            gr.Markdown("### インポート")
+        import_file = gr.File(label="インポートするzipファイル", file_types=[".zip"])
+        import_btn = gr.Button("インポート", variant="primary")
+        import_log = gr.Textbox(label="進捗ログ", interactive=False, lines=8)
+
+        export_reload_btn.click(
+            lambda: gr.update(choices=list_video_choices_only()), outputs=[export_video_select]
+        )
+        export_btn.click(
+            do_export, inputs=[export_video_select], outputs=[export_file, export_path_box]
+        )
+        import_btn.click(
+            do_import, inputs=[import_file], outputs=[import_log, video_select]
         )
 
 

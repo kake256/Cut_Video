@@ -42,6 +42,16 @@ def get_conn() -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # マイグレーション: ASR完了フラグ (途中保存・再開のため)
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN asr_complete INTEGER DEFAULT 0")
+        # 既にチャンクまで作られている動画はASR完了扱いにする
+        conn.execute(
+            "UPDATE videos SET asr_complete = 1 WHERE video_id IN "
+            "(SELECT DISTINCT video_id FROM text_chunks)"
+        )
+    except sqlite3.OperationalError:
+        pass  # カラム追加済み
     conn.commit()
 
 
@@ -92,6 +102,27 @@ def get_chunks_by_ids(conn: sqlite3.Connection, chunk_ids: Iterable[int]) -> dic
         chunk_ids,
     ).fetchall()
     return {row["chunk_id"]: dict(row) for row in rows}
+
+
+def mark_asr_complete(conn: sqlite3.Connection, video_id: str) -> None:
+    conn.execute(
+        "UPDATE videos SET asr_complete = 1 WHERE video_id = ?", (video_id,)
+    )
+    conn.commit()
+
+
+def is_asr_complete(conn: sqlite3.Connection, video_id: str) -> bool:
+    row = conn.execute(
+        "SELECT asr_complete FROM videos WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    return bool(row and row["asr_complete"])
+
+
+def get_last_segment_end(conn: sqlite3.Connection, video_id: str) -> float:
+    row = conn.execute(
+        "SELECT MAX(end_sec) AS m FROM asr_segments WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    return float(row["m"]) if row and row["m"] is not None else 0.0
 
 
 def get_segments(conn: sqlite3.Connection, video_id: str) -> list[dict]:

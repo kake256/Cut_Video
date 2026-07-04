@@ -485,6 +485,20 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
         _index_lock.release()
 
 
+# 終了ボタン押下時にブラウザ側で実行するJS。まずタブを閉じようとし、
+# ブラウザのセキュリティ制約で閉じられない場合は画面を終了表示に差し替える
+# (サーバー停止による接続エラー画面になるより分かりやすい)。
+_QUIT_JS = """() => {
+    try { window.open('', '_self'); window.close(); } catch (e) {}
+    setTimeout(() => {
+        document.body.innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:center;'
+            + 'height:100vh;font-family:sans-serif;font-size:1.4rem;color:#888;">'
+            + 'アプリを終了しました。このタブは閉じてください。</div>';
+    }, 200);
+}"""
+
+
 def shutdown_app():
     """実行中のジョブを停止してアプリ本体(サーバープロセス)を終了する。"""
     import os
@@ -584,7 +598,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         lambda: (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)),
         outputs=[quit_confirm_btn, quit_cancel_btn, quit_btn],
     )
-    quit_confirm_btn.click(shutdown_app, outputs=[quit_msg])
+    quit_confirm_btn.click(shutdown_app, outputs=[quit_msg], js=_QUIT_JS)
 
     with gr.Tab("検索・切り抜き"):
         results_state = gr.State([])

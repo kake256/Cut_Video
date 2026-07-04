@@ -826,6 +826,7 @@ def _cleanup_stale_index_job() -> None:
 
     ASRは途中保存されるため、停止しても次回は続きから再開できる。
     """
+    import os
     import subprocess
 
     if not INDEX_JOB_PIDFILE.exists():
@@ -836,16 +837,28 @@ def _cleanup_stale_index_job() -> None:
         INDEX_JOB_PIDFILE.unlink(missing_ok=True)
         return
 
-    # PIDが使い回されて別プロセスを殺さないよう、python.exeであることを確認する
-    check = subprocess.run(
-        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True,
-    )
-    if "python" in check.stdout.lower():
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+    # 掃除は1回だけ試行する
+    INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+
+    # 自分自身は絶対に停止しない。Windowsは終了プロセスのPIDを再利用するため、
+    # 残留PIDが起動中のこのプロセスを指していると自殺してしまう。
+    if pid == os.getpid():
+        return
+
+    # コマンドラインを確認し、index_video.py を実行しているプロセスだけを停止する。
+    # (PID再利用で app.py 自身や無関係なpythonプロセスを誤って停止しないため)
+    try:
+        check = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return
+    if "index_video" in (check.stdout or ""):
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
         print(f"前回の残留インデックス処理 (PID {pid}) を停止しました。"
               "文字起こしは途中保存から再開できます。")
-    INDEX_JOB_PIDFILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

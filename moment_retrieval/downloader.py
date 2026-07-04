@@ -38,6 +38,36 @@ def _progress_message(d: dict) -> Optional[str]:
     return None
 
 
+def _sanitize(name: str) -> str:
+    """ファイル名に使えない文字を除去する。"""
+    for ch in '/\\:*?"<>|#':
+        name = name.replace(ch, "_")
+    return name[:120]
+
+
+def _build_basename(info: dict) -> str:
+    """投稿日時ベースの分かりやすいファイル名 (YYYYMMDD_HHMMSS_<ID>) を作る。
+
+    投稿時刻(timestamp)があれば「日付_時刻_ID」、日付だけなら「日付_ID」、
+    どちらも無ければIDのみにフォールバックする。IDを末尾に残すのは
+    同一動画の再ダウンロード検出(スキップ)と元動画の特定のため。
+    """
+    from datetime import datetime
+
+    vid = str(info.get("id", "video"))
+    ts = info.get("timestamp") or info.get("release_timestamp")
+    if ts:
+        try:
+            prefix = datetime.fromtimestamp(ts).strftime("%Y%m%d_%H%M%S")
+            return _sanitize(f"{prefix}_{vid}")
+        except (ValueError, OSError, OverflowError):
+            pass
+    date = info.get("upload_date") or info.get("release_date")
+    if date and str(date).isdigit() and len(str(date)) == 8:
+        return _sanitize(f"{date}_{vid}")
+    return _sanitize(vid)
+
+
 def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[str, Optional[Path]]]:
     """URLから動画をダウンロードする。
 
@@ -63,28 +93,29 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
         if msg:
             msg_queue.put(msg)
 
+    try:
+        with YoutubeDL({"noplaylist": True, "quiet": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise DownloadError(f"動画情報の取得に失敗しました: {e}")
+
+    # 投稿日時ベースの分かりやすいファイル名にする
+    basename = _build_basename(info)
+    out_path = save_dir / f"{basename}.mp4"
+    if out_path.exists():
+        yield f"既にダウンロード済みです: {out_path}", out_path
+        return
+
     ydl_opts = {
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-        "outtmpl": str(save_dir / "%(id)s.%(ext)s"),
+        "outtmpl": str(save_dir / f"{basename}.%(ext)s"),
         "noplaylist": True,
         "retries": 21,
         "progress_hooks": [_hook],
     }
 
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise DownloadError(f"動画情報の取得に失敗しました: {e}")
-
-    video_id = info.get("id", "unknown")
-    out_path = save_dir / f"{video_id}.mp4"
-    if out_path.exists():
-        yield f"既にダウンロード済みです: {out_path}", out_path
-        return
-
-    title = info.get("title", video_id)
+    title = info.get("title", basename)
     duration = info.get("duration")
     dur_note = f" (長さ {duration // 3600}時間{(duration % 3600) // 60}分)" if duration else ""
     yield f"ダウンロードを開始します: {title}{dur_note}", None
@@ -125,12 +156,11 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
         raise DownloadError(f"ダウンロードに失敗しました: {result['error']}")
 
     dl_info = result.get("info") or {}
-    video_id = dl_info.get("id", video_id)
-    out_path = save_dir / f"{video_id}.mp4"
+    out_path = save_dir / f"{basename}.mp4"
     if not out_path.exists():
         # merge_output_format='mp4' 以外で保存された場合のフォールバック
         ext = dl_info.get("ext", "mp4")
-        alt = save_dir / f"{video_id}.{ext}"
+        alt = save_dir / f"{basename}.{ext}"
         if alt.exists():
             out_path = alt
         else:

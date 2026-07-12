@@ -146,7 +146,7 @@ def do_search(
     range_end: float = 0.0,
 ):
     if not query.strip():
-        return [], gr.update(choices=[], value=None), []
+        return ([], [], *_EMPTY_SELECTION)
     if not config.TEXT_INDEX_PATH.exists():
         raise gr.Error("インデックスがありません。「動画の追加」タブで動画を登録してください。")
 
@@ -188,7 +188,7 @@ def do_search(
     conn.close()
     if not results:
         gr.Info("該当するシーンが見つかりませんでした。")
-        return [], gr.update(choices=[], value=None), []
+        return ([], [], *_EMPTY_SELECTION)
 
     table = [
         [
@@ -202,11 +202,8 @@ def do_search(
         ]
         for i, r in enumerate(results)
     ]
-    choices = [
-        f"{i + 1}. [{r['match_type']}] {utils.format_timestamp(r['start'])} {r['text'][:30]}"
-        for i, r in enumerate(results)
-    ]
-    return table, gr.update(choices=choices, value=choices[0]), results
+    # 検索直後は先頭候補(行クリックと同じ処理)を自動で読み込む
+    return (table, results, *_select_result(0, results))
 
 
 def make_preview(video_path: str, start: float, end: float, duration: float) -> str:
@@ -233,11 +230,22 @@ def _sentence_choices(sents: list) -> list:
     ]
 
 
-def on_select(selection: str, results: list):
-    if not selection or not results:
-        return (None, gr.update(), gr.update(), gr.update(), gr.update(),
-                None, "", "", [], gr.update(), gr.update())
-    idx = int(selection.split(".")[0]) - 1
+# _select_result/do_searchの「未選択・該当なし」時に返す空の状態
+# (preview, start, end, start_slider, end_slider, ctx, info, transcript,
+#  sents, start_sent_dd, end_sent_dd)
+_EMPTY_SELECTION = (
+    None, gr.update(), gr.update(), gr.update(), gr.update(),
+    None, "", "", [], gr.update(), gr.update(),
+)
+
+
+def _select_result(idx, results: list):
+    """検索結果の指定順位(0始まり)を読み込み、プレビュー等の状態を返す。
+
+    検索直後の自動選択とテーブル行クリックの両方から呼ばれる共通処理。
+    """
+    if idx is None or not results or not (0 <= idx < len(results)):
+        return _EMPTY_SELECTION
     r = results[idx]
 
     conn = db.get_conn()
@@ -276,6 +284,12 @@ def on_select(selection: str, results: list):
         gr.update(choices=choices, value=None),
         gr.update(choices=choices, value=None),
     )
+
+
+def on_table_select(results: list, evt: gr.SelectData):
+    """検索結果テーブルの行クリックで、その行の候補を読み込む。"""
+    idx = evt.index[0] if evt.index is not None else None
+    return _select_result(idx, results)
 
 
 def manual_load(video_choice: str):
@@ -683,12 +697,12 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     value=0, label="終了 (秒)", precision=1, scale=1, min_width=90
                 )
 
+        gr.Markdown("行をクリックすると、その候補を切り抜き対象として読み込みます。")
         result_table = gr.Dataframe(
             headers=["#", "動画", "開始", "終了", "一致方法", "類似度", "テキスト"],
             interactive=False,
             label="検索結果",
         )
-        result_select = gr.Radio(choices=[], label="切り抜く候補を選択")
 
         preview_video = gr.Video(label="プレビュー", autoplay=False)
 
@@ -743,20 +757,19 @@ with gr.Blocks(title="動画シーン検索") as demo:
         saved_path = gr.Textbox(label="保存先", interactive=False)
 
         # --- イベント配線 ---
+        # 検索結果選択(自動選択・行クリック・手動読み込み)で共通して更新する出力
+        selection_outputs = [
+            preview_video, start_num, end_num, start_slider, end_slider,
+            ctx_state, info_box, transcript_box,
+            sentences_state, start_sent_dd, end_sent_dd,
+        ]
         search_inputs = [
             query_box, video_select, top_k, min_score,
             range_chk, range_start_num, range_end_num,
         ]
-        search_btn.click(
-            do_search,
-            inputs=search_inputs,
-            outputs=[result_table, result_select, results_state],
-        )
-        query_box.submit(
-            do_search,
-            inputs=search_inputs,
-            outputs=[result_table, result_select, results_state],
-        )
+        search_outputs = [result_table, results_state, *selection_outputs]
+        search_btn.click(do_search, inputs=search_inputs, outputs=search_outputs)
+        query_box.submit(do_search, inputs=search_inputs, outputs=search_outputs)
         reload_btn.click(lambda: gr.update(choices=list_video_choices()), outputs=[video_select])
         video_select.change(
             sync_range_to_video,
@@ -776,28 +789,14 @@ with gr.Blocks(title="動画シーン検索") as demo:
         range_end_num.input(
             lambda v: gr.update(value=v), inputs=[range_end_num], outputs=[range_end_slider]
         )
-        manual_btn.click(
-            manual_load,
-            inputs=[video_select],
-            outputs=[
-                preview_video, start_num, end_num, start_slider, end_slider,
-                ctx_state, info_box, transcript_box,
-                sentences_state, start_sent_dd, end_sent_dd,
-            ],
-        )
+        manual_btn.click(manual_load, inputs=[video_select], outputs=selection_outputs)
         refresh_sents_btn.click(
             refresh_sentences,
             inputs=[start_num, end_num, ctx_state],
             outputs=[sentences_state, start_sent_dd, end_sent_dd],
         )
-        result_select.change(
-            on_select,
-            inputs=[result_select, results_state],
-            outputs=[
-                preview_video, start_num, end_num, start_slider, end_slider,
-                ctx_state, info_box, transcript_box,
-                sentences_state, start_sent_dd, end_sent_dd,
-            ],
+        result_table.select(
+            on_table_select, inputs=[results_state], outputs=selection_outputs
         )
         # 文字起こしの文ベースの区間調整
         start_sent_dd.change(

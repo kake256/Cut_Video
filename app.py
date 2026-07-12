@@ -111,17 +111,29 @@ def region_transcript(conn, video_id: str, start: float, end: float) -> str:
     return " ".join(r["text"] for r in rows)
 
 
-def sync_range_end_to_duration(video_choice: str, current_end: float):
-    """動画選択時、範囲の終了が未設定(0)ならその動画の長さで初期化する。"""
+def sync_range_to_video(video_choice: str, current_end: float):
+    """動画選択時、範囲用シークバーの上限をその動画の長さに合わせる。
+
+    終了(秒)が未設定(0)の場合は、シークバー・数値欄とも動画の長さで初期化する。
+    """
     video_id = parse_video_choice(video_choice)
-    if not video_id or current_end:
-        return gr.update()
+    if not video_id:
+        return gr.update(), gr.update(), gr.update()
     conn = db.get_conn()
     video = db.get_video(conn, video_id)
     conn.close()
     if not video:
-        return gr.update()
-    return gr.update(value=round(video["duration"], 1))
+        return gr.update(), gr.update(), gr.update()
+
+    duration = round(video["duration"], 1)
+    start_slider_update = gr.update(maximum=duration)
+    if current_end:
+        end_slider_update = gr.update(maximum=duration)
+        end_num_update = gr.update()
+    else:
+        end_slider_update = gr.update(maximum=duration, value=duration)
+        end_num_update = gr.update(value=duration)
+    return start_slider_update, end_slider_update, end_num_update
 
 
 def do_search(
@@ -653,12 +665,23 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 )
             gr.Markdown(
                 "検索範囲を絞ると、動画を1本選んだ上でその範囲内だけを検索対象にします"
-                "(秒単位。動画の長さは検索対象の動画欄の括弧内に表示されています)。"
+                "(シークバーまたは秒数で指定)。"
             )
+            range_chk = gr.Checkbox(value=False, label="検索範囲を指定する")
             with gr.Row():
-                range_chk = gr.Checkbox(value=False, label="検索範囲を指定する")
-                range_start_num = gr.Number(value=0, label="範囲の開始 (秒)", precision=1)
-                range_end_num = gr.Number(value=0, label="範囲の終了 (秒)", precision=1)
+                range_start_slider = gr.Slider(
+                    0, 1, value=0, step=0.1, label="範囲の開始", scale=4
+                )
+                range_start_num = gr.Number(
+                    value=0, label="開始 (秒)", precision=1, scale=1, min_width=90
+                )
+            with gr.Row():
+                range_end_slider = gr.Slider(
+                    0, 1, value=1, step=0.1, label="範囲の終了", scale=4
+                )
+                range_end_num = gr.Number(
+                    value=0, label="終了 (秒)", precision=1, scale=1, min_width=90
+                )
 
         result_table = gr.Dataframe(
             headers=["#", "動画", "開始", "終了", "一致方法", "類似度", "テキスト"],
@@ -736,9 +759,22 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         reload_btn.click(lambda: gr.update(choices=list_video_choices()), outputs=[video_select])
         video_select.change(
-            sync_range_end_to_duration,
+            sync_range_to_video,
             inputs=[video_select, range_end_num],
-            outputs=[range_end_num],
+            outputs=[range_start_slider, range_end_slider, range_end_num],
+        )
+        # 範囲用シークバーと数値欄の相互同期(切り抜き区間のシークバーと同じ方式)
+        range_start_slider.release(
+            lambda v: round(v, 1), inputs=[range_start_slider], outputs=[range_start_num]
+        )
+        range_end_slider.release(
+            lambda v: round(v, 1), inputs=[range_end_slider], outputs=[range_end_num]
+        )
+        range_start_num.input(
+            lambda v: gr.update(value=v), inputs=[range_start_num], outputs=[range_start_slider]
+        )
+        range_end_num.input(
+            lambda v: gr.update(value=v), inputs=[range_end_num], outputs=[range_end_slider]
         )
         manual_btn.click(
             manual_load,

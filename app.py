@@ -21,6 +21,7 @@ from moment_retrieval import config, db, utils
 from moment_retrieval.downloader import DownloadError, download_video
 from moment_retrieval.embedder import TextEmbedder
 from moment_retrieval.refine import expand_to_speech_boundary
+from moment_retrieval.search import search_chunks
 from moment_retrieval.share import ShareError, export_index, import_index
 from moment_retrieval.vector_index import VectorIndex
 
@@ -110,13 +111,43 @@ def region_transcript(conn, video_id: str, start: float, end: float) -> str:
     return " ".join(r["text"] for r in rows)
 
 
-def do_search(query: str, video_choice: str, top_k: int, min_score: float):
+def sync_range_end_to_duration(video_choice: str, current_end: float):
+    """動画選択時、範囲の終了が未設定(0)ならその動画の長さで初期化する。"""
+    video_id = parse_video_choice(video_choice)
+    if not video_id or current_end:
+        return gr.update()
+    conn = db.get_conn()
+    video = db.get_video(conn, video_id)
+    conn.close()
+    if not video:
+        return gr.update()
+    return gr.update(value=round(video["duration"], 1))
+
+
+def do_search(
+    query: str,
+    video_choice: str,
+    top_k: int,
+    min_score: float,
+    range_enabled: bool = False,
+    range_start: float = 0.0,
+    range_end: float = 0.0,
+):
     if not query.strip():
         return [], gr.update(choices=[], value=None), []
     if not config.TEXT_INDEX_PATH.exists():
         raise gr.Error("インデックスがありません。「動画の追加」タブで動画を登録してください。")
 
     video_filter = parse_video_choice(video_choice)
+
+    if range_enabled and not video_filter:
+        raise gr.Error("範囲を指定した検索は、動画を1本選んでから行ってください。")
+
+    start_sec = end_sec = None
+    if range_enabled and video_filter:
+        start_sec, end_sec = float(range_start), float(range_end)
+        if end_sec <= start_sec:
+            raise gr.Error("範囲の終了は開始より後にしてください。")
 
     conn = db.get_conn()
     db.init_db(conn)
@@ -130,30 +161,17 @@ def do_search(query: str, video_choice: str, top_k: int, min_score: float):
             f"再試行してください。({type(e).__name__}: {e})"
         )
     vindex = VectorIndex.load(config.TEXT_INDEX_PATH, query_vec.shape[1])
-    fetch_k = int(top_k) * 5 if video_filter else int(top_k)
-    scores, ids = vindex.search(query_vec, top_k=fetch_k)
-
-    chunks = db.get_chunks_by_ids(conn, [int(i) for i in ids if i != -1])
-
-    results = []
-    for cid, score in zip(ids, scores):
-        cid = int(cid)
-        if cid == -1 or cid not in chunks or float(score) < min_score:
-            continue
-        c = chunks[cid]
-        if video_filter and c["video_id"] != video_filter:
-            continue
-        results.append(
-            {
-                "video_id": c["video_id"],
-                "start": c["start_sec"],
-                "end": c["end_sec"],
-                "score": float(score),
-                "text": c["text"],
-            }
-        )
-        if len(results) >= int(top_k):
-            break
+    results = search_chunks(
+        conn,
+        vindex,
+        query,
+        query_vec,
+        top_k=int(top_k),
+        min_score=float(min_score),
+        video_id=video_filter,
+        start_sec=start_sec,
+        end_sec=end_sec,
+    )
 
     conn.close()
     if not results:
@@ -166,13 +184,14 @@ def do_search(query: str, video_choice: str, top_k: int, min_score: float):
             r["video_id"],
             utils.format_timestamp(r["start"]),
             utils.format_timestamp(r["end"]),
+            r["match_type"],
             f"{r['score']:.3f}",
             r["text"][:60] + ("..." if len(r["text"]) > 60 else ""),
         ]
         for i, r in enumerate(results)
     ]
     choices = [
-        f"{i + 1}. {utils.format_timestamp(r['start'])} {r['text'][:30]}"
+        f"{i + 1}. [{r['match_type']}] {utils.format_timestamp(r['start'])} {r['text'][:30]}"
         for i, r in enumerate(results)
     ]
     return table, gr.update(choices=choices, value=choices[0]), results
@@ -325,6 +344,11 @@ def adjust_time(value: float, ctx: dict, delta: float):
     if hi is not None:
         v = min(v, hi)
     return round(v, 1)
+
+
+def adjust_time_with_step(value: float, ctx: dict, step: float, direction: float):
+    """UIで選択した調整幅だけ開始・終了時刻を前後させる。"""
+    return adjust_time(value, ctx, float(step or 1.0) * float(direction))
 
 
 def always_refresh(start: float, end: float, ctx: dict):
@@ -562,14 +586,14 @@ def do_import(zip_file):
         yield "\n".join(log_lines), gr.update()
 
 
-def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider):
+def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider, step_input):
     with gr.Row():
         gr.Markdown(f"**{label}**")
-        for step in [-s for s in reversed(ADJUST_STEPS)] + ADJUST_STEPS:
-            btn = gr.Button(f"{step:+g}", size="sm", min_width=40)
+        for label_text, direction in (("前へ", -1.0), ("後ろへ", 1.0)):
+            btn = gr.Button(label_text, size="sm")
             btn.click(
-                adjust_time,
-                inputs=[target_number, ctx_state, gr.State(step)],
+                adjust_time_with_step,
+                inputs=[target_number, ctx_state, step_input, gr.State(direction)],
                 outputs=[target_number],
             ).then(
                 lambda v: gr.update(value=v), inputs=[target_number], outputs=[slider]
@@ -619,12 +643,25 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 label="検索クエリ", placeholder="例: 奨学金について話しているところ", scale=4
             )
             search_btn = gr.Button("検索", variant="primary", scale=1)
-        with gr.Row():
-            top_k = gr.Slider(1, 20, value=5, step=1, label="候補数")
-            min_score = gr.Slider(0.0, 1.0, value=config.MIN_SCORE, step=0.01, label="類似度閾値")
+        with gr.Accordion("検索の詳細設定", open=False):
+            gr.Markdown("文字一致は類似度に関係なく表示され、閾値は意味検索だけに適用されます。")
+            with gr.Row():
+                top_k = gr.Slider(1, 20, value=5, step=1, label="表示する候補数")
+                min_score = gr.Slider(
+                    0.0, 1.0, value=config.MIN_SCORE, step=0.01,
+                    label="意味検索の類似度閾値",
+                )
+            gr.Markdown(
+                "検索範囲を絞ると、動画を1本選んだ上でその範囲内だけを検索対象にします"
+                "(秒単位。動画の長さは検索対象の動画欄の括弧内に表示されています)。"
+            )
+            with gr.Row():
+                range_chk = gr.Checkbox(value=False, label="検索範囲を指定する")
+                range_start_num = gr.Number(value=0, label="範囲の開始 (秒)", precision=1)
+                range_end_num = gr.Number(value=0, label="範囲の終了 (秒)", precision=1)
 
         result_table = gr.Dataframe(
-            headers=["#", "動画", "開始", "終了", "スコア", "テキスト"],
+            headers=["#", "動画", "開始", "終了", "一致方法", "類似度", "テキスト"],
             interactive=False,
             label="検索結果",
         )
@@ -636,27 +673,39 @@ with gr.Blocks(title="動画シーン検索") as demo:
         transcript_box = gr.Textbox(label="区間の文字起こし", interactive=False, lines=4)
 
         sentences_state = gr.State([])
-        gr.Markdown("**文字起こしの文で区間を調整** (文を選ぶと開始/終了がその文に合います)")
-        with gr.Row():
-            start_sent_dd = gr.Dropdown(choices=[], label="この文から (開始)", scale=2)
-            end_sent_dd = gr.Dropdown(choices=[], label="この文まで (終了)", scale=2)
-            refresh_sents_btn = gr.Button("この区間周辺の文を再取得", scale=1)
+        with gr.Accordion("文単位で区間を調整", open=False):
+            gr.Markdown("文を選ぶと、開始・終了時刻がその文の境界に合います。")
+            with gr.Row():
+                start_sent_dd = gr.Dropdown(choices=[], label="この文から (開始)", scale=2)
+                end_sent_dd = gr.Dropdown(choices=[], label="この文まで (終了)", scale=2)
+                refresh_sents_btn = gr.Button("周辺の文を再取得", scale=1)
 
-        start_slider = gr.Slider(0, 1, value=0, step=0.1, label="開始 (シークバー)")
-        end_slider = gr.Slider(0, 1, value=1, step=0.1, label="終了 (シークバー)")
+        with gr.Accordion("秒単位で区間を微調整", open=False):
+            start_slider = gr.Slider(0, 1, value=0, step=0.1, label="開始位置")
+            end_slider = gr.Slider(0, 1, value=1, step=0.1, label="終了位置")
 
-        with gr.Row():
-            start_num = gr.Number(value=0, label="開始 (秒)", precision=1)
-            end_num = gr.Number(value=0, label="終了 (秒)", precision=1)
+            with gr.Row():
+                start_num = gr.Number(value=0, label="開始 (秒)", precision=1)
+                end_num = gr.Number(value=0, label="終了 (秒)", precision=1)
 
-        preview_io = {
-            "inputs": [start_num, end_num, ctx_state],
-            "outputs": [preview_video, info_box, transcript_box],
-        }
-        build_adjust_row("開始を調整", start_num, ctx_state, preview_io, start_slider)
-        build_adjust_row("終了を調整", end_num, ctx_state, preview_io, end_slider)
+            adjust_step = gr.Radio(
+                choices=ADJUST_STEPS,
+                value=1.0,
+                label="調整幅 (秒)",
+            )
 
-        update_btn = gr.Button("プレビュー更新")
+            preview_io = {
+                "inputs": [start_num, end_num, ctx_state],
+                "outputs": [preview_video, info_box, transcript_box],
+            }
+            build_adjust_row(
+                "開始を調整", start_num, ctx_state, preview_io, start_slider, adjust_step
+            )
+            build_adjust_row(
+                "終了を調整", end_num, ctx_state, preview_io, end_slider, adjust_step
+            )
+
+            update_btn = gr.Button("プレビュー更新")
 
         gr.Markdown("### 保存")
         with gr.Row():
@@ -671,17 +720,26 @@ with gr.Blocks(title="動画シーン検索") as demo:
         saved_path = gr.Textbox(label="保存先", interactive=False)
 
         # --- イベント配線 ---
+        search_inputs = [
+            query_box, video_select, top_k, min_score,
+            range_chk, range_start_num, range_end_num,
+        ]
         search_btn.click(
             do_search,
-            inputs=[query_box, video_select, top_k, min_score],
+            inputs=search_inputs,
             outputs=[result_table, result_select, results_state],
         )
         query_box.submit(
             do_search,
-            inputs=[query_box, video_select, top_k, min_score],
+            inputs=search_inputs,
             outputs=[result_table, result_select, results_state],
         )
         reload_btn.click(lambda: gr.update(choices=list_video_choices()), outputs=[video_select])
+        video_select.change(
+            sync_range_end_to_duration,
+            inputs=[video_select, range_end_num],
+            outputs=[range_end_num],
+        )
         manual_btn.click(
             manual_load,
             inputs=[video_select],

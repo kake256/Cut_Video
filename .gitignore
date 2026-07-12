@@ -11,6 +11,17 @@ clips/
 # 入力動画 (サイズが大きいため各自配置)
 video/
 
+# 共有用インデックス (文字起こしなどの個人情報を含む可能性がある)
+exports/
+
+# ローカル設定・認証情報
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
 # OS
 Thumbs.db
 .DS_Store

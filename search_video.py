@@ -11,6 +11,7 @@ from pathlib import Path
 
 from moment_retrieval import config, db, utils
 from moment_retrieval.embedder import TextEmbedder
+from moment_retrieval.search import search_chunks
 from moment_retrieval.vector_index import VectorIndex
 
 
@@ -43,14 +44,42 @@ def main():
         default=config.BOUNDARY_GAP_SEC,
         help="この秒数以上の無音で話の切れ目とみなす",
     )
+    parser.add_argument(
+        "--start-sec", type=float, default=None,
+        help="この秒数以降だけを検索対象にする(--video-idと併用必須)",
+    )
+    parser.add_argument(
+        "--end-sec", type=float, default=None,
+        help="この秒数までだけを検索対象にする(--video-idと併用必須)",
+    )
     args = parser.parse_args()
 
     if not config.TEXT_INDEX_PATH.exists():
         print("インデックスが見つかりません。先に index_video.py を実行してください。", file=sys.stderr)
         sys.exit(1)
 
+    range_specified = args.start_sec is not None or args.end_sec is not None
+    if range_specified and not args.video_id:
+        print("--start-sec/--end-secは--video-idと併用してください。", file=sys.stderr)
+        sys.exit(1)
+
     conn = db.get_conn()
     db.init_db(conn)
+
+    start_sec, end_sec = args.start_sec, args.end_sec
+    if range_specified:
+        video = db.get_video(conn, args.video_id)
+        if not video:
+            print(f"動画が見つかりません: {args.video_id}", file=sys.stderr)
+            sys.exit(1)
+        # 片方だけ指定した場合は動画の先頭/末尾で補完する
+        if start_sec is None:
+            start_sec = 0.0
+        if end_sec is None:
+            end_sec = video["duration"]
+        if end_sec <= start_sec:
+            print("--end-secは--start-secより後の値にしてください。", file=sys.stderr)
+            sys.exit(1)
 
     embedder = TextEmbedder()
     query_vec = embedder.encode([args.query])
@@ -58,65 +87,60 @@ def main():
 
     vindex = VectorIndex.load(config.TEXT_INDEX_PATH, dim)
 
-    # video_idで絞り込む場合、フィルタで捨てられる分を見込んで多めに取得する
-    fetch_k = args.top_k * 5 if args.video_id else args.top_k
-    scores, ids = vindex.search(query_vec, top_k=max(fetch_k, args.top_k))
-
-    valid_ids = [int(cid) for cid in ids if cid != -1]
-    chunks = db.get_chunks_by_ids(conn, valid_ids)
-
-    results = []
-    for cid, score in zip(ids, scores):
-        cid = int(cid)
-        if cid == -1:
-            continue
-        chunk = chunks.get(cid)
-        if not chunk:
-            continue
-        if args.video_id and chunk["video_id"] != args.video_id:
-            continue
-        if float(score) < args.min_score:
-            continue
-        results.append((float(score), chunk))
-        if len(results) >= args.top_k:
-            break
+    results = search_chunks(
+        conn,
+        vindex,
+        args.query,
+        query_vec,
+        top_k=args.top_k,
+        min_score=args.min_score,
+        video_id=args.video_id,
+        start_sec=start_sec,
+        end_sec=end_sec,
+    )
 
     if not results:
-        print(f"該当するシーンが見つかりませんでした。(類似度 {args.min_score} 以上の候補なし)")
+        print(
+            "該当するシーンが見つかりませんでした。"
+            f"(文字一致なし、意味類似度 {args.min_score} 以上の候補なし)"
+        )
         return
 
     print(f"クエリ: {args.query!r}")
     print("-" * 60)
-    for rank, (score, chunk) in enumerate(results, start=1):
-        start_ts = utils.format_timestamp(chunk["start_sec"])
-        end_ts = utils.format_timestamp(chunk["end_sec"])
-        print(f"{rank}. [{chunk['video_id']}] {start_ts} - {end_ts} (score={score:.3f})")
-        preview = chunk["text"][:80] + ("..." if len(chunk["text"]) > 80 else "")
+    for rank, result in enumerate(results, start=1):
+        start_ts = utils.format_timestamp(result["start"])
+        end_ts = utils.format_timestamp(result["end"])
+        print(
+            f"{rank}. [{result['video_id']}] {start_ts} - {end_ts} "
+            f"({result['match_type']}, score={result['score']:.3f})"
+        )
+        preview = result["text"][:80] + ("..." if len(result["text"]) > 80 else "")
         print(f"   {preview}")
 
     if args.cut:
         from cut_clip import cut_clip
         from moment_retrieval.refine import expand_to_speech_boundary
 
-        for rank, (score, chunk) in enumerate(results[: args.cut_top_n], start=1):
-            video = db.get_video(conn, chunk["video_id"])
+        for rank, result in enumerate(results[: args.cut_top_n], start=1):
+            video = db.get_video(conn, result["video_id"])
             if not video:
                 continue
 
-            start, end = chunk["start_sec"], chunk["end_sec"]
+            start, end = result["start"], result["end"]
             if not args.no_expand:
                 start, end = expand_to_speech_boundary(
-                    conn, chunk["video_id"], start, end, gap_sec=args.gap
+                    conn, result["video_id"], start, end, gap_sec=args.gap
                 )
                 print(
-                    f"境界拡張: {utils.format_timestamp(chunk['start_sec'])}-"
-                    f"{utils.format_timestamp(chunk['end_sec'])} → "
+                    f"境界拡張: {utils.format_timestamp(result['start'])}-"
+                    f"{utils.format_timestamp(result['end'])} → "
                     f"{utils.format_timestamp(start)}-{utils.format_timestamp(end)}"
                 )
 
             args.output_dir.mkdir(parents=True, exist_ok=True)
             out_path = (
-                args.output_dir / f"{chunk['video_id']}_{rank}_{int(start)}.mp4"
+                args.output_dir / f"{result['video_id']}_{rank}_{int(start)}.mp4"
             )
             print(f"切り出し中: {out_path}")
             cut_clip(

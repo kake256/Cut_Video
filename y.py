@@ -40,10 +40,9 @@ def download_youtube_video_as_mp4(url, save_path="./"):
 
 if __name__ == "__main__":
     video_url = input("Enter the YouTube video URL: ").strip()
-    #save_directory = input("Enter the directory to save the video (leave blank for current directory): ").strip()
-    save_directory = "d:\ゲラ\配信"
-    if not save_directory:
-        save_directory = "./"
+    save_directory = input(
+        "Enter the directory to save the video (leave blank for current directory): "
+    ).strip() or "./"
 
     print(f"Downloading video from: {video_url}")
     download_youtube_video_as_mp4(video_url, save_path=save_directory)

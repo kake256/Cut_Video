@@ -136,6 +136,22 @@ def sync_range_to_video(video_choice: str, current_end: float):
     return start_slider_update, end_slider_update, end_num_update
 
 
+def _build_table(results: list, selected_idx=None) -> list:
+    """検索結果を表形式にする。選択中の行はラジオボタン風に●で示す。"""
+    return [
+        [
+            f"{'●' if i == selected_idx else '○'} {i + 1}",
+            r["video_id"],
+            utils.format_timestamp(r["start"]),
+            utils.format_timestamp(r["end"]),
+            r["match_type"],
+            f"{r['score']:.3f}",
+            r["text"][:60] + ("..." if len(r["text"]) > 60 else ""),
+        ]
+        for i, r in enumerate(results)
+    ]
+
+
 def do_search(
     query: str,
     video_choice: str,
@@ -190,19 +206,8 @@ def do_search(
         gr.Info("該当するシーンが見つかりませんでした。")
         return ([], [], *_EMPTY_SELECTION)
 
-    table = [
-        [
-            i + 1,
-            r["video_id"],
-            utils.format_timestamp(r["start"]),
-            utils.format_timestamp(r["end"]),
-            r["match_type"],
-            f"{r['score']:.3f}",
-            r["text"][:60] + ("..." if len(r["text"]) > 60 else ""),
-        ]
-        for i, r in enumerate(results)
-    ]
-    # 検索直後は先頭候補(行クリックと同じ処理)を自動で読み込む
+    # 検索直後は先頭候補(行クリックと同じ処理)を自動で選択する
+    table = _build_table(results, selected_idx=0)
     return (table, results, *_select_result(0, results))
 
 
@@ -287,9 +292,13 @@ def _select_result(idx, results: list):
 
 
 def on_table_select(results: list, evt: gr.SelectData):
-    """検索結果テーブルの行クリックで、その行の候補を読み込む。"""
+    """検索結果テーブルの行クリックで、その行の候補を読み込む。
+
+    選択行の●印を更新するため、テーブル自体も再描画して返す。
+    """
     idx = evt.index[0] if evt.index is not None else None
-    return _select_result(idx, results)
+    table = _build_table(results, selected_idx=idx)
+    return (table, *_select_result(idx, results))
 
 
 def manual_load(video_choice: str):
@@ -677,8 +686,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     0.0, 1.0, value=config.MIN_SCORE, step=0.01,
                     label="意味検索の類似度閾値",
                 )
+        with gr.Accordion("検索範囲を指定する", open=False):
             gr.Markdown(
-                "検索範囲を絞ると、動画を1本選んだ上でその範囲内だけを検索対象にします"
+                "動画を1本選んだ上で範囲を絞ると、その範囲内だけを検索対象にします"
                 "(シークバーまたは秒数で指定)。"
             )
             range_chk = gr.Checkbox(value=False, label="検索範囲を指定する")
@@ -796,7 +806,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[sentences_state, start_sent_dd, end_sent_dd],
         )
         result_table.select(
-            on_table_select, inputs=[results_state], outputs=selection_outputs
+            on_table_select,
+            inputs=[results_state],
+            outputs=[result_table, *selection_outputs]
         )
         # 文字起こしの文ベースの区間調整
         start_sent_dd.change(

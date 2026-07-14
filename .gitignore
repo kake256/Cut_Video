@@ -25,4 +25,5 @@ credentials*.json
 # OS
 Thumbs.db
 .DS_Store
+*.lnk
 .claude/settings.local.json

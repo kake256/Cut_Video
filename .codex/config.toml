@@ -1,0 +1,16 @@
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+
+[agents]
+max_threads = 3
+max_depth = 1
+
+[agents.terra_worker]
+description = "Routine implementation, refactoring, tests, repository searches, and mechanical verification."
+config_file = "./agents/terra_worker.toml"
+nickname_candidates = ["Terra Builder", "Terra Runner"]
+
+[agents.sol_reviewer]
+description = "Architecture, ambiguous requirements, risk analysis, and high-value correctness review."
+config_file = "./agents/sol_reviewer.toml"
+nickname_candidates = ["Sol Architect", "Sol Auditor"]

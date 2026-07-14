@@ -7,6 +7,7 @@
 「動画の追加」タブ: 新規動画の文字起こし〜インデックス化をWebUIから実行。
 """
 import faulthandler
+import hashlib
 import threading
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import gradio as gr
 _crash_log = open("data/crash_trace.log", "a", encoding="utf-8", errors="replace")
 faulthandler.enable(file=_crash_log)
 
-from cut_clip import cut_clip
+from cut_clip import cut_clip, cut_clips
 from moment_retrieval import config, db, utils
 from moment_retrieval.downloader import DownloadError, download_video
 from moment_retrieval.embedder import TextEmbedder
@@ -405,7 +406,122 @@ def pick_sentence(sel: str, sents: list, which: str):
     return v, gr.update(value=v)
 
 
-def on_save(start: float, end: float, ctx: dict, precise: bool, out_dir: str, filename: str):
+def _clip_plan_ranges(start: float, end: float, plan: dict | None) -> list[list[float]]:
+    """現在の外側区間に対応する保持区間を返す。区間変更後の古い計画は使わない。"""
+    start, end = float(start or 0.0), float(end or 0.0)
+    if end <= start:
+        return []
+    if (
+        isinstance(plan, dict)
+        and abs(float(plan.get("base_start", -1.0)) - start) < 0.001
+        and abs(float(plan.get("base_end", -1.0)) - end) < 0.001
+        and plan.get("ranges")
+    ):
+        return [[float(s), float(e)] for s, e in plan["ranges"]]
+    return [[start, end]]
+
+
+def _clip_plan_view(ranges: list[list[float]]) -> tuple[list, str]:
+    table = [
+        [i, utils.format_timestamp(s), utils.format_timestamp(e), round(e - s, 1)]
+        for i, (s, e) in enumerate(ranges, 1)
+    ]
+    total = sum(e - s for s, e in ranges)
+    return table, f"保持区間: {len(ranges)}個 / 出力予定: {total:.1f}秒"
+
+
+def reset_clip_plan(start: float, end: float):
+    """外側の開始・終了を1つの保持区間として編集計画を初期化する。"""
+    ranges = _clip_plan_ranges(start, end, None)
+    if not ranges:
+        return None, [], "開始・終了を正しく指定してください。"
+    plan = {"base_start": float(start), "base_end": float(end), "ranges": ranges}
+    table, summary = _clip_plan_view(ranges)
+    return plan, table, summary
+
+
+def exclude_clip_range(
+    start: float,
+    end: float,
+    exclude_start: float,
+    exclude_end: float,
+    plan: dict | None,
+):
+    """保持区間から指定区間を差し引く。複数回の除外で複数窓を作れる。"""
+    start, end = float(start or 0.0), float(end or 0.0)
+    cut_start, cut_end = float(exclude_start or 0.0), float(exclude_end or 0.0)
+    if end <= start:
+        raise gr.Error("先に切り抜く開始・終了を正しく指定してください。")
+    if cut_end <= cut_start:
+        raise gr.Error("除外終了は除外開始より後にしてください。")
+    if cut_start < start or cut_end > end:
+        raise gr.Error("除外区間は、選択中の開始・終了の内側に指定してください。")
+
+    ranges = _clip_plan_ranges(start, end, plan)
+    new_ranges = []
+    changed = False
+    for range_start, range_end in ranges:
+        if cut_end <= range_start or cut_start >= range_end:
+            new_ranges.append([range_start, range_end])
+            continue
+        changed = True
+        if range_start < cut_start:
+            new_ranges.append([range_start, min(cut_start, range_end)])
+        if cut_end < range_end:
+            new_ranges.append([max(cut_end, range_start), range_end])
+
+    if not changed:
+        raise gr.Error("その区間は既に除外されています。")
+    if not new_ranges:
+        raise gr.Error("選択区間のすべてを除外することはできません。")
+
+    new_plan = {"base_start": start, "base_end": end, "ranges": new_ranges}
+    table, summary = _clip_plan_view(new_ranges)
+    return new_plan, table, summary
+
+
+def preview_clip_plan(start: float, end: float, ctx: dict, plan: dict | None):
+    """除外後の保持区間を連結したプレビューを作る。"""
+    if not ctx:
+        raise gr.Error("先に検索結果を選択してください。")
+    ranges = _clip_plan_ranges(start, end, plan)
+    if not ranges:
+        raise gr.Error("終了は開始より後にしてください。")
+    if len(ranges) == 1:
+        preview = make_preview(ctx["video_path"], ranges[0][0], ranges[0][1], ctx["duration"])
+    else:
+        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        range_key = repr([(round(s, 3), round(e, 3)) for s, e in ranges])
+        key = hashlib.sha1(range_key.encode("utf-8")).hexdigest()[:16]
+        out = PREVIEW_DIR / f"preview_multi_{ctx['video_id']}_{key}.mp4"
+        if not out.exists():
+            cut_clips(
+                Path(ctx["video_path"]), ranges, out,
+                precise=False, duration=ctx["duration"],
+            )
+        preview = str(out)
+    conn = db.get_conn()
+    try:
+        transcripts = [
+            region_transcript(conn, ctx["video_id"], range_start, range_end)
+            for range_start, range_end in ranges
+        ]
+    finally:
+        conn.close()
+    transcript = "\n\n--- 除外区間 ---\n\n".join(text for text in transcripts if text)
+    _, summary = _clip_plan_view(ranges)
+    return preview, f"{summary}（除外後の連結プレビュー）", transcript
+
+
+def on_save(
+    start: float,
+    end: float,
+    ctx: dict,
+    plan: dict | None,
+    precise: bool,
+    out_dir: str,
+    filename: str,
+):
     if not ctx:
         raise gr.Error("先に検索結果を選択してください。")
     if end <= start:
@@ -422,9 +538,10 @@ def on_save(start: float, end: float, ctx: dict, precise: bool, out_dir: str, fi
     if out.exists():
         raise gr.Error(f"既に存在します: {out} (ファイル名を変えてください)")
 
-    cut_clip(
-        Path(ctx["video_path"]), start, end, out,
-        pad=0.0, precise=precise, duration=ctx["duration"],
+    ranges = _clip_plan_ranges(start, end, plan)
+    cut_clips(
+        Path(ctx["video_path"]), ranges, out,
+        precise=precise, duration=ctx["duration"],
     )
     gr.Info(f"保存しました: {out}")
     return str(out.resolve())
@@ -754,6 +871,30 @@ with gr.Blocks(title="動画シーン検索") as demo:
 
             update_btn = gr.Button("プレビュー更新")
 
+        clip_plan_state = gr.State(None)
+        with gr.Accordion("途中を除外する（複数区間を連結）", open=False):
+            gr.Markdown(
+                "選択中の開始・終了から不要な区間を除外します。複数回指定でき、"
+                "残った区間は時系列順に1本の動画へ連結されます。"
+            )
+            with gr.Row():
+                exclude_start_num = gr.Number(
+                    value=0, label="除外開始 (秒)", precision=1, scale=2
+                )
+                exclude_end_num = gr.Number(
+                    value=0, label="除外終了 (秒)", precision=1, scale=2
+                )
+            with gr.Row():
+                exclude_btn = gr.Button("この区間を除外", variant="secondary")
+                reset_plan_btn = gr.Button("除外をすべて取り消す")
+                multi_preview_btn = gr.Button("除外後をプレビュー")
+            clip_plan_summary = gr.Markdown("保持区間は、動画を選択すると表示されます。")
+            clip_plan_table = gr.Dataframe(
+                headers=["#", "開始", "終了", "長さ (秒)"],
+                interactive=False,
+                label="保存する区間",
+            )
+
         gr.Markdown("### 保存")
         with gr.Row():
             out_dir_box = gr.Textbox(value=DEFAULT_CLIPS_DIR, label="保存先フォルダ", scale=3)
@@ -847,6 +988,17 @@ with gr.Blocks(title="動画シーン検索") as demo:
         # 数値欄の直接編集もシークバーに反映
         start_num.input(lambda v: gr.update(value=v), inputs=[start_num], outputs=[start_slider])
         end_num.input(lambda v: gr.update(value=v), inputs=[end_num], outputs=[end_slider])
+        # 外側の区間が変わった場合、以前の除外位置は意味が変わるため初期化する
+        start_num.change(
+            reset_clip_plan,
+            inputs=[start_num, end_num],
+            outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+        )
+        end_num.change(
+            reset_clip_plan,
+            inputs=[start_num, end_num],
+            outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+        )
         # 数値を直接入力してEnterで確定した場合もプレビューへ反映
         start_num.submit(
             always_refresh, inputs=preview_io["inputs"], outputs=preview_io["outputs"]
@@ -860,10 +1012,30 @@ with gr.Blocks(title="動画シーン検索") as demo:
             inputs=[start_num, end_num, ctx_state],
             outputs=[preview_video, info_box, transcript_box],
         )
+        exclude_btn.click(
+            exclude_clip_range,
+            inputs=[
+                start_num, end_num, exclude_start_num, exclude_end_num, clip_plan_state,
+            ],
+            outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+        )
+        reset_plan_btn.click(
+            reset_clip_plan,
+            inputs=[start_num, end_num],
+            outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+        )
+        multi_preview_btn.click(
+            preview_clip_plan,
+            inputs=[start_num, end_num, ctx_state, clip_plan_state],
+            outputs=[preview_video, info_box, transcript_box],
+        )
         folder_btn.click(browse_folder, inputs=[out_dir_box], outputs=[out_dir_box])
         save_btn.click(
             on_save,
-            inputs=[start_num, end_num, ctx_state, precise_chk, out_dir_box, filename_box],
+            inputs=[
+                start_num, end_num, ctx_state, clip_plan_state,
+                precise_chk, out_dir_box, filename_box,
+            ],
             outputs=[saved_path],
         )
 

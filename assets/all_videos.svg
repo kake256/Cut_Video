@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360">
+  <rect width="640" height="360" rx="24" fill="#243044"/>
+  <g fill="none" stroke="#8fb6ff" stroke-width="16">
+    <rect x="120" y="94" width="300" height="172" rx="14"/>
+    <path d="M220 70h300a16 16 0 0 1 16 16v172" opacity=".55"/>
+  </g>
+  <path d="m264 137 93 43-93 43z" fill="#fff"/>
+  <text x="320" y="318" text-anchor="middle" fill="#fff" font-family="sans-serif" font-size="34">ALL VIDEOS</text>
+</svg>

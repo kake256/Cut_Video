@@ -8,6 +8,8 @@
 """
 import faulthandler
 import hashlib
+import math
+import subprocess
 import threading
 from pathlib import Path
 
@@ -27,9 +29,13 @@ from moment_retrieval.share import ShareError, export_index, import_index
 from moment_retrieval.vector_index import VectorIndex
 
 PREVIEW_DIR = Path("data/previews")
+THUMBNAIL_DIR = Path("data/thumbnails")
+ALL_VIDEOS_IMAGE = Path("assets/all_videos.svg")
+VIDEO_UNAVAILABLE_IMAGE = Path("assets/video_unavailable.svg")
 DEFAULT_CLIPS_DIR = "clips"
 APP_PORT = 7860
 INDEX_JOB_PIDFILE = Path("data/index_job.pid")
+ALL_VIDEOS_VALUE = "__all_videos__"
 
 ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
 
@@ -85,22 +91,125 @@ def list_video_choices() -> list:
     db.init_db(conn)
     videos = db.list_videos(conn)
     conn.close()
-    choices = ["(すべての動画)"]
+    # Dropdownには「表示名, 内部値」の組を渡す。内部IDを先頭に表示すると
+    # 動画を見分けにくいため、利用者にはファイル名と長さだけを見せる。
+    choices = [("すべての動画", ALL_VIDEOS_VALUE)]
     for v in videos:
         name = Path(v["path"]).name
-        choices.append(f"{v['video_id']}  ({name}, {utils.format_timestamp(v['duration'])})")
+        label = f"{name}  —  {utils.format_timestamp(v['duration'])}"
+        choices.append((label, v["video_id"]))
     return choices
 
 
 def list_video_choices_only() -> list:
-    """「(すべての動画)」を除いた個別動画の選択肢一覧(共有タブ用)。"""
-    return [c for c in list_video_choices() if not c.startswith("(")]
+    """「すべての動画」を除いた個別動画の選択肢一覧(共有タブ用)。"""
+    return list_video_choices()[1:]
 
 
 def parse_video_choice(choice: str) -> str:
-    if not choice or choice.startswith("("):
+    if not choice or choice == ALL_VIDEOS_VALUE or choice.startswith("("):
         return None
-    return choice.split()[0]
+    # 旧UIの「video_id  (filename, duration)」形式も受け付ける。
+    return choice.split()[0] if "  (" in choice else choice
+
+
+def _thumbnail_path(video: dict) -> Path:
+    """動画の内容が変わった場合だけ作り直すサムネイルの保存先を返す。"""
+    source = Path(video["path"])
+    try:
+        stamp = source.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    key = hashlib.sha256(
+        f"{video['video_id']}|{source}|{stamp}".encode("utf-8")
+    ).hexdigest()[:20]
+    return THUMBNAIL_DIR / f"{key}.jpg"
+
+
+def _make_video_thumbnail(video: dict) -> str | None:
+    """冒頭の黒画面を避けた位置からローカル用サムネイルを生成する。"""
+    source = Path(video["path"])
+    if not source.exists():
+        return None
+    output = _thumbnail_path(video)
+    if output.exists():
+        return str(output.resolve())
+
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    duration = float(video.get("duration") or 0)
+    seek = min(30.0, max(1.0, duration * 0.1)) if duration > 0 else 1.0
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-ss", f"{seek:.3f}", "-i", str(source),
+            "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3", str(output),
+        ],
+        capture_output=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0 or not output.exists():
+        output.unlink(missing_ok=True)
+        return None
+    return str(output.resolve())
+
+
+def selected_video_info(video_choice: str):
+    """検索前に、現在選択している対象動画を視覚的に確認できるようにする。"""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        return gr.update(value=None, visible=False), "**検索対象:** すべての動画"
+
+    conn = db.get_conn()
+    try:
+        video = db.get_video(conn, video_id)
+    finally:
+        conn.close()
+    if not video:
+        return gr.update(value=None, visible=False), "対象動画の情報を取得できませんでした。"
+
+    name = Path(video["path"]).name
+    duration = utils.format_timestamp(video["duration"])
+    thumbnail = _make_video_thumbnail(video)
+    detail = f"**検索対象:** {name}  \n**長さ:** {duration}"
+    return gr.update(value=thumbnail, visible=bool(thumbnail)), detail
+
+
+def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDEOS_VALUE):
+    """サムネイル付きの動画選択メニューと、各カードに対応する内部IDを返す。"""
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        videos = db.list_videos(conn)
+    finally:
+        conn.close()
+
+    needle = (filter_text or "").strip().casefold()
+    items = [(str(ALL_VIDEOS_IMAGE.resolve()), f"すべての動画（{len(videos)}本）")]
+    video_ids = [ALL_VIDEOS_VALUE]
+    for video in videos:
+        name = Path(video["path"]).name
+        if needle and needle not in name.casefold():
+            continue
+        thumbnail = _make_video_thumbnail(video)
+        image = thumbnail or str(VIDEO_UNAVAILABLE_IMAGE.resolve())
+        caption = f"{name}\n{utils.format_timestamp(video['duration'])}"
+        items.append((image, caption))
+        video_ids.append(video["video_id"])
+
+    try:
+        selected_index = video_ids.index(selected_video_id)
+    except ValueError:
+        selected_index = None
+    return gr.update(value=items, selected_index=selected_index), video_ids
+
+
+def select_video_from_gallery(video_ids: list[str], evt: gr.SelectData):
+    """カードを検索対象にして選択中表示を更新する。"""
+    index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
+    if not isinstance(index, int) or not 0 <= index < len(video_ids):
+        raise gr.Error("動画を選択できませんでした。一覧を更新してください。")
+    video_id = video_ids[index]
+    thumbnail_update, detail = selected_video_info(video_id)
+    return video_id, thumbnail_update, detail, gr.update(selected_index=index)
 
 
 def region_transcript(conn, video_id: str, start: float, end: float) -> str:
@@ -142,7 +251,7 @@ def _build_table(results: list, selected_idx=None) -> list:
     return [
         [
             f"{'●' if i == selected_idx else '○'} {i + 1}",
-            r["video_id"],
+            r.get("video_name") or r["video_id"],
             utils.format_timestamp(r["start"]),
             utils.format_timestamp(r["end"]),
             r["match_type"],
@@ -151,6 +260,35 @@ def _build_table(results: list, selected_idx=None) -> list:
         ]
         for i, r in enumerate(results)
     ]
+
+
+def _preview_update(
+    preview_path: str | None,
+    video_path: str | None,
+    video_id: str | None = None,
+    edited: bool = False,
+):
+    """プレビュー値と、現在の動画を識別できるラベルをまとめて返す。"""
+    if not preview_path or not video_path:
+        return gr.update(value=None, label="共通プレビュー")
+    filename = Path(video_path).name
+    identifier = f" [{video_id}]" if video_id and video_id != filename else ""
+    suffix = "（編集結果）" if edited else ""
+    return gr.update(
+        value=preview_path,
+        label=f"プレビュー: {filename}{identifier}{suffix}",
+    )
+
+
+def _safe_time_range(start, end) -> tuple[float, float] | None:
+    """イベント競合でNone等が届いた場合に安全に判定する。"""
+    try:
+        start_value, end_value = float(start), float(end)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(start_value) or not math.isfinite(end_value):
+        return None
+    return start_value, end_value
 
 
 def do_search(
@@ -202,6 +340,15 @@ def do_search(
         end_sec=end_sec,
     )
 
+    videos_by_id = {}
+    for video in db.list_videos(conn):
+        filename = Path(video["path"]).name
+        videos_by_id[video["video_id"]] = (
+            f"{filename} [{video['video_id']}]"
+            if filename != video["video_id"] else filename
+        )
+    for result in results:
+        result["video_name"] = videos_by_id.get(result["video_id"], result["video_id"])
     conn.close()
     if not results:
         gr.Info("該当するシーンが見つかりませんでした。")
@@ -238,10 +385,12 @@ def _sentence_choices(sents: list) -> list:
 
 # _select_result/do_searchの「未選択・該当なし」時に返す空の状態
 # (preview, start, end, start_slider, end_slider, ctx, info, transcript,
-#  sents, start_sent_dd, end_sent_dd)
+#  sents, start_sent_dd, end_sent_dd, preview_origin)
 _EMPTY_SELECTION = (
-    None, gr.update(), gr.update(), gr.update(), gr.update(),
+    gr.update(value=None, label="共通プレビュー"),
+    gr.update(), gr.update(), gr.update(), gr.update(),
     None, "", "", [], gr.update(), gr.update(),
+    gr.update(value=0.0),
 )
 
 
@@ -270,6 +419,7 @@ def _select_result(idx, results: list):
     duration = video["duration"]
     preview = make_preview(video["path"], start, end, duration)
     info = (
+        "プレビュー中: 元の全体範囲\n"
         f"動画: {video['path']}\n"
         f"ヒット区間: {utils.format_timestamp(r['start'])} - {utils.format_timestamp(r['end'])}\n"
         f"拡張後: {utils.format_timestamp(start)} - {utils.format_timestamp(end)} "
@@ -278,7 +428,7 @@ def _select_result(idx, results: list):
     ctx = {"video_path": video["path"], "duration": duration, "video_id": r["video_id"]}
     choices = _sentence_choices(sents)
     return (
-        preview,
+        _preview_update(preview, video["path"], r["video_id"]),
         round(start, 1),
         round(end, 1),
         gr.update(minimum=0, maximum=round(duration, 1), value=round(start, 1)),
@@ -289,6 +439,7 @@ def _select_result(idx, results: list):
         sents,
         gr.update(choices=choices, value=None),
         gr.update(choices=choices, value=None),
+        round(start, 1),
     )
 
 
@@ -322,6 +473,7 @@ def manual_load(video_choice: str):
 
     preview = make_preview(video["path"], start, end, duration)
     info = (
+        "プレビュー中: 元の全体範囲\n"
         f"動画: {video['path']}\n"
         f"区間: {utils.format_timestamp(start)} - {utils.format_timestamp(end)} "
         f"(長さ {end - start:.1f} 秒) ※検索なしの手動指定モード"
@@ -329,7 +481,7 @@ def manual_load(video_choice: str):
     ctx = {"video_path": video["path"], "duration": duration, "video_id": video_id}
     choices = _sentence_choices(sents)
     return (
-        preview,
+        _preview_update(preview, video["path"], video_id),
         round(start, 1),
         round(end, 1),
         gr.update(minimum=0, maximum=round(duration, 1), value=round(start, 1)),
@@ -340,6 +492,7 @@ def manual_load(video_choice: str):
         sents,
         gr.update(choices=choices, value=None),
         gr.update(choices=choices, value=None),
+        round(start, 1),
     )
 
 
@@ -347,6 +500,10 @@ def refresh_sentences(start: float, end: float, ctx: dict):
     """現在の区間の前後90秒で文リストを取り直す。"""
     if not ctx:
         raise gr.Error("先に動画を読み込むか検索結果を選択してください。")
+    time_range = _safe_time_range(start, end)
+    if not time_range or time_range[1] <= time_range[0]:
+        raise gr.Error("開始・終了を正しく指定してください。")
+    start, end = time_range
     conn = db.get_conn()
     sents = get_region_sentences(
         conn, ctx["video_id"], max(0.0, start - 90.0), end + 90.0
@@ -359,6 +516,10 @@ def refresh_sentences(start: float, end: float, ctx: dict):
 def refresh_preview(start: float, end: float, ctx: dict):
     if not ctx:
         raise gr.Error("先に検索結果を選択してください。")
+    time_range = _safe_time_range(start, end)
+    if not time_range:
+        raise gr.Error("開始・終了を正しく指定してください。")
+    start, end = time_range
     if end <= start:
         raise gr.Error("終了は開始より後にしてください。")
     preview = make_preview(ctx["video_path"], start, end, ctx["duration"])
@@ -366,11 +527,17 @@ def refresh_preview(start: float, end: float, ctx: dict):
     transcript = region_transcript(conn, ctx["video_id"], start, end)
     conn.close()
     info = (
+        "プレビュー中: 元の全体範囲\n"
         f"動画: {ctx['video_path']}\n"
         f"区間: {utils.format_timestamp(start)} - {utils.format_timestamp(end)} "
         f"(長さ {end - start:.1f} 秒)"
     )
-    return preview, info, transcript
+    return (
+        _preview_update(preview, ctx["video_path"], ctx.get("video_id")),
+        info,
+        transcript,
+        start,
+    )
 
 
 def adjust_time(value: float, ctx: dict, delta: float):
@@ -389,9 +556,10 @@ def adjust_time_with_step(value: float, ctx: dict, step: float, direction: float
 
 def always_refresh(start: float, end: float, ctx: dict):
     """選択済みならプレビュー・区間情報・文字起こしを更新する。"""
-    if not ctx or end <= start:
-        return gr.update(), gr.update(), gr.update()
-    return refresh_preview(start, end, ctx)
+    time_range = _safe_time_range(start, end)
+    if not ctx or not time_range or time_range[1] <= time_range[0]:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+    return refresh_preview(time_range[0], time_range[1], ctx)
 
 
 def pick_sentence(sel: str, sents: list, which: str):
@@ -421,23 +589,102 @@ def _clip_plan_ranges(start: float, end: float, plan: dict | None) -> list[list[
     return [[start, end]]
 
 
-def _clip_plan_view(ranges: list[list[float]]) -> tuple[list, str]:
+def _clip_plan_exclusions(
+    start: float, end: float, plan: dict | None
+) -> list[list[float]]:
+    """内部の保持区間から、UIに表示する除外区間を復元する。"""
+    start, end = float(start or 0.0), float(end or 0.0)
+    ranges = _clip_plan_ranges(start, end, plan)
+    if not ranges:
+        return []
+    exclusions: list[list[float]] = []
+    cursor = start
+    for range_start, range_end in ranges:
+        if range_start > cursor + 0.001:
+            exclusions.append([cursor, range_start])
+        cursor = max(cursor, range_end)
+    if cursor < end - 0.001:
+        exclusions.append([cursor, end])
+    return exclusions
+
+
+def _clip_plan_view(
+    start: float,
+    end: float,
+    ranges: list[list[float]],
+    notice: str = "",
+    selected_index: int | None = None,
+) -> tuple[list, str]:
+    """ユーザーが操作した除外区間と、完成予定時間を表示する。"""
+    plan = {"base_start": float(start), "base_end": float(end), "ranges": ranges}
+    exclusions = _clip_plan_exclusions(start, end, plan)
     table = [
-        [i, utils.format_timestamp(s), utils.format_timestamp(e), round(e - s, 1)]
-        for i, (s, e) in enumerate(ranges, 1)
+        [
+            f"{'●' if selected_index == i - 1 else '○'} {i}",
+            utils.format_timestamp(s),
+            utils.format_timestamp(e),
+            round(e - s, 1),
+        ]
+        for i, (s, e) in enumerate(exclusions, 1)
     ]
-    total = sum(e - s for s, e in ranges)
-    return table, f"保持区間: {len(ranges)}個 / 出力予定: {total:.1f}秒"
+    total = max(0.0, float(end) - float(start))
+    removed = sum(e - s for s, e in exclusions)
+    result = sum(e - s for s, e in ranges)
+    summary = (
+        f"**全体範囲:** {utils.format_timestamp(start)} ～ {utils.format_timestamp(end)} "
+        f"({total:.1f}秒)　｜　**途中カット:** {len(exclusions)}箇所 / {removed:.1f}秒　"
+        f"｜　**完成予定:** {result:.1f}秒"
+    )
+    if notice:
+        summary += f"\n\n{notice}"
+    return table, summary
+
+
+def render_clip_plan_timeline(start: float, end: float, plan: dict | None) -> str:
+    """全体範囲に対する除外位置をハッチ表示した簡易タイムライン。"""
+    start, end = float(start or 0.0), float(end or 0.0)
+    total = end - start
+    if total <= 0:
+        return "<div class='clip-timeline-empty'>動画を選択するとタイムラインを表示します。</div>"
+    overlays = []
+    for cut_start, cut_end in _clip_plan_exclusions(start, end, plan):
+        left = max(0.0, min(100.0, (cut_start - start) / total * 100.0))
+        width = max(0.0, min(100.0 - left, (cut_end - cut_start) / total * 100.0))
+        overlays.append(
+            f"<span class='clip-timeline-cut' style='left:{left:.4f}%;width:{width:.4f}%' "
+            f"title='除外 {utils.format_timestamp(cut_start)} ～ "
+            f"{utils.format_timestamp(cut_end)}'></span>"
+        )
+    return (
+        "<div class='clip-timeline-label'>保存予定タイムライン "
+        "<span>青: 保存</span> <span class='clip-timeline-hatch-key'>斜線: 除外</span></div>"
+        "<div class='clip-timeline-track' role='img' aria-label='途中カットの位置'>"
+        + "".join(overlays)
+        + "</div>"
+    )
 
 
 def reset_clip_plan(start: float, end: float):
     """外側の開始・終了を1つの保持区間として編集計画を初期化する。"""
-    ranges = _clip_plan_ranges(start, end, None)
-    if not ranges:
+    time_range = _safe_time_range(start, end)
+    if not time_range or time_range[1] <= time_range[0]:
         return None, [], "開始・終了を正しく指定してください。"
+    start, end = time_range
+    ranges = _clip_plan_ranges(start, end, None)
     plan = {"base_start": float(start), "base_end": float(end), "ranges": ranges}
-    table, summary = _clip_plan_view(ranges)
+    table, summary = _clip_plan_view(start, end, ranges)
     return plan, table, summary
+
+
+def reset_clip_plan_after_range_change(start: float, end: float, plan: dict | None):
+    """全体範囲変更時に、古い途中カットを明示的に破棄する。"""
+    old_exclusions = _clip_plan_exclusions(
+        float(plan.get("base_start", 0.0)), float(plan.get("base_end", 0.0)), plan
+    ) if isinstance(plan, dict) else []
+    new_plan, table, summary = reset_clip_plan(start, end)
+    if old_exclusions:
+        summary += "\n\n⚠️ 全体範囲を変更したため、途中カットをリセットしました。"
+    return new_plan, table, summary, None
 
 
 def exclude_clip_range(
@@ -471,13 +718,98 @@ def exclude_clip_range(
             new_ranges.append([max(cut_end, range_start), range_end])
 
     if not changed:
-        raise gr.Error("その区間は既に除外されています。")
+        gr.Info("その区間は既に除外されています。編集内容は変更していません。")
+        current_plan = {
+            "base_start": start,
+            "base_end": end,
+            "ranges": ranges,
+        }
+        table, summary = _clip_plan_view(start, end, ranges)
+        return current_plan, table, summary
     if not new_ranges:
         raise gr.Error("選択区間のすべてを除外することはできません。")
 
     new_plan = {"base_start": start, "base_end": end, "ranges": new_ranges}
-    table, summary = _clip_plan_view(new_ranges)
+    table, summary = _clip_plan_view(start, end, new_ranges)
     return new_plan, table, summary
+
+
+def select_clip_exclusion(
+    start: float, end: float, plan: dict | None, evt: gr.SelectData
+):
+    """除外一覧で選ばれた行番号を保持する。"""
+    if evt is None or evt.index is None:
+        ranges = _clip_plan_ranges(start, end, plan)
+        table, summary = _clip_plan_view(start, end, ranges)
+        return None, table, summary
+    index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
+    selected_index = int(index)
+    ranges = _clip_plan_ranges(start, end, plan)
+    table, summary = _clip_plan_view(
+        start, end, ranges, selected_index=selected_index
+    )
+    return selected_index, table, summary
+
+
+def remove_clip_exclusion(
+    start: float, end: float, selected_index: int | None, plan: dict | None
+):
+    """一覧で選択した除外区間だけを取り消す。"""
+    exclusions = _clip_plan_exclusions(start, end, plan)
+    if selected_index is None or not 0 <= int(selected_index) < len(exclusions):
+        raise gr.Error("一覧から取り消す除外区間を選択してください。")
+    exclusions.pop(int(selected_index))
+    ranges: list[list[float]] = [[float(start), float(end)]]
+    for cut_start, cut_end in exclusions:
+        next_ranges = []
+        for range_start, range_end in ranges:
+            if cut_end <= range_start or cut_start >= range_end:
+                next_ranges.append([range_start, range_end])
+            else:
+                if range_start < cut_start:
+                    next_ranges.append([range_start, cut_start])
+                if cut_end < range_end:
+                    next_ranges.append([cut_end, range_end])
+        ranges = next_ranges
+    new_plan = {"base_start": float(start), "base_end": float(end), "ranges": ranges}
+    table, summary = _clip_plan_view(start, end, ranges)
+    return new_plan, table, summary, None
+
+
+def adjust_exclusion_time(
+    value: float, start: float, end: float, delta: float
+) -> float:
+    """除外境界を全体範囲内で微調整する。"""
+    adjusted = float(value or start or 0.0) + float(delta)
+    return round(min(max(adjusted, float(start or 0.0)), float(end or 0.0)), 1)
+
+
+def adjust_exclusion_time_with_step(
+    value: float,
+    start: float,
+    end: float,
+    step: float,
+    direction: float,
+) -> float:
+    """選択した調整幅だけ除外境界を動かす。"""
+    return adjust_exclusion_time(
+        value, start, end, float(step or 1.0) * float(direction)
+    )
+
+
+def sync_exclusion_controls(start: float, end: float):
+    """全体範囲に合わせて途中カットの入力範囲と初期値を揃える。"""
+    time_range = _safe_time_range(start, end)
+    if not time_range or time_range[1] <= time_range[0]:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+    start, end = time_range
+    maximum = max(start, end)
+    return (
+        gr.update(minimum=start, maximum=maximum, value=start),
+        gr.update(minimum=start, maximum=maximum, value=maximum),
+        gr.update(value=start, minimum=start, maximum=maximum),
+        gr.update(value=maximum, minimum=start, maximum=maximum),
+    )
 
 
 def preview_clip_plan(start: float, end: float, ctx: dict, plan: dict | None):
@@ -508,9 +840,24 @@ def preview_clip_plan(start: float, end: float, ctx: dict, plan: dict | None):
         ]
     finally:
         conn.close()
-    transcript = "\n\n--- 除外区間 ---\n\n".join(text for text in transcripts if text)
-    _, summary = _clip_plan_view(ranges)
-    return preview, f"{summary}（除外後の連結プレビュー）", transcript
+    transcript = "\n\n--- カットのつなぎ目 ---\n\n".join(
+        text for text in transcripts if text
+    )
+    exclusions = _clip_plan_exclusions(start, end, plan)
+    removed = sum(cut_end - cut_start for cut_start, cut_end in exclusions)
+    result = sum(range_end - range_start for range_start, range_end in ranges)
+    info = (
+        "プレビュー中: 編集結果（途中カット適用後）\n"
+        f"途中カット: {len(exclusions)}箇所 / {removed:.1f}秒、"
+        f"完成予定: {result:.1f}秒"
+    )
+    return (
+        _preview_update(
+            preview, ctx["video_path"], ctx.get("video_id"), edited=True
+        ),
+        info,
+        transcript,
+    )
 
 
 def on_save(
@@ -745,7 +1092,8 @@ def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider, s
             btn = gr.Button(label_text, size="sm")
             btn.click(
                 adjust_time_with_step,
-                inputs=[target_number, ctx_state, step_input, gr.State(direction)],
+                # 画面上のSliderを正として計算し、結果を内部Stateへ同期する。
+                inputs=[slider, ctx_state, step_input, gr.State(direction)],
                 outputs=[target_number],
             ).then(
                 lambda v: gr.update(value=v), inputs=[target_number], outputs=[slider]
@@ -754,6 +1102,49 @@ def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider, s
                 inputs=preview_io["inputs"],
                 outputs=preview_io["outputs"],
             )
+
+
+_APP_CSS = """
+.reverse-fill-slider input[type=range]::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    var(--neutral-200) var(--range_progress),
+    var(--slider-color) var(--range_progress)
+  ) !important;
+}
+.reverse-fill-slider input[type=range]::-moz-range-track {
+  background: var(--slider-color) !important;
+}
+.reverse-fill-slider input[type=range]::-moz-range-progress {
+  background: var(--neutral-200) !important;
+}
+.time-slider input[type=number] {
+  min-width: 8.5rem !important;
+  width: 8.5rem !important;
+  font-size: 1.05rem !important;
+  padding: .45rem .6rem !important;
+}
+.clip-timeline-label {
+  display: flex; gap: .8rem; align-items: center; margin: .2rem 0 .35rem;
+  font-size: .9rem;
+}
+.clip-timeline-track {
+  position: relative; height: 1.1rem; overflow: hidden; border-radius: .4rem;
+  background: var(--primary-500); border: 1px solid var(--border-color-primary);
+}
+.clip-timeline-cut, .clip-timeline-hatch-key {
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(45, 45, 45, .92) 0,
+    rgba(45, 45, 45, .92) 4px,
+    rgba(245, 245, 245, .96) 4px,
+    rgba(245, 245, 245, .96) 8px
+  );
+}
+.clip-timeline-cut { position: absolute; inset-block: 0; }
+.clip-timeline-hatch-key { padding: .05rem .35rem; border-radius: .2rem; color: #fff; }
+.clip-timeline-empty { color: var(--body-text-color-subdued); font-size: .9rem; }
+"""
 
 
 with gr.Blocks(title="動画シーン検索") as demo:
@@ -779,16 +1170,45 @@ with gr.Blocks(title="動画シーン検索") as demo:
     with gr.Tab("検索・切り抜き"):
         results_state = gr.State([])
         ctx_state = gr.State(None)
+        video_select = gr.State(ALL_VIDEOS_VALUE)
+        video_gallery_ids = gr.State([])
 
         with gr.Row():
-            video_select = gr.Dropdown(
-                choices=list_video_choices(),
-                value="(すべての動画)",
-                label="検索対象の動画",
-                scale=3,
+            target_thumbnail = gr.Image(
+                label="現在の検索対象",
+                interactive=False,
+                visible=False,
+                height=150,
+                scale=1,
+                elem_id="current-target-thumbnail",
             )
-            reload_btn = gr.Button("動画リスト更新", scale=1)
+            target_video_detail = gr.Markdown(
+                "**検索対象:** すべての動画",
+                container=True,
+                scale=2,
+                elem_id="current-target-detail",
+            )
             manual_btn = gr.Button("検索せずにこの動画を切り抜く", scale=1)
+
+        with gr.Accordion("検索対象の動画を選ぶ", open=False) as video_picker:
+            gr.Markdown("サムネイルをクリックすると検索対象が切り替わります。")
+            with gr.Row():
+                video_filter_box = gr.Textbox(
+                    label="ファイル名で絞り込み",
+                    placeholder="ファイル名の一部を入力",
+                    scale=3,
+                )
+                video_filter_btn = gr.Button("絞り込む", scale=1)
+                reload_btn = gr.Button("一覧更新", scale=1)
+            video_gallery = gr.Gallery(
+                label="動画一覧",
+                columns=4,
+                height=460,
+                allow_preview=False,
+                object_fit="cover",
+                selected_index=None,
+                elem_id="video-picker-gallery",
+            )
 
         with gr.Row():
             query_box = gr.Textbox(
@@ -831,69 +1251,173 @@ with gr.Blocks(title="動画シーン検索") as demo:
             label="検索結果",
         )
 
-        preview_video = gr.Video(label="プレビュー", autoplay=False)
-
-        info_box = gr.Textbox(label="選択中の区間", interactive=False, lines=3)
-        transcript_box = gr.Textbox(label="区間の文字起こし", interactive=False, lines=4)
-
-        sentences_state = gr.State([])
-        with gr.Accordion("文単位で区間を調整", open=False):
-            gr.Markdown("文を選ぶと、開始・終了時刻がその文の境界に合います。")
-            with gr.Row():
-                start_sent_dd = gr.Dropdown(choices=[], label="この文から (開始)", scale=2)
-                end_sent_dd = gr.Dropdown(choices=[], label="この文まで (終了)", scale=2)
-                refresh_sents_btn = gr.Button("周辺の文を再取得", scale=1)
-
-        with gr.Accordion("秒単位で区間を微調整", open=False):
-            start_slider = gr.Slider(0, 1, value=0, step=0.1, label="開始位置")
-            end_slider = gr.Slider(0, 1, value=1, step=0.1, label="終了位置")
-
-            with gr.Row():
-                start_num = gr.Number(value=0, label="開始 (秒)", precision=1)
-                end_num = gr.Number(value=0, label="終了 (秒)", precision=1)
-
-            adjust_step = gr.Radio(
-                choices=ADJUST_STEPS,
-                value=1.0,
-                label="調整幅 (秒)",
-            )
-
-            preview_io = {
-                "inputs": [start_num, end_num, ctx_state],
-                "outputs": [preview_video, info_box, transcript_box],
-            }
-            build_adjust_row(
-                "開始を調整", start_num, ctx_state, preview_io, start_slider, adjust_step
-            )
-            build_adjust_row(
-                "終了を調整", end_num, ctx_state, preview_io, end_slider, adjust_step
-            )
-
-            update_btn = gr.Button("プレビュー更新")
+        with gr.Row():
+            with gr.Column(scale=3, min_width=420):
+                preview_video = gr.Video(
+                    label="共通プレビュー",
+                    autoplay=False,
+                    elem_id="clip-preview-video",
+                )
+            with gr.Column(scale=2, min_width=280):
+                with gr.Accordion(
+                    "プレビュー区間の文字起こし", open=True
+                ) as transcript_accordion:
+                    transcript_box = gr.Textbox(
+                        label="文字起こし",
+                        interactive=False,
+                        lines=12,
+                        show_label=False,
+                    )
+        info_box = gr.Textbox(
+            label="プレビュー中の内容", interactive=False, lines=4, render=False
+        )
+        # ブラウザで現在位置を元動画時刻へ換算するための、実際のプレビュー開始時刻。
+        # visible=Falseならコンポーネントは設定に存在しつつ画面の場所を取らない。
+        preview_origin = gr.Number(value=0.0, visible=False)
 
         clip_plan_state = gr.State(None)
-        with gr.Accordion("途中を除外する（複数区間を連結）", open=False):
-            gr.Markdown(
-                "選択中の開始・終了から不要な区間を除外します。複数回指定でき、"
-                "残った区間は時系列順に1本の動画へ連結されます。"
-            )
-            with gr.Row():
-                exclude_start_num = gr.Number(
-                    value=0, label="除外開始 (秒)", precision=1, scale=2
+        selected_exclusion_state = gr.State(None)
+        clip_plan_summary = gr.Markdown(
+            "動画を選択すると、全体範囲と完成予定時間が表示されます。"
+        )
+        clip_plan_timeline = gr.HTML(render_clip_plan_timeline(0, 0, None))
+
+        sentences_state = gr.State([])
+        with gr.Tabs():
+            with gr.Tab("① 全体範囲"):
+                gr.Markdown(
+                    "まず、保存したい範囲全体の開始と終了を決めます。"
+                    "途中カットを使わない場合は、このタブだけで従来どおり保存できます。"
                 )
-                exclude_end_num = gr.Number(
-                    value=0, label="除外終了 (秒)", precision=1, scale=2
+                with gr.Accordion("現在位置で全体範囲を設定", open=True):
+                    gr.Markdown(
+                        "プレビューの現在位置を、全体範囲の開始または終了に設定します。"
+                    )
+                    with gr.Row():
+                        mark_overall_start_btn = gr.Button(
+                            "現在位置を全体開始に設定"
+                        )
+                        mark_overall_end_btn = gr.Button(
+                            "現在位置を全体終了に設定"
+                        )
+                with gr.Accordion("文単位で全体範囲を調整", open=False):
+                    gr.Markdown(
+                        "文字起こしの文を選ぶと、全体範囲の開始・終了時刻が"
+                        "文の境界に合います。"
+                    )
+                    with gr.Row():
+                        start_sent_dd = gr.Dropdown(
+                            choices=[], label="この文から (全体の開始)", scale=2
+                        )
+                        end_sent_dd = gr.Dropdown(
+                            choices=[], label="この文まで (全体の終了)", scale=2
+                        )
+                        refresh_sents_btn = gr.Button("周辺の文を再取得", scale=1)
+
+                with gr.Accordion("秒単位で区間を微調整", open=True):
+                    start_slider = gr.Slider(
+                        0, 1, value=0, step=0.1, label="開始位置",
+                        elem_classes=["time-slider"],
+                    )
+                    end_slider = gr.Slider(
+                        0, 1, value=1, step=0.1, label="終了位置",
+                        elem_classes=["time-slider"],
+                    )
+
+                    # Slider右側の組み込み数値欄を使うため、重複する独立Numberは
+                    # 描画しない。イベント間で共有する値はStateとして保持する。
+                    start_num = gr.State(0.0)
+                    end_num = gr.State(0.0)
+
+                    adjust_step = gr.Radio(
+                        choices=ADJUST_STEPS, value=1.0, label="調整幅 (秒)"
+                    )
+
+                    preview_io = {
+                        "inputs": [start_num, end_num, ctx_state],
+                        "outputs": [
+                            preview_video, info_box, transcript_box, preview_origin,
+                        ],
+                    }
+                    build_adjust_row(
+                        "開始を調整", start_num, ctx_state,
+                        preview_io, start_slider, adjust_step,
+                    )
+                    build_adjust_row(
+                        "終了を調整", end_num, ctx_state,
+                        preview_io, end_slider, adjust_step,
+                    )
+                    update_btn = gr.Button("全体範囲をプレビュー更新")
+
+            with gr.Tab("② 途中カット（任意）"):
+                gr.Markdown(
+                    "全体範囲の中から不要な箇所を指定します。プレビューを再生し、"
+                    "不要部分の先頭・末尾で現在位置を設定してください。"
                 )
-            with gr.Row():
-                exclude_btn = gr.Button("この区間を除外", variant="secondary")
-                reset_plan_btn = gr.Button("除外をすべて取り消す")
-                multi_preview_btn = gr.Button("除外後をプレビュー")
-            clip_plan_summary = gr.Markdown("保持区間は、動画を選択すると表示されます。")
-            clip_plan_table = gr.Dataframe(
-                headers=["#", "開始", "終了", "長さ (秒)"],
-                interactive=False,
-                label="保存する区間",
-            )
+                with gr.Row():
+                    mark_exclude_start_btn = gr.Button("現在位置を除外開始に設定")
+                    mark_exclude_end_btn = gr.Button("現在位置を除外終了に設定")
+                with gr.Accordion("文単位で除外範囲を調整", open=False):
+                    gr.Markdown(
+                        "文字起こしの文を選ぶと、除外範囲の開始・終了時刻が"
+                        "文の境界に合います。"
+                    )
+                    with gr.Row():
+                        exclude_start_sent_dd = gr.Dropdown(
+                            choices=[], label="この文から (除外の開始)", scale=2
+                        )
+                        exclude_end_sent_dd = gr.Dropdown(
+                            choices=[], label="この文まで (除外の終了)", scale=2
+                        )
+                        refresh_exclude_sents_btn = gr.Button(
+                            "周辺の文を再取得", scale=1
+                        )
+                exclude_start_slider = gr.Slider(
+                    0, 1, value=0, step=0.1, label="除外開始位置",
+                    elem_classes=["time-slider"],
+                )
+                exclude_end_slider = gr.Slider(
+                    0, 1, value=1, step=0.1, label="除外終了位置",
+                    elem_classes=["time-slider", "reverse-fill-slider"],
+                )
+                gr.Markdown(
+                    "除外終了sliderの **右側の色付き部分は、終了後に保存する範囲** です。"
+                )
+                exclude_start_num = gr.State(0.0)
+                exclude_end_num = gr.State(1.0)
+                exclude_adjust_step = gr.Radio(
+                    choices=ADJUST_STEPS, value=1.0, label="調整幅 (秒)"
+                )
+                exclusion_adjust_buttons = []
+                for target_name, target, slider in (
+                    ("除外開始", exclude_start_num, exclude_start_slider),
+                    ("除外終了", exclude_end_num, exclude_end_slider),
+                ):
+                    with gr.Row():
+                        gr.Markdown(f"**{target_name}を調整**", min_width=100)
+                        before_btn = gr.Button("前へ", size="sm")
+                        after_btn = gr.Button("後ろへ", size="sm")
+                        exclusion_adjust_buttons.extend((
+                            (before_btn, target, slider, -1.0),
+                            (after_btn, target, slider, 1.0),
+                        ))
+                with gr.Row():
+                    exclude_btn = gr.Button("除外を追加", variant="primary")
+                    multi_preview_btn = gr.Button("編集結果をプレビュー")
+                clip_plan_table = gr.Dataframe(
+                    headers=["#", "除外開始", "除外終了", "長さ (秒)"],
+                    interactive=False,
+                    label="除外箇所（行を選択して個別に取り消せます）",
+                )
+                with gr.Row():
+                    remove_exclusion_btn = gr.Button("選択した除外を取り消す")
+                    reset_plan_btn = gr.Button("除外をすべて取り消す")
+                gr.Markdown(
+                    "※「編集結果をプレビュー」後に現在位置から追加する場合は、"
+                    "先に①の「全体範囲をプレビュー更新」を押してください。"
+                )
+
+        info_box.render()
 
         gr.Markdown("### 保存")
         with gr.Row():
@@ -913,6 +1437,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             preview_video, start_num, end_num, start_slider, end_slider,
             ctx_state, info_box, transcript_box,
             sentences_state, start_sent_dd, end_sent_dd,
+            preview_origin,
         ]
         search_inputs = [
             query_box, video_select, top_k, min_score,
@@ -921,11 +1446,52 @@ with gr.Blocks(title="動画シーン検索") as demo:
         search_outputs = [result_table, results_state, *selection_outputs]
         search_btn.click(do_search, inputs=search_inputs, outputs=search_outputs)
         query_box.submit(do_search, inputs=search_inputs, outputs=search_outputs)
-        reload_btn.click(lambda: gr.update(choices=list_video_choices()), outputs=[video_select])
-        video_select.change(
+        gallery_outputs = [video_gallery, video_gallery_ids]
+        gallery_inputs = [video_filter_box, video_select]
+        video_picker.expand(
+            build_video_gallery,
+            inputs=gallery_inputs,
+            outputs=gallery_outputs,
+        )
+        video_filter_btn.click(
+            build_video_gallery,
+            inputs=gallery_inputs,
+            outputs=gallery_outputs,
+        )
+        video_filter_box.submit(
+            build_video_gallery,
+            inputs=gallery_inputs,
+            outputs=gallery_outputs,
+        )
+        reload_btn.click(
+            build_video_gallery,
+            inputs=gallery_inputs,
+            outputs=gallery_outputs,
+        )
+        collapse_video_picker_js = """() => {
+            const gallery = document.getElementById('video-picker-gallery');
+            const accordion = gallery ? gallery.closest('.gr-accordion') : null;
+            const content = accordion
+                ? accordion.querySelector(':scope > [data-testid="accordion-content"]')
+                : null;
+            const button = accordion
+                ? accordion.querySelector(':scope > button.label-wrap')
+                : null;
+            if (content && button && getComputedStyle(content).display !== 'none') {
+                button.click();
+            }
+        }"""
+        video_gallery.select(
+            select_video_from_gallery,
+            inputs=[video_gallery_ids],
+            outputs=[video_select, target_thumbnail, target_video_detail, video_gallery],
+        ).then(
             sync_range_to_video,
             inputs=[video_select, range_end_num],
             outputs=[range_start_slider, range_end_slider, range_end_num],
+        ).then(
+            fn=None,
+            js=collapse_video_picker_js,
         )
         # 範囲用シークバーと数値欄の相互同期(切り抜き区間のシークバーと同じ方式)
         range_start_slider.release(
@@ -970,7 +1536,13 @@ with gr.Blocks(title="動画シーン検索") as demo:
             inputs=preview_io["inputs"],
             outputs=preview_io["outputs"],
         )
-        # シークバー(ユーザーが離した時のみ発火)→数値欄へ反映→自動プレビュー
+        # シークバー値を内部Stateへ反映し、離した時に自動プレビュー
+        start_slider.input(
+            lambda v: round(v, 1), inputs=[start_slider], outputs=[start_num]
+        )
+        end_slider.input(
+            lambda v: round(v, 1), inputs=[end_slider], outputs=[end_num]
+        )
         start_slider.release(
             lambda v: round(v, 1), inputs=[start_slider], outputs=[start_num]
         ).then(
@@ -985,32 +1557,49 @@ with gr.Blocks(title="動画シーン検索") as demo:
             inputs=preview_io["inputs"],
             outputs=preview_io["outputs"],
         )
-        # 数値欄の直接編集もシークバーに反映
-        start_num.input(lambda v: gr.update(value=v), inputs=[start_num], outputs=[start_slider])
-        end_num.input(lambda v: gr.update(value=v), inputs=[end_num], outputs=[end_slider])
-        # 外側の区間が変わった場合、以前の除外位置は意味が変わるため初期化する
+        # 外側の区間が変わった場合、以前の除外を明示して初期化する
         start_num.change(
-            reset_clip_plan,
+            reset_clip_plan_after_range_change,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[
+                clip_plan_state, clip_plan_table,
+                clip_plan_summary, selected_exclusion_state,
+            ],
+        ).then(
+            sync_exclusion_controls,
             inputs=[start_num, end_num],
-            outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+            outputs=[
+                exclude_start_slider, exclude_end_slider,
+                exclude_start_num, exclude_end_num,
+            ],
+        ).then(
+            render_clip_plan_timeline,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[clip_plan_timeline],
         )
         end_num.change(
-            reset_clip_plan,
+            reset_clip_plan_after_range_change,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[
+                clip_plan_state, clip_plan_table,
+                clip_plan_summary, selected_exclusion_state,
+            ],
+        ).then(
+            sync_exclusion_controls,
             inputs=[start_num, end_num],
-            outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+            outputs=[
+                exclude_start_slider, exclude_end_slider,
+                exclude_start_num, exclude_end_num,
+            ],
+        ).then(
+            render_clip_plan_timeline,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[clip_plan_timeline],
         )
-        # 数値を直接入力してEnterで確定した場合もプレビューへ反映
-        start_num.submit(
-            always_refresh, inputs=preview_io["inputs"], outputs=preview_io["outputs"]
-        )
-        end_num.submit(
-            always_refresh, inputs=preview_io["inputs"], outputs=preview_io["outputs"]
-        )
-
         update_btn.click(
             refresh_preview,
             inputs=[start_num, end_num, ctx_state],
-            outputs=[preview_video, info_box, transcript_box],
+            outputs=[preview_video, info_box, transcript_box, preview_origin],
         )
         exclude_btn.click(
             exclude_clip_range,
@@ -1018,12 +1607,147 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 start_num, end_num, exclude_start_num, exclude_end_num, clip_plan_state,
             ],
             outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+        ).then(
+            lambda: None, outputs=[selected_exclusion_state]
+        ).then(
+            render_clip_plan_timeline,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[clip_plan_timeline],
         )
         reset_plan_btn.click(
             reset_clip_plan,
             inputs=[start_num, end_num],
             outputs=[clip_plan_state, clip_plan_table, clip_plan_summary],
+        ).then(
+            lambda: None, outputs=[selected_exclusion_state]
+        ).then(
+            render_clip_plan_timeline,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[clip_plan_timeline],
         )
+        clip_plan_table.select(
+            select_clip_exclusion,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[selected_exclusion_state, clip_plan_table, clip_plan_summary],
+        )
+        remove_exclusion_btn.click(
+            remove_clip_exclusion,
+            inputs=[start_num, end_num, selected_exclusion_state, clip_plan_state],
+            outputs=[
+                clip_plan_state, clip_plan_table,
+                clip_plan_summary, selected_exclusion_state,
+            ],
+        ).then(
+            render_clip_plan_timeline,
+            inputs=[start_num, end_num, clip_plan_state],
+            outputs=[clip_plan_timeline],
+        )
+        _CURRENT_PREVIEW_TIME_JS = """
+        (base, current, previewInfo) => {
+            const root = document.getElementById('clip-preview-video');
+            const video = root ? root.querySelector('video') : null;
+            if (!video || !Number.isFinite(video.currentTime)) return current;
+            if (String(previewInfo || '').includes('編集結果')) {
+                window.alert(
+                    '編集結果プレビューでは元動画の時刻を取得できません。' +
+                    '① 全体範囲の「全体範囲をプレビュー更新」を押してから再試行してください。'
+                );
+                return current;
+            }
+            const value = Math.round((Number(base || 0) + video.currentTime) * 10) / 10;
+            return value;
+        }
+        """
+        mark_overall_start_btn.click(
+            fn=None,
+            inputs=[preview_origin, start_slider, info_box],
+            outputs=[start_slider],
+            js=_CURRENT_PREVIEW_TIME_JS,
+        ).then(
+            lambda v: round(float(v), 1),
+            inputs=[start_slider],
+            outputs=[start_num],
+        )
+        mark_overall_end_btn.click(
+            fn=None,
+            inputs=[preview_origin, end_slider, info_box],
+            outputs=[end_slider],
+            js=_CURRENT_PREVIEW_TIME_JS,
+        ).then(
+            lambda v: round(float(v), 1),
+            inputs=[end_slider],
+            outputs=[end_num],
+        )
+        mark_exclude_start_btn.click(
+            fn=None,
+            inputs=[preview_origin, exclude_start_slider, info_box],
+            outputs=[exclude_start_slider],
+            js=_CURRENT_PREVIEW_TIME_JS,
+        ).then(
+            lambda v: round(float(v), 1),
+            inputs=[exclude_start_slider],
+            outputs=[exclude_start_num],
+        )
+        mark_exclude_end_btn.click(
+            fn=None,
+            inputs=[preview_origin, exclude_end_slider, info_box],
+            outputs=[exclude_end_slider],
+            js=_CURRENT_PREVIEW_TIME_JS,
+        ).then(
+            lambda v: round(float(v), 1),
+            inputs=[exclude_end_slider],
+            outputs=[exclude_end_num],
+        )
+        exclude_start_slider.release(
+            lambda v: round(v, 1),
+            inputs=[exclude_start_slider],
+            outputs=[exclude_start_num],
+        )
+        exclude_end_slider.release(
+            lambda v: round(v, 1),
+            inputs=[exclude_end_slider],
+            outputs=[exclude_end_num],
+        )
+        exclude_start_slider.input(
+            lambda v: round(v, 1),
+            inputs=[exclude_start_slider],
+            outputs=[exclude_start_num],
+        )
+        exclude_end_slider.input(
+            lambda v: round(v, 1),
+            inputs=[exclude_end_slider],
+            outputs=[exclude_end_num],
+        )
+        refresh_exclude_sents_btn.click(
+            refresh_sentences,
+            inputs=[start_num, end_num, ctx_state],
+            outputs=[
+                sentences_state, exclude_start_sent_dd, exclude_end_sent_dd,
+            ],
+        )
+        exclude_start_sent_dd.change(
+            pick_sentence,
+            inputs=[exclude_start_sent_dd, sentences_state, gr.State("start")],
+            outputs=[exclude_start_num, exclude_start_slider],
+        )
+        exclude_end_sent_dd.change(
+            pick_sentence,
+            inputs=[exclude_end_sent_dd, sentences_state, gr.State("end")],
+            outputs=[exclude_end_num, exclude_end_slider],
+        )
+        for button, target, slider, direction in exclusion_adjust_buttons:
+            button.click(
+                adjust_exclusion_time_with_step,
+                inputs=[
+                    slider, start_slider, end_slider,
+                    exclude_adjust_step, gr.State(direction),
+                ],
+                outputs=[target],
+            ).then(
+                lambda v: gr.update(value=v),
+                inputs=[target],
+                outputs=[slider],
+            )
         multi_preview_btn.click(
             preview_clip_plan,
             inputs=[start_num, end_num, ctx_state, clip_plan_state],
@@ -1162,4 +1886,9 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     _cleanup_stale_index_job()
-    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True)
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=APP_PORT,
+        inbrowser=True,
+        css=_APP_CSS,
+    )

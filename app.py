@@ -8,7 +8,10 @@
 """
 import faulthandler
 import hashlib
+import html
+import json
 import math
+import secrets
 import subprocess
 import threading
 from pathlib import Path
@@ -41,6 +44,7 @@ ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
 
 _embedder = None
 _index_lock = threading.Lock()
+_intuitive_preview_lock = threading.Lock()
 # 実行中のインデックス処理サブプロセス (停止ボタン用)
 _index_state = {"proc": None, "stopped": False}
 
@@ -291,7 +295,7 @@ def _safe_time_range(start, end) -> tuple[float, float] | None:
     return start_value, end_value
 
 
-def do_search(
+def search_video_results(
     query: str,
     video_choice: str,
     top_k: int,
@@ -301,7 +305,7 @@ def do_search(
     range_end: float = 0.0,
 ):
     if not query.strip():
-        return ([], [], *_EMPTY_SELECTION)
+        return []
     if not config.TEXT_INDEX_PATH.exists():
         raise gr.Error("インデックスがありません。「動画の追加」タブで動画を登録してください。")
 
@@ -320,37 +324,56 @@ def do_search(
     db.init_db(conn)
 
     try:
-        query_vec = get_embedder().encode([query])
-    except Exception as e:
-        raise gr.Error(
-            "検索用モデルのロードに失敗しました。インデックス処理の実行中は"
-            "VRAMが不足することがあります。処理の完了を待つか停止してから"
-            f"再試行してください。({type(e).__name__}: {e})"
+        try:
+            query_vec = get_embedder().encode([query])
+        except Exception as e:
+            raise gr.Error(
+                "検索用モデルのロードに失敗しました。インデックス処理の実行中は"
+                "VRAMが不足することがあります。処理の完了を待つか停止してから"
+                f"再試行してください。({type(e).__name__}: {e})"
+            )
+        vindex = VectorIndex.load(config.TEXT_INDEX_PATH, query_vec.shape[1])
+        results = search_chunks(
+            conn,
+            vindex,
+            query,
+            query_vec,
+            top_k=int(top_k),
+            min_score=float(min_score),
+            video_id=video_filter,
+            start_sec=start_sec,
+            end_sec=end_sec,
         )
-    vindex = VectorIndex.load(config.TEXT_INDEX_PATH, query_vec.shape[1])
-    results = search_chunks(
-        conn,
-        vindex,
-        query,
-        query_vec,
-        top_k=int(top_k),
-        min_score=float(min_score),
-        video_id=video_filter,
-        start_sec=start_sec,
-        end_sec=end_sec,
-    )
+        videos_by_id = {}
+        for video in db.list_videos(conn):
+            filename = Path(video["path"]).name
+            videos_by_id[video["video_id"]] = (
+                f"{filename} [{video['video_id']}]"
+                if filename != video["video_id"] else filename
+            )
+        for result in results:
+            result["video_name"] = videos_by_id.get(result["video_id"], result["video_id"])
+        return results
+    finally:
+        conn.close()
 
-    videos_by_id = {}
-    for video in db.list_videos(conn):
-        filename = Path(video["path"]).name
-        videos_by_id[video["video_id"]] = (
-            f"{filename} [{video['video_id']}]"
-            if filename != video["video_id"] else filename
-        )
-    for result in results:
-        result["video_name"] = videos_by_id.get(result["video_id"], result["video_id"])
-    conn.close()
+
+def do_search(
+    query: str,
+    video_choice: str,
+    top_k: int,
+    min_score: float,
+    range_enabled: bool = False,
+    range_start: float = 0.0,
+    range_end: float = 0.0,
+):
+    results = search_video_results(
+        query, video_choice, top_k, min_score,
+        range_enabled, range_start, range_end,
+    )
     if not results:
+        if not query.strip():
+            return ([], [], *_EMPTY_SELECTION)
         gr.Info("該当するシーンが見つかりませんでした。")
         return ([], [], *_EMPTY_SELECTION)
 
@@ -365,6 +388,1233 @@ def make_preview(video_path: str, start: float, end: float, duration: float) -> 
     if not out.exists():
         cut_clip(Path(video_path), start, end, out, pad=0.0, precise=False, duration=duration)
     return str(out)
+
+
+def _intuitive_preview_path(
+    video_id: str, video_path: str, start: float, end: float
+) -> Path:
+    """動画をまたいで衝突しない、ファイル名として安全な試作プレビュー保存先。"""
+    source = Path(video_path)
+    try:
+        stamp = source.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    cache_key = hashlib.sha256(
+        f"{video_id}|{source.resolve()}|{stamp}|{start:.3f}|{end:.3f}".encode("utf-8")
+    ).hexdigest()[:24]
+    return PREVIEW_DIR / f"intuitive_{cache_key}.mp4"
+
+
+def make_intuitive_preview(
+    video_id: str, video_path: str, start: float, end: float, duration: float
+) -> str:
+    """直感編集試作用の動画ID別プレビューをローカルに生成する。"""
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    out = _intuitive_preview_path(video_id, video_path, start, end)
+    with _intuitive_preview_lock:
+        if out.exists():
+            return str(out)
+        temporary = out.with_name(
+            f"{out.stem}.{secrets.token_hex(6)}.tmp.mp4"
+        )
+        try:
+            cut_clip(
+                Path(video_path), start, end, temporary,
+                pad=0.0, precise=False, duration=duration,
+            )
+            temporary.replace(out)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return str(out)
+
+
+def render_intuitive_transcript(segments: list[dict], state: dict | None = None) -> str:
+    """単語時刻を優先し、安全にエスケープした試作用文字起こしHTMLを返す。"""
+    def classes_for(start: float, end: float, segment: bool = False) -> str:
+        classes = ["intuitive-word"]
+        if segment:
+            classes.append("intuitive-segment")
+        if not state:
+            return " ".join(classes)
+        selected = state.get("selected_word") or {}
+        if (
+            abs(float(selected.get("start", -999999)) - start) < 0.002
+            and abs(float(selected.get("end", -999999)) - end) < 0.002
+        ):
+            classes.append("is-selected-word")
+        if end <= state["overall_start"] or start >= state["overall_end"]:
+            classes.append("is-outside-overall")
+        if any(
+            end > cut["start"] and start < cut["end"]
+            for cut in state.get("exclusions") or []
+        ):
+            classes.append("is-excluded-word")
+        contains_start = lambda value: (
+            start <= value < end or (start == end and abs(value - start) < 0.002)
+        )
+        contains_end = lambda value: (
+            start < value <= end or (start == end and abs(value - start) < 0.002)
+        )
+        if contains_start(state["overall_start"]):
+            classes.append("marks-overall-start")
+        if contains_end(state["overall_end"]):
+            classes.append("marks-overall-end")
+        pending = state.get("pending_cut_start")
+        if pending is not None and contains_start(float(pending)):
+            classes.append("marks-pending-cut")
+        if any(contains_start(float(cut["start"])) for cut in state.get("exclusions") or []):
+            classes.append("marks-exclusion-start")
+        if any(contains_end(float(cut["end"])) for cut in state.get("exclusions") or []):
+            classes.append("marks-exclusion-end")
+        return " ".join(classes)
+
+    def timed_words_for(segment: dict) -> list[tuple[str, float, float]] | None:
+        """Return words only when the segment has complete, real word timestamps.
+
+        Falling back missing word timestamps to the segment boundary makes the UI
+        look word-accurate even though the ASR data is not. Treat the whole
+        segment as the smallest selectable unit unless every stored word has an
+        explicit, finite time range.
+        """
+        words_json = segment.get("words_json")
+        if not words_json:
+            return None
+        try:
+            parsed = json.loads(words_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, list) or not parsed:
+            return None
+
+        timed_words = []
+        for word in parsed:
+            if (
+                not isinstance(word, dict)
+                or "word" not in word
+                or "start" not in word
+                or "end" not in word
+                or isinstance(word.get("start"), bool)
+                or isinstance(word.get("end"), bool)
+            ):
+                return None
+            try:
+                start = float(word["start"])
+                end = float(word["end"])
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start:
+                return None
+            timed_words.append((str(word["word"]), start, end))
+        return timed_words
+
+    rendered_segments = []
+    granularities = set()
+    for raw_segment in segments:
+        segment = dict(raw_segment)
+        words = timed_words_for(segment)
+
+        word_spans = []
+        for word in words or []:
+            text, start, end = word
+            label = f"単語時刻: {utils.format_timestamp(start)} - {utils.format_timestamp(end)}"
+            word_spans.append(
+                f'<span class="{classes_for(start, end)}" '
+                f'data-time-granularity="word" '
+                f'data-start="{start:.3f}" data-end="{end:.3f}" '
+                f'title="{html.escape(label, quote=True)}">'
+                f'{html.escape(text)}</span>'
+            )
+
+        if word_spans:
+            granularities.add("word")
+            rendered_segments.append("".join(word_spans))
+            continue
+
+        granularities.add("segment")
+        start = float(segment.get("start_sec") or 0.0)
+        end = float(segment.get("end_sec") or start)
+        label = (
+            "発話区間（単語時刻なし）: "
+            f"{utils.format_timestamp(start)} - {utils.format_timestamp(end)}"
+        )
+        rendered_segments.append(
+            f'<span class="{classes_for(start, end, segment=True)}" '
+            f'data-time-granularity="segment" '
+            f'data-start="{start:.3f}" data-end="{end:.3f}" '
+            f'title="{html.escape(label, quote=True)}">'
+            f'{html.escape(str(segment.get("text") or ""))}</span>'
+        )
+
+    content = "<br>".join(rendered_segments)
+    if not content:
+        content = '<span class="intuitive-transcript-empty">この区間に文字起こしはありません。</span>'
+        granularity_label = "時刻指定できる文字起こしがありません"
+    elif granularities == {"word"}:
+        granularity_label = "時刻指定: 単語単位（ASRの単語時刻）"
+    elif granularities == {"segment"}:
+        granularity_label = "時刻指定: 発話区間単位（単語時刻なし）"
+    else:
+        granularity_label = "時刻指定: 単語単位＋発話区間単位（区間ごとのASR精度）"
+    range_label = ""
+    if state:
+        transcript_start, transcript_end = _intuitive_transcript_bounds(state)
+        range_label = (
+            '<span class="intuitive-transcript-range">表示中: '
+            f'{utils.format_timestamp(transcript_start)} ～ '
+            f'{utils.format_timestamp(transcript_end)}</span>'
+        )
+    return (
+        '<div class="intuitive-transcript-copy" aria-label="プレビュー区間の文字起こし">'
+        '<div class="intuitive-transcript-granularity">'
+        f'<span>{granularity_label}</span>{range_label}</div>'
+        f"{content}</div>"
+    )
+
+
+def render_intuitive_overview_timeline(
+    duration: float, start: float, end: float
+) -> str:
+    duration = max(float(duration or 0.0), 0.1)
+    left = max(0.0, min(100.0, start / duration * 100.0))
+    right = max(left, min(100.0, end / duration * 100.0))
+    return f"""
+    <div class="intuitive-timeline">
+      <div class="intuitive-timeline-scale"><span>00:00:00</span><span>動画全体</span><span>{utils.format_timestamp(duration)}</span></div>
+      <div class="intuitive-overview-track" role="img" aria-label="動画全体と拡大表示範囲">
+        <div class="intuitive-overview-window" style="left:{left:.4f}%;width:{right - left:.4f}%" title="下段で拡大している範囲"></div>
+      </div>
+    </div>
+    """
+
+
+def render_intuitive_zoom_timeline(start: float, end: float) -> str:
+    midpoint = start + (end - start) / 2.0
+    return f"""
+    <div class="intuitive-timeline">
+      <div class="intuitive-timeline-scale"><span>{utils.format_timestamp(start)}</span><span>{utils.format_timestamp(midpoint)}</span><span>{utils.format_timestamp(end)}</span></div>
+      <div class="intuitive-zoom-track" role="img" aria-label="保存範囲、除外範囲、再生位置の試作タイムライン">
+        <div class="intuitive-handle start" title="全体開始ハンドル"></div>
+        <div class="intuitive-cut-zone" title="途中カットの表示例"></div>
+        <div class="intuitive-playhead" title="プレビュー再生位置"></div>
+        <div class="intuitive-handle end" title="全体終了ハンドル"></div>
+      </div>
+      <div class="intuitive-timeline-legend">
+        <span class="intuitive-legend-keep">■ 保存範囲</span>
+        <span class="intuitive-legend-cut">▨ 途中カット（表示例）</span>
+        <span class="intuitive-legend-position">│ 再生位置</span>
+        <span>● オレンジ: 全体範囲ハンドル</span>
+      </div>
+    </div>
+    """
+
+
+def load_intuitive_video(video_choice: str):
+    """インデックス済み動画の最初の発話付近を試作画面へ読み込む。"""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("直感編集で試す動画を選択してください。")
+
+    conn = db.get_conn()
+    try:
+        video = db.get_video(conn, video_id)
+        if not video:
+            raise gr.Error(f"動画が見つかりません: {video_id}")
+        first_segment = conn.execute(
+            "SELECT start_sec, end_sec FROM asr_segments "
+            "WHERE video_id = ? AND trim(COALESCE(text, '')) <> '' "
+            "ORDER BY start_sec LIMIT 1",
+            (video_id,),
+        ).fetchone()
+        duration = max(float(video.get("duration") or 0.0), 0.0)
+        first_start = float(first_segment["start_sec"]) if first_segment else 0.0
+        preview_start = max(0.0, first_start - 2.0)
+        effective_duration = duration or max(preview_start + 90.0, 90.0)
+        preview_end = min(effective_duration, preview_start + 90.0)
+        if preview_end <= preview_start:
+            raise gr.Error("プレビューできる長さの動画ではありません。")
+        rows = conn.execute(
+            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
+            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? "
+            "ORDER BY start_sec",
+            (video_id, preview_start, preview_end),
+        ).fetchall()
+        segments = [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+    preview_path = make_intuitive_preview(
+        video_id, video["path"], preview_start, preview_end, effective_duration
+    )
+    filename = Path(video["path"]).name
+    interval = (
+        f"{utils.format_timestamp(preview_start)} - "
+        f"{utils.format_timestamp(preview_end)}"
+    )
+    info = f"**選択動画:** {html.escape(filename)}　｜　**表示区間:** {interval}"
+    return (
+        gr.update(
+            value=preview_path,
+            label=f"直感編集プレビュー: {filename} [{video_id}]",
+        ),
+        render_intuitive_transcript(segments),
+        info,
+        render_intuitive_overview_timeline(effective_duration, preview_start, preview_end),
+        render_intuitive_zoom_timeline(preview_start, preview_end),
+    )
+
+
+_INTUITIVE_TOOLS = {
+    "overall_start", "overall_end", "exclude_start", "exclude_end",
+}
+_INTUITIVE_TOOL_LABELS = (
+    ("overall_start", "全体開始"),
+    ("overall_end", "全体終了"),
+    ("exclude_start", "除外開始"),
+    ("exclude_end", "除外終了"),
+)
+_INTUITIVE_VIEWPORT_MIN_SECONDS = 5.0
+# A 90-second initial viewport keeps first load quick, but it must not also be a
+# hard resize ceiling: users commonly widen the overview window after finding a
+# scene.  Ten minutes is a practical upper bound for the generated source
+# preview while still making the resize operation useful and predictable.
+_INTUITIVE_VIEWPORT_MAX_SECONDS = 600.0
+_INTUITIVE_TRANSCRIPT_WINDOW_SECONDS = 90.0
+
+
+def _intuitive_transcript_bounds(
+    state: dict, focus: float | None = None,
+) -> tuple[float, float]:
+    """Return a short transcript window clamped inside the zoom viewport."""
+    view_start = float(state["viewport_start"])
+    view_end = max(view_start, float(state["viewport_end"]))
+    span = min(_INTUITIVE_TRANSCRIPT_WINDOW_SECONDS, view_end - view_start)
+    if span <= 0:
+        return view_start, view_end
+    if focus is None:
+        focus = state.get("transcript_focus_sec", view_start)
+    try:
+        focus = float(focus)
+    except (TypeError, ValueError):
+        focus = view_start
+    if not math.isfinite(focus):
+        focus = view_start
+    focus = min(max(focus, view_start), view_end)
+    start = min(max(focus - span / 2.0, view_start), view_end - span)
+    return start, start + span
+
+
+def _set_intuitive_transcript_focus(state: dict, focus: float | None = None) -> None:
+    """Store a canonical focus and its derived, bounded transcript interval."""
+    view_start = float(state["viewport_start"])
+    view_end = float(state["viewport_end"])
+    if focus is None:
+        focus = state.get("transcript_focus_sec", view_start)
+    try:
+        focus = float(focus)
+    except (TypeError, ValueError):
+        focus = view_start
+    if not math.isfinite(focus):
+        focus = view_start
+    focus = min(max(focus, view_start), view_end)
+    start, end = _intuitive_transcript_bounds(state, focus)
+    state["transcript_focus_sec"] = focus
+    state["transcript_start"] = start
+    state["transcript_end"] = end
+
+
+def _new_intuitive_state(video: dict, start: float, end: float) -> dict:
+    duration = max(float(video.get("duration") or end), end)
+    state = {
+        "revision": 0,
+        "nonce": secrets.token_hex(12),
+        "video_id": str(video["video_id"]),
+        "video_path": str(video["path"]),
+        "duration": duration,
+        "preview_start": float(start),
+        "preview_end": float(end),
+        "overall_start": float(start),
+        "overall_end": float(end),
+        "exclusions": [],
+        "active_tool": None,
+        "preview_mode": "source",
+        "pending_cut_start": None,
+        "selected_boundary": None,
+        "selected_word": None,
+        "viewport_start": float(start),
+        "viewport_end": float(end),
+        "playhead_sec": float(start),
+    }
+    _set_intuitive_transcript_focus(state, start)
+    return state
+
+
+def _finite_time(value, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name}が数値ではありません。") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name}が有限値ではありません。")
+    return result
+
+
+def _clip_intuitive_exclusions(state: dict) -> list[dict]:
+    """全体範囲との交差だけを残し、重複区間をID付きで統合する。"""
+    lo = float(state["overall_start"])
+    hi = float(state["overall_end"])
+    clipped = []
+    for raw in state.get("exclusions") or []:
+        try:
+            start = max(lo, _finite_time(raw.get("start"), "除外開始"))
+            end = min(hi, _finite_time(raw.get("end"), "除外終了"))
+        except (AttributeError, ValueError):
+            continue
+        if end <= start + 0.001:
+            continue
+        clipped.append({"id": str(raw.get("id") or "cut"), "start": start, "end": end})
+    clipped.sort(key=lambda cut: (cut["start"], cut["end"]))
+    merged = []
+    for cut in clipped:
+        if merged and cut["start"] <= merged[-1]["end"] + 0.001:
+            merged[-1]["end"] = max(merged[-1]["end"], cut["end"])
+        else:
+            merged.append(dict(cut))
+    return merged
+
+
+def _set_intuitive_boundary(state: dict, boundary: dict, value: float) -> None:
+    value = _finite_time(value, "境界時刻")
+    duration = float(state["duration"])
+    value = min(max(value, 0.0), duration)
+    kind = boundary.get("kind")
+    if kind == "overall_start":
+        state["overall_start"] = min(value, state["overall_end"] - 0.1)
+    elif kind == "overall_end":
+        state["overall_end"] = max(value, state["overall_start"] + 0.1)
+    elif kind == "pending_cut_start":
+        state["pending_cut_start"] = min(
+            max(value, state["overall_start"]), state["overall_end"] - 0.1
+        )
+    elif kind in {"exclusion_start", "exclusion_end"}:
+        cut = next(
+            (item for item in state["exclusions"] if item["id"] == boundary.get("id")),
+            None,
+        )
+        if not cut:
+            raise ValueError("選択中の除外区間が見つかりません。")
+        if kind == "exclusion_start":
+            cut["start"] = min(
+                max(value, state["overall_start"]), cut["end"] - 0.1
+            )
+        else:
+            cut["end"] = max(
+                min(value, state["overall_end"]), cut["start"] + 0.1
+            )
+    else:
+        raise ValueError("調整する境界が選択されていません。")
+    state["exclusions"] = _clip_intuitive_exclusions(state)
+    if (
+        state["exclusions"]
+        and sum(c["end"] - c["start"] for c in state["exclusions"])
+        >= state["overall_end"] - state["overall_start"] - 0.001
+    ):
+        raise ValueError("全体範囲のすべてを除外することはできません。")
+
+
+def _remap_intuitive_boundary(state: dict, boundary: dict | None, anchor=None):
+    """除外統合後も、同じ時刻を含む生存cutへ選択境界を付け替える。"""
+    if not isinstance(boundary, dict):
+        return None
+    kind = boundary.get("kind")
+    if kind not in {"exclusion_start", "exclusion_end"}:
+        if kind == "pending_cut_start" and state.get("pending_cut_start") is None:
+            return None
+        return dict(boundary)
+    same = next(
+        (cut for cut in state.get("exclusions") or [] if cut["id"] == boundary.get("id")),
+        None,
+    )
+    if same:
+        return {"kind": kind, "id": same["id"]}
+    try:
+        value = _finite_time(anchor, "選択境界")
+    except ValueError:
+        return None
+    survivor = next(
+        (cut for cut in state.get("exclusions") or []
+         if cut["start"] - 0.001 <= value <= cut["end"] + 0.001),
+        None,
+    )
+    return {"kind": kind, "id": survivor["id"]} if survivor else None
+
+
+def _apply_intuitive_word_tool(state: dict, word: dict) -> None:
+    """選択済み単語と選択済みツールを、操作順に依存せず適用する。"""
+    word_start = _finite_time(word.get("start"), "単語開始")
+    word_end = _finite_time(word.get("end"), "単語終了")
+    if word_end < word_start:
+        raise ValueError("単語の時刻範囲が不正です。")
+    normalized_word = {"start": word_start, "end": word_end}
+    tool = state.get("active_tool")
+    if tool not in _INTUITIVE_TOOLS:
+        state["selected_word"] = normalized_word
+        return
+    if tool == "overall_start":
+        boundary = {"kind": "overall_start"}
+        _set_intuitive_boundary(state, boundary, word_start)
+        state["selected_boundary"] = boundary
+        state["active_tool"] = None
+        state["selected_word"] = None
+    elif tool == "overall_end":
+        boundary = {"kind": "overall_end"}
+        _set_intuitive_boundary(state, boundary, word_end)
+        state["selected_boundary"] = boundary
+        state["active_tool"] = None
+        state["selected_word"] = None
+    elif tool == "exclude_start":
+        boundary = {"kind": "pending_cut_start"}
+        _set_intuitive_boundary(state, boundary, word_start)
+        state["selected_boundary"] = boundary
+        state["selected_word"] = None
+        state["active_tool"] = "exclude_end"
+    else:
+        pending = state.get("pending_cut_start")
+        if pending is None:
+            raise ValueError("先に除外開始を指定してください。")
+        if word_end <= float(pending) + 0.001:
+            raise ValueError("除外終了は除外開始より後にしてください。")
+        cut_start = max(float(pending), state["overall_start"])
+        cut_end = min(word_end, state["overall_end"])
+        if cut_end <= cut_start + 0.001:
+            raise ValueError("除外終了は除外開始より後にしてください。")
+        cut_id = f"cut-{state['revision'] + 1}-{len(state['exclusions']) + 1}"
+        state["exclusions"].append(
+            {"id": cut_id, "start": cut_start, "end": cut_end}
+        )
+        state["exclusions"] = _clip_intuitive_exclusions(state)
+        if sum(c["end"] - c["start"] for c in state["exclusions"]) >= (
+            state["overall_end"] - state["overall_start"] - 0.001
+        ):
+            raise ValueError("全体範囲のすべてを除外することはできません。")
+        chosen = next(
+            (c for c in state["exclusions"] if c["start"] <= cut_end <= c["end"] + 0.001),
+            state["exclusions"][-1],
+        )
+        state["selected_boundary"] = {
+            "kind": "exclusion_end", "id": chosen["id"]
+        }
+        state["pending_cut_start"] = None
+        state["selected_word"] = None
+        state["active_tool"] = None
+
+
+def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
+    """直感編集の全操作を検証し、単一のcanonical stateへ反映する。"""
+    if not isinstance(state, dict) or not state.get("nonce"):
+        raise gr.Error("先に動画を読み込んでください。")
+    if isinstance(command_json, str) and len(command_json) > 65536:
+        raise gr.Error("編集コマンドが長すぎます。")
+    try:
+        command = json.loads(command_json) if isinstance(command_json, str) else command_json
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise gr.Error("編集コマンドを読み取れませんでした。") from exc
+    if not isinstance(command, dict):
+        raise gr.Error("編集コマンドの形式が不正です。")
+    try:
+        revision = int(command.get("revision"))
+    except (TypeError, ValueError) as exc:
+        raise gr.Error("編集コマンドのrevisionが不正です。") from exc
+    if revision != int(state.get("revision", -1)) or command.get("nonce") != state["nonce"]:
+        raise gr.Error("古い画面からの操作を破棄しました。最新表示で再操作してください。")
+    if (
+        state.get("preview_mode", "source") == "result"
+        and command.get("type") not in {"set_viewport", "set_tool"}
+    ):
+        raise gr.Error("編集結果のプレビュー中です。動画を再読み込みして編集を再開してください。")
+
+    next_state = {
+        **state,
+        "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
+        "selected_boundary": (
+            dict(state["selected_boundary"])
+            if isinstance(state.get("selected_boundary"), dict) else None
+        ),
+        "selected_word": (
+            dict(state["selected_word"])
+            if isinstance(state.get("selected_word"), dict) else None
+        ),
+    }
+    action = command.get("type")
+    transcript_focus = None
+    try:
+        if action == "set_tool":
+            tool = command.get("tool")
+            if tool not in _INTUITIVE_TOOLS:
+                raise ValueError("不明な編集ツールです。")
+            if next_state.get("preview_mode") == "result":
+                # 連結済みプレビューの再生時刻を元動画の絶対時刻として扱わない。
+                # 元動画への復帰はhandle_intuitive_command側で完了してから、
+                # 選択したツールを有効にする。
+                next_state["preview_mode"] = "source"
+                next_state["active_tool"] = tool
+            else:
+                next_state["active_tool"] = (
+                    None if next_state.get("active_tool") == tool else tool
+                )
+            if (
+                next_state.get("pending_cut_start") is not None
+                and next_state.get("active_tool") != "exclude_end"
+            ):
+                next_state["pending_cut_start"] = None
+                if (next_state.get("selected_boundary") or {}).get("kind") == "pending_cut_start":
+                    next_state["selected_boundary"] = None
+            if next_state.get("active_tool") and next_state.get("selected_word"):
+                transcript_focus = next_state["selected_word"].get("start")
+                _apply_intuitive_word_tool(next_state, next_state["selected_word"])
+        elif action == "set_from_word":
+            transcript_focus = _finite_time(command.get("start"), "文字起こし時刻")
+            _apply_intuitive_word_tool(next_state, {
+                "start": command.get("start"), "end": command.get("end"),
+            })
+        elif action == "set_from_timeline":
+            if next_state.get("active_tool") not in _INTUITIVE_TOOLS:
+                raise ValueError("先にタイムライン編集ツールを選んでください。")
+            timeline_time = _finite_time(command.get("time"), "タイムライン時刻")
+            transcript_focus = timeline_time
+            _apply_intuitive_word_tool(
+                next_state, {"start": timeline_time, "end": timeline_time}
+            )
+        elif action == "set_transcript_focus":
+            transcript_focus = _finite_time(
+                command.get("time"), "文字起こしの表示中心"
+            )
+            next_state["playhead_sec"] = min(
+                max(transcript_focus, next_state["viewport_start"]),
+                next_state["viewport_end"],
+            )
+        elif action == "select_boundary":
+            boundary = {"kind": str(command.get("kind"))}
+            if command.get("id") is not None:
+                boundary["id"] = str(command["id"])
+            # 存在確認も兼ね、現在値で再設定する。
+            current = _intuitive_boundary_value(next_state, boundary)
+            transcript_focus = current
+            _set_intuitive_boundary(next_state, boundary, current)
+            next_state["selected_boundary"] = boundary
+        elif action == "set_boundary":
+            boundary = {"kind": str(command.get("kind"))}
+            if command.get("id") is not None:
+                boundary["id"] = str(command["id"])
+            boundary_time = _finite_time(command.get("time"), "境界時刻")
+            transcript_focus = boundary_time
+            _set_intuitive_boundary(next_state, boundary, boundary_time)
+            next_state["selected_boundary"] = _remap_intuitive_boundary(
+                next_state, boundary, boundary_time
+            )
+        elif action == "adjust_selected":
+            boundary = next_state.get("selected_boundary")
+            if not boundary:
+                raise ValueError("先に調整する境界を選択してください。")
+            delta = _finite_time(command.get("delta"), "調整幅")
+            adjusted_time = _intuitive_boundary_value(next_state, boundary) + delta
+            transcript_focus = adjusted_time
+            _set_intuitive_boundary(next_state, boundary, adjusted_time)
+            next_state["selected_boundary"] = _remap_intuitive_boundary(
+                next_state, boundary, adjusted_time
+            )
+        elif action == "add_exclusion":
+            start = _finite_time(command.get("start"), "除外開始")
+            end = _finite_time(command.get("end"), "除外終了")
+            start, end = sorted((start, end))
+            start = max(start, next_state["overall_start"])
+            end = min(end, next_state["overall_end"])
+            if end <= start + 0.001:
+                raise ValueError("全体範囲の内側をドラッグして除外を作成してください。")
+            cut_id = f"cut-{next_state['revision'] + 1}-{len(next_state['exclusions']) + 1}"
+            next_state["exclusions"].append(
+                {"id": cut_id, "start": start, "end": end}
+            )
+            next_state["exclusions"] = _clip_intuitive_exclusions(next_state)
+            if sum(c["end"] - c["start"] for c in next_state["exclusions"]) >= (
+                next_state["overall_end"] - next_state["overall_start"] - 0.001
+            ):
+                raise ValueError("全体範囲のすべてを除外することはできません。")
+            chosen = next(
+                (c for c in next_state["exclusions"] if c["start"] <= start <= c["end"]),
+                next_state["exclusions"][-1],
+            )
+            next_state["selected_boundary"] = {
+                "kind": "exclusion_end", "id": chosen["id"]
+            }
+            transcript_focus = (start + end) / 2.0
+        elif action == "set_viewport":
+            start = _finite_time(command.get("start"), "表示開始")
+            end = _finite_time(command.get("end"), "表示終了")
+            if end < start:
+                start, end = end, start
+            lo, hi = 0.0, float(next_state["duration"])
+            min_span = min(_INTUITIVE_VIEWPORT_MIN_SECONDS, hi)
+            max_span = min(_INTUITIVE_VIEWPORT_MAX_SECONDS, hi)
+            center = (start + end) / 2.0
+            span = min(max(end - start, min_span), max_span)
+            start, end = center - span / 2.0, center + span / 2.0
+            if start < lo:
+                end, start = min(hi, span), lo
+            if end > hi:
+                start, end = max(lo, hi - span), hi
+            next_state["viewport_start"], next_state["viewport_end"] = start, end
+            next_state["playhead_sec"] = min(
+                max(float(next_state.get("playhead_sec", start)), start), end
+            )
+            if next_state.get("preview_mode") == "result":
+                next_state["preview_mode"] = "source"
+                next_state["active_tool"] = None
+        else:
+            raise ValueError("不明な編集コマンドです。")
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+
+    next_state["overall_start"] = max(0.0, min(next_state["overall_start"], next_state["duration"]))
+    next_state["overall_end"] = max(
+        next_state["overall_start"] + 0.1,
+        min(next_state["overall_end"], next_state["duration"]),
+    )
+    next_state["exclusions"] = _clip_intuitive_exclusions(next_state)
+    next_state["selected_boundary"] = _remap_intuitive_boundary(
+        next_state, next_state.get("selected_boundary")
+    )
+    next_state["playhead_sec"] = min(
+        max(float(next_state.get("playhead_sec", next_state["viewport_start"])),
+            next_state["viewport_start"]),
+        next_state["viewport_end"],
+    )
+    _set_intuitive_transcript_focus(next_state, transcript_focus)
+    next_state["revision"] = int(next_state["revision"]) + 1
+    return next_state
+
+
+def _intuitive_boundary_value(state: dict, boundary: dict) -> float:
+    kind = boundary.get("kind")
+    if kind in {"overall_start", "overall_end", "pending_cut_start"}:
+        key = kind
+        value = state.get(key)
+        if value is None:
+            raise ValueError("境界がまだ設定されていません。")
+        return float(value)
+    if kind in {"exclusion_start", "exclusion_end"}:
+        cut = next(
+            (item for item in state.get("exclusions") or [] if item["id"] == boundary.get("id")),
+            None,
+        )
+        if not cut:
+            raise ValueError("選択中の除外区間が見つかりません。")
+        return float(cut["start" if kind.endswith("start") else "end"])
+    raise ValueError("不明な境界です。")
+
+
+def intuitive_state_to_clip_plan(state: dict) -> dict:
+    start, end = float(state["overall_start"]), float(state["overall_end"])
+    ranges = [[start, end]]
+    for cut in _clip_intuitive_exclusions(state):
+        next_ranges = []
+        for range_start, range_end in ranges:
+            if cut["end"] <= range_start or cut["start"] >= range_end:
+                next_ranges.append([range_start, range_end])
+            else:
+                if range_start < cut["start"]:
+                    next_ranges.append([range_start, cut["start"]])
+                if cut["end"] < range_end:
+                    next_ranges.append([cut["end"], range_end])
+        ranges = next_ranges
+    if not ranges:
+        raise gr.Error("全体範囲のすべてを除外することはできません。")
+    return {"base_start": start, "base_end": end, "ranges": ranges}
+
+
+def render_intuitive_toolbar(state: dict) -> str:
+    revision = int(state.get("revision", 0))
+    nonce = html.escape(str(state.get("nonce", "")), quote=True)
+    active = state.get("active_tool")
+    result_mode = state.get("preview_mode", "source") == "result"
+    transcript_start, transcript_end = _intuitive_transcript_bounds(state)
+    buttons = "".join(
+        f'<button type="button" class="intuitive-tool-button'
+        f'{" is-selected" if active == key else ""}" data-intuitive-tool="{key}">'
+        f"{label}</button>"
+        for key, label in _INTUITIVE_TOOL_LABELS
+    )
+    if result_mode:
+        status = "編集ツールを選ぶと元動画へ戻り、その編集を続けられます。"
+    elif active == "exclude_end" and state.get("pending_cut_start") is not None:
+        status = "除外開始を設定済みです。終了にする文字起こし範囲またはタイムライン位置を選んでください。"
+    elif state.get("selected_word"):
+        status = "文字起こし範囲を選択済みです。適用する編集ツールを選んでください。"
+    elif active:
+        status = f"{dict(_INTUITIVE_TOOL_LABELS).get(active)}にする文字起こし範囲またはタイムライン位置を選んでください。"
+    else:
+        status = "時刻付きの文字起こし範囲、または編集ツールを選んでください。"
+    return (
+        f'<div class="intuitive-toolbox" data-intuitive-root data-revision="{revision}" '
+        f'data-nonce="{nonce}" data-preview-mode="{state.get("preview_mode", "source")}" '
+        f'data-active-tool="{html.escape(str(active or ""), quote=True)}" '
+        f'data-transcript-start="{transcript_start:.3f}" '
+        f'data-transcript-end="{transcript_end:.3f}" '
+        f'data-viewport-start="{float(state["viewport_start"]):.3f}" '
+        f'data-viewport-end="{float(state["viewport_end"]):.3f}">'
+        f'<div class="intuitive-tool-heading"><strong>文字起こし編集ツール</strong></div>'
+        f'<div class="intuitive-tool-buttons">{buttons}</div>'
+        f'<div class="intuitive-tool-status">{status}</div></div>'
+    )
+
+
+def render_intuitive_selected_boundary(state: dict) -> str:
+    boundary = state.get("selected_boundary")
+    if not boundary:
+        return "**選択中の境界:** 未選択　｜　文字起こしまたはタイムラインから選択"
+    labels = {
+        "overall_start": "全体開始",
+        "overall_end": "全体終了",
+        "pending_cut_start": "除外開始（確定待ち）",
+        "exclusion_start": "除外開始",
+        "exclusion_end": "除外終了",
+    }
+    try:
+        value = _intuitive_boundary_value(state, boundary)
+    except ValueError:
+        return "**選択中の境界:** 未選択"
+    return f"**選択中の境界:** {labels.get(boundary.get('kind'), '境界')}　{utils.format_timestamp(value)}"
+
+
+def render_intuitive_state_overview(state: dict) -> str:
+    duration = max(float(state["duration"]), 0.1)
+    overall_left = max(0.0, min(100.0, state["overall_start"] / duration * 100.0))
+    overall_right = max(overall_left, min(100.0, state["overall_end"] / duration * 100.0))
+    viewport_left = max(0.0, min(100.0, state["viewport_start"] / duration * 100.0))
+    viewport_right = max(viewport_left, min(100.0, state["viewport_end"] / duration * 100.0))
+    viewport_span = max(0.0, state["viewport_end"] - state["viewport_start"])
+    min_span = min(_INTUITIVE_VIEWPORT_MIN_SECONDS, duration)
+    max_span = min(_INTUITIVE_VIEWPORT_MAX_SECONDS, duration)
+    return f"""
+    <div class="intuitive-timeline" data-intuitive-overview data-duration="{duration:.3f}"
+         data-preview-start="{state['preview_start']:.3f}" data-preview-end="{state['preview_end']:.3f}"
+         data-viewport-start="{state['viewport_start']:.3f}" data-viewport-end="{state['viewport_end']:.3f}"
+         data-viewport-min-span="{min_span:.3f}" data-viewport-max-span="{max_span:.3f}">
+      <div class="intuitive-timeline-scale"><span>00:00:00</span><span>元動画全体</span><span>{utils.format_timestamp(duration)}</span></div>
+      <div class="intuitive-overview-track" role="img" aria-label="全体編集範囲と拡大表示範囲">
+        <div class="intuitive-overall-window" style="left:{overall_left:.4f}%;width:{overall_right - overall_left:.4f}%" title="全体編集範囲"></div>
+        <div class="intuitive-overview-window" style="left:{viewport_left:.4f}%;width:{viewport_right - viewport_left:.4f}%" title="拡大表示範囲">
+          <span class="intuitive-viewport-interaction">
+            <span class="intuitive-viewport-grip start" data-viewport-drag="start"></span>
+            <span class="intuitive-viewport-move" data-viewport-drag="move"></span>
+            <span class="intuitive-viewport-grip end" data-viewport-drag="end"></span>
+          </span>
+        </div>
+      </div>
+      <div class="intuitive-viewport-summary">
+        <span>拡大表示: <strong data-viewport-summary>{utils.format_timestamp(state['viewport_start'])} ～ {utils.format_timestamp(state['viewport_end'])}（{viewport_span:.1f}秒）</strong></span>
+        <span>両端をドラッグして{min_span:.0f}～{max_span:.0f}秒に変更 / 中央をドラッグして移動</span>
+      </div>
+    </div>
+    """
+
+
+def render_intuitive_state_zoom(state: dict) -> str:
+    view_start, view_end = float(state["viewport_start"]), float(state["viewport_end"])
+    span = max(view_end - view_start, 0.1)
+    midpoint = view_start + span / 2.0
+
+    def percent(value):
+        return max(0.0, min(100.0, (float(value) - view_start) / span * 100.0))
+
+    overlays = []
+    selected_boundary = state.get("selected_boundary") or {}
+    selected_cut_id = (
+        str(selected_boundary.get("id"))
+        if selected_boundary.get("kind") in {"exclusion_start", "exclusion_end"}
+        else None
+    )
+    for cut in state.get("exclusions") or []:
+        left, right = percent(cut["start"]), percent(cut["end"])
+        if right <= 0 or left >= 100 or right <= left:
+            continue
+        cut_id = html.escape(str(cut["id"]), quote=True)
+        selected_class = " is-selected-cut" if str(cut["id"]) == selected_cut_id else ""
+        overlays.append(
+            f'<div class="intuitive-cut-zone{selected_class}" style="left:{left:.4f}%;width:{right-left:.4f}%" '
+            f'data-cut-id="{cut_id}" title="途中カット">'
+            f'<span class="intuitive-cut-handle start" data-boundary-kind="exclusion_start" data-cut-id="{cut_id}"></span>'
+            f'<span class="intuitive-cut-handle end" data-boundary-kind="exclusion_end" data-cut-id="{cut_id}"></span></div>'
+        )
+    handles = []
+    for kind, value, css_class in (
+        ("overall_start", state["overall_start"], "start"),
+        ("overall_end", state["overall_end"], "end"),
+    ):
+        position = percent(value)
+        if 0 <= position <= 100:
+            handles.append(
+                f'<div class="intuitive-handle {css_class}" style="left:{position:.4f}%" '
+                f'data-boundary-kind="{kind}" title="{kind}"></div>'
+            )
+    result_mode = state.get("preview_mode", "source") == "result"
+    transcript_start, transcript_end = _intuitive_transcript_bounds(state)
+    transcript_left = percent(transcript_start)
+    transcript_right = percent(transcript_end)
+    playhead_position = percent(state.get("playhead_sec", view_start))
+    timeline_tools = "".join(
+        f'<button type="button" class="intuitive-tool-button'
+        f'{" is-selected" if state.get("active_tool") == key else ""}" '
+        f'data-intuitive-tool="{key}">'
+        f'{label}</button>'
+        for key, label in _INTUITIVE_TOOL_LABELS
+    )
+    return f"""
+    <div class="intuitive-timeline" data-intuitive-zoom data-view-start="{view_start:.3f}" data-view-end="{view_end:.3f}"
+         data-preview-start="{state['preview_start']:.3f}" data-preview-end="{state['preview_end']:.3f}"
+         data-preview-mode="{html.escape(state.get('preview_mode', 'source'), quote=True)}"
+         data-overall-start="{state['overall_start']:.3f}" data-overall-end="{state['overall_end']:.3f}">
+      <div class="intuitive-timeline-toolbox" aria-label="拡大タイムライン編集ツール">
+        <span>ツール選択 → 位置をクリック</span><div class="intuitive-tool-buttons">{timeline_tools}</div>
+      </div>
+      <div class="intuitive-timeline-scale"><span>{utils.format_timestamp(view_start)}</span><span>{utils.format_timestamp(midpoint)}</span><span>{utils.format_timestamp(view_end)}</span></div>
+      <div class="intuitive-zoom-track" role="img" aria-label="保存範囲、除外範囲、再生位置">
+        <div class="intuitive-transcript-window" style="left:{transcript_left:.4f}%;width:{max(0.0, transcript_right - transcript_left):.4f}%"
+             title="文字起こし表示: {utils.format_timestamp(transcript_start)} ～ {utils.format_timestamp(transcript_end)}"></div>
+        <div class="intuitive-zoom-overall" style="left:{percent(state['overall_start']):.4f}%;width:{max(0.0, percent(state['overall_end']) - percent(state['overall_start'])):.4f}%"></div>
+        {''.join(overlays)}{''.join(handles)}
+        <div class="intuitive-playhead" style="left:{playhead_position:.4f}%" title="プレビュー再生位置"></div>
+        <div class="intuitive-zoom-hint">全体範囲内をドラッグして途中カットを追加</div>
+      </div>
+      <div class="intuitive-timeline-legend"><span class="intuitive-legend-keep">■ 保存範囲</span>
+        <span class="intuitive-legend-cut">▨ 途中カット</span><span class="intuitive-legend-position">│ 再生位置</span>
+        <span class="intuitive-legend-transcript">▔ 文字起こし表示</span>
+        <span>青枠: viewport / 薄青: 全体編集範囲</span></div>
+    </div>
+    """
+
+
+def _refresh_intuitive_source(state: dict):
+    start, end = float(state["viewport_start"]), float(state["viewport_end"])
+    _set_intuitive_transcript_focus(state)
+    transcript_start, transcript_end = _intuitive_transcript_bounds(state)
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
+            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
+            (state["video_id"], transcript_start, transcript_end),
+        ).fetchall()
+        segments = [dict(row) for row in rows]
+    finally:
+        conn.close()
+    preview_path = make_intuitive_preview(
+        state["video_id"], state["video_path"], start, end, state["duration"]
+    )
+    refreshed = {
+        **state,
+        "preview_start": start,
+        "preview_end": end,
+        "active_tool": state.get("active_tool"),
+        "preview_mode": "source",
+    }
+    filename = Path(state["video_path"]).name
+    interval = f"{utils.format_timestamp(start)} - {utils.format_timestamp(end)}"
+    return (
+        refreshed,
+        gr.update(
+            value=preview_path,
+            label=f"直感編集プレビュー: {filename} [{state['video_id']}]",
+        ),
+        render_intuitive_transcript(segments, refreshed),
+        f"**表示モード:** 元動画プレビュー　｜　**選択動画:** {html.escape(filename)}　｜　**表示区間:** {interval}",
+    )
+
+
+def _render_intuitive_transcript_for_state(state: dict) -> str:
+    _set_intuitive_transcript_focus(state)
+    transcript_start, transcript_end = _intuitive_transcript_bounds(state)
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
+            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
+            (state["video_id"], transcript_start, transcript_end),
+        ).fetchall()
+        segments = [dict(row) for row in rows]
+    finally:
+        conn.close()
+    return render_intuitive_transcript(segments, state)
+
+
+def _intuitive_render_outputs(state: dict, source_updates=None):
+    preview, transcript, info = source_updates or (gr.update(), gr.update(), gr.update())
+    return (
+        state,
+        render_intuitive_toolbar(state),
+        render_intuitive_selected_boundary(state),
+        render_intuitive_state_overview(state),
+        render_intuitive_state_zoom(state),
+        preview,
+        transcript,
+        info,
+    )
+
+
+def handle_intuitive_command(command_json: str, state: dict):
+    try:
+        command = json.loads(command_json) if isinstance(command_json, str) else dict(command_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        command = {}
+    resume_for_tool = bool(
+        isinstance(state, dict)
+        and state.get("preview_mode", "source") == "result"
+        and command.get("type") == "set_tool"
+    )
+    try:
+        next_state = dispatch_intuitive_command(command_json, state)
+    except gr.Error as exc:
+        # HTML→Gradio bridgeはrevisionの更新を完了通知として直列実行する。
+        # 無効操作でcallback自体を失敗させると後続操作が待ち続けるため、
+        # 編集内容を変えずrevisionだけ進めて最新表示へ安全に復帰させる。
+        gr.Warning(str(exc))
+        if not isinstance(state, dict):
+            raise
+        next_state = {
+            **state,
+            "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
+            "selected_boundary": (
+                dict(state["selected_boundary"])
+                if isinstance(state.get("selected_boundary"), dict) else None
+            ),
+            "revision": int(state.get("revision", 0)) + 1,
+        }
+        return _intuitive_render_outputs(next_state)
+    if command.get("type") == "set_viewport" or resume_for_tool:
+        try:
+            next_state, preview, transcript, info = _refresh_intuitive_source(next_state)
+        except Exception as exc:
+            gr.Warning(
+                "表示区間のプレビュー更新に失敗しました。元の表示区間へ戻します。"
+                f" ({type(exc).__name__})"
+            )
+            recovered = {
+                **state,
+                "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
+                "selected_boundary": (
+                    dict(state["selected_boundary"])
+                    if isinstance(state.get("selected_boundary"), dict) else None
+                ),
+                "revision": int(state.get("revision", 0)) + 1,
+            }
+            return _intuitive_render_outputs(recovered)
+        return _intuitive_render_outputs(next_state, (preview, transcript, info))
+    transcript = _render_intuitive_transcript_for_state(next_state)
+    return _intuitive_render_outputs(
+        next_state, (gr.update(), transcript, gr.update())
+    )
+
+
+def adjust_intuitive_boundary(step: float, direction: float, state: dict):
+    command = {
+        "type": "adjust_selected",
+        "delta": _finite_time(step or 1.0, "調整幅") * float(direction),
+        "revision": state.get("revision") if state else None,
+        "nonce": state.get("nonce") if state else None,
+    }
+    try:
+        next_state = dispatch_intuitive_command(command, state)
+        return _intuitive_render_outputs(
+            next_state,
+            (gr.update(), _render_intuitive_transcript_for_state(next_state), gr.update()),
+        )
+    except gr.Error as exc:
+        gr.Warning(str(exc))
+        if not isinstance(state, dict):
+            raise
+        return _intuitive_render_outputs(state)
+
+
+def load_intuitive_editor(video_choice: str):
+    preview, transcript, info, _, _ = load_intuitive_video(video_choice)
+    video_id = parse_video_choice(video_choice)
+    conn = db.get_conn()
+    try:
+        video = db.get_video(conn, video_id)
+        first_segment = conn.execute(
+            "SELECT start_sec, end_sec FROM asr_segments "
+            "WHERE video_id = ? AND trim(COALESCE(text, '')) <> '' "
+            "ORDER BY start_sec LIMIT 1",
+            (video_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not video:
+        raise gr.Error(f"動画が見つかりません: {video_id}")
+    first_start = float(first_segment["start_sec"]) if first_segment else 0.0
+    start = max(0.0, first_start - 2.0)
+    end = min(float(video.get("duration") or start + 90.0), start + 90.0)
+    state = _new_intuitive_state(video, start, end)
+    transcript = _render_intuitive_transcript_for_state(state)
+    return (
+        state, preview, transcript, "**表示モード:** 元動画プレビュー　｜　" + info,
+        render_intuitive_toolbar(state),
+        render_intuitive_selected_boundary(state),
+        render_intuitive_state_overview(state),
+        render_intuitive_state_zoom(state),
+    )
+
+
+def _load_intuitive_search_result(index: int, results: list[dict]):
+    if not results or index < 0 or index >= len(results):
+        raise gr.Error("検索結果を選択してください。")
+    result = results[index]
+    conn = db.get_conn()
+    try:
+        video = db.get_video(conn, result["video_id"])
+        if not video:
+            raise gr.Error(f"動画が見つかりません: {result['video_id']}")
+        overall_start, overall_end = expand_to_speech_boundary(
+            conn, result["video_id"], result["start"], result["end"]
+        )
+        duration = float(video.get("duration") or overall_end)
+        if not math.isfinite(duration) or duration < 0.1:
+            raise gr.Error("検索結果の動画が短すぎるか、長さを取得できません。")
+        overall_start = max(0.0, min(float(overall_start), duration - 0.1))
+        overall_end = max(
+            overall_start + 0.1,
+            min(float(overall_end), duration),
+        )
+        desired_start = max(0.0, overall_start - 10.0)
+        desired_end = min(duration, overall_end + 10.0)
+        if desired_end - desired_start > 90.0:
+            center = (overall_start + overall_end) / 2.0
+            desired_start, desired_end = center - 45.0, center + 45.0
+            if desired_start < 0:
+                desired_start, desired_end = 0.0, min(duration, 90.0)
+            elif desired_end > duration:
+                desired_start, desired_end = max(0.0, duration - 90.0), duration
+        rows = conn.execute(
+            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
+            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
+            (result["video_id"], desired_start, desired_end),
+        ).fetchall()
+        segments = [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+    state = _new_intuitive_state(video, desired_start, desired_end)
+    state["overall_start"] = float(overall_start)
+    state["overall_end"] = float(overall_end)
+    preview_path = make_intuitive_preview(
+        state["video_id"], state["video_path"], desired_start, desired_end, state["duration"]
+    )
+    filename = Path(state["video_path"]).name
+    interval = f"{utils.format_timestamp(desired_start)} - {utils.format_timestamp(desired_end)}"
+    return (
+        state,
+        gr.update(
+            value=preview_path,
+            label=f"直感編集プレビュー: {filename} [{state['video_id']}]",
+        ),
+        render_intuitive_transcript(segments, state),
+        f"**表示モード:** 元動画プレビュー　｜　**検索結果:** {html.escape(filename)}　｜　**表示区間:** {interval}",
+        render_intuitive_toolbar(state),
+        render_intuitive_selected_boundary(state),
+        render_intuitive_state_overview(state),
+        render_intuitive_state_zoom(state),
+    )
+
+
+def do_intuitive_search(
+    query: str, video_choice: str, top_k: int, min_score: float,
+    current_state: dict | None = None,
+):
+    results = search_video_results(query, video_choice, top_k, min_score)
+    if not results:
+        if query.strip():
+            gr.Info("該当するシーンが見つかりませんでした。")
+        return (
+            [], [], current_state,
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+    return (_build_table(results, selected_idx=0), results, *_load_intuitive_search_result(0, results))
+
+
+def on_intuitive_search_select(results: list, evt: gr.SelectData):
+    raw_index = evt.index if evt and evt.index is not None else 0
+    index = raw_index[0] if isinstance(raw_index, (tuple, list)) else raw_index
+    index = int(index)
+    return (_build_table(results, selected_idx=index), *_load_intuitive_search_result(index, results))
+
+
+def preview_intuitive_editor(state: dict):
+    if not state:
+        raise gr.Error("先に動画を読み込んでください。")
+    ctx = {
+        "video_id": state["video_id"],
+        "video_path": state["video_path"],
+        "duration": state["duration"],
+    }
+    preview, info, _ = preview_clip_plan(
+        state["overall_start"], state["overall_end"], ctx,
+        intuitive_state_to_clip_plan(state),
+    )
+    result_state = {
+        **state,
+        "active_tool": None,
+        "pending_cut_start": None,
+        "selected_word": None,
+        "selected_boundary": (
+            None
+            if (state.get("selected_boundary") or {}).get("kind") == "pending_cut_start"
+            else state.get("selected_boundary")
+        ),
+        "preview_mode": "result",
+        "revision": state["revision"] + 1,
+    }
+    return _intuitive_render_outputs(
+        result_state,
+        (
+            preview,
+            gr.update(),
+            "**表示モード:** 編集結果プレビュー　｜　" + info.replace("\n", "　"),
+        ),
+    )
+
+
+def return_intuitive_source(state: dict):
+    if not state:
+        raise gr.Error("先に動画を読み込んでください。")
+    source_state = {
+        **state,
+        "active_tool": None,
+        "preview_mode": "source",
+        "revision": int(state.get("revision", 0)) + 1,
+    }
+    source_state, preview, transcript, info = _refresh_intuitive_source(source_state)
+    return _intuitive_render_outputs(source_state, (preview, transcript, info))
+
+
+def save_intuitive_editor(state: dict, precise: bool, out_dir: str, filename: str):
+    if not state:
+        raise gr.Error("先に動画を読み込んでください。")
+    requested_name = (filename or "").strip()
+    if requested_name and (
+        Path(requested_name).name != requested_name
+        or requested_name in {".", ".."}
+        or "/" in requested_name
+        or "\\" in requested_name
+    ):
+        raise gr.Error("ファイル名にはフォルダやパスを含めないでください。")
+    ctx = {
+        "video_id": state["video_id"],
+        "video_path": state["video_path"],
+        "duration": state["duration"],
+    }
+    return on_save(
+        state["overall_start"], state["overall_end"], ctx,
+        intuitive_state_to_clip_plan(state), precise, out_dir, filename,
+    )
 
 
 def get_region_sentences(conn, video_id: str, lo: float, hi: float) -> list:
@@ -1144,7 +2394,535 @@ _APP_CSS = """
 .clip-timeline-cut { position: absolute; inset-block: 0; }
 .clip-timeline-hatch-key { padding: .05rem .35rem; border-radius: .2rem; color: #fff; }
 .clip-timeline-empty { color: var(--body-text-color-subdued); font-size: .9rem; }
+.intuitive-prototype-note {
+  border-left: .3rem solid var(--primary-500); padding: .55rem .8rem;
+  background: var(--background-fill-secondary); border-radius: .35rem;
+}
+#intuitive-transcript-panel {
+  border: 1px solid var(--border-color-primary); border-radius: .55rem;
+  overflow: hidden; height: 420px; background: var(--background-fill-primary);
+  display: flex !important; flex-direction: column !important;
+}
+#intuitive-mode-row {
+  align-items: center !important; gap: .45rem !important; margin-bottom: .15rem;
+}
+#intuitive-video-info { min-width: 0; }
+#intuitive-video-info .prose { margin: 0 !important; }
+#intuitive-preview-result, #intuitive-return-source {
+  flex: 0 0 auto !important; align-self: center !important;
+}
+button#intuitive-preview-result, #intuitive-preview-result button {
+  border-color: var(--primary-500); color: var(--primary-500);
+}
+.intuitive-tool-header {
+  position: relative; flex: 0 0 auto !important; align-self: stretch !important;
+  min-height: 0 !important; height: auto !important; z-index: 2; padding: .18rem .3rem;
+  background: var(--background-fill-secondary);
+  border-bottom: 1px solid var(--border-color-primary);
+}
+.intuitive-tool-header .prose { margin: 0 !important; }
+.intuitive-toolbox { padding: .2rem .35rem; }
+.intuitive-tool-heading {
+  display: flex; align-items: center; justify-content: space-between; gap: .4rem;
+}
+.intuitive-tool-heading strong { white-space: nowrap; font-size: .92rem; }
+.intuitive-tool-buttons { display: flex; gap: .25rem; margin: .18rem 0; }
+.intuitive-tool-button {
+  flex: 1; min-width: 4.2rem; border: 1px solid var(--border-color-primary);
+  border-radius: .35rem; padding: .2rem .22rem; cursor: pointer;
+  font-size: .82rem; line-height: 1.2;
+  background: var(--button-secondary-background-fill); color: var(--body-text-color);
+}
+.intuitive-tool-button.is-selected {
+  background: var(--primary-500); color: #fff; border-color: var(--primary-500);
+}
+.intuitive-tool-button:disabled { opacity: .55; cursor: not-allowed; }
+.intuitive-tool-status {
+  font-size: .74rem; line-height: 1.25; color: var(--body-text-color-subdued);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#intuitive-transcript-words {
+  flex: 1 1 0 !important; min-height: 0 !important; height: auto !important;
+  overflow: hidden !important; align-self: stretch !important;
+}
+#intuitive-transcript-words > div,
+#intuitive-transcript-words .prose {
+  height: 100% !important; min-height: 0 !important; overflow: hidden !important;
+}
+.intuitive-transcript-copy {
+  height: 100%; max-height: 100%; min-height: 0; overflow-y: scroll;
+  overscroll-behavior: contain; scrollbar-gutter: stable;
+  touch-action: pan-y; padding: .55rem .65rem; line-height: 1.7;
+}
+.intuitive-word {
+  display: inline-block; margin: .08rem .1rem; padding: .05rem .16rem;
+  border-radius: .2rem; border-bottom: 2px solid transparent; white-space: pre-wrap;
+}
+.intuitive-word:hover { border-bottom-color: var(--primary-500); background: var(--background-fill-secondary); }
+.intuitive-word.is-selected-word { background: #ff9800 !important; color: #111; outline: 2px solid #e67700; }
+.intuitive-word.is-outside-overall { opacity: .32; }
+.intuitive-word.is-excluded-word {
+  background: repeating-linear-gradient(135deg, rgba(80,80,80,.25) 0 4px, rgba(230,230,230,.4) 4px 8px);
+  text-decoration: line-through;
+}
+.intuitive-word.marks-overall-start { border-left: 3px solid #1976d2; }
+.intuitive-word.marks-overall-end { border-right: 3px solid #1976d2; }
+.intuitive-word.marks-pending-cut { border-left: 3px solid #ff9800; }
+.intuitive-word.marks-exclusion-start { box-shadow: inset 3px 0 #555; }
+.intuitive-word.marks-exclusion-end { box-shadow: inset -3px 0 #555; }
+.intuitive-transcript-granularity {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 0 0 .45rem;
+  padding: .3rem .5rem;
+  border-radius: .35rem;
+  background: var(--background-fill-secondary);
+  color: var(--body-text-color-subdued);
+  font-size: .82rem;
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: .2rem .6rem;
+}
+.intuitive-transcript-range { color: var(--body-text-color); font-weight: 600; }
+.intuitive-segment {
+  border-radius: .25rem;
+  outline: 1px dashed var(--border-color-primary);
+}
+.intuitive-boundary-box {
+  padding: .45rem .65rem; border: 1px solid var(--border-color-primary);
+  border-radius: .45rem; background: var(--background-fill-secondary);
+}
+.intuitive-compact-row { align-items: end !important; }
+.intuitive-timeline { margin: .2rem 0 .45rem; }
+.intuitive-timeline-toolbox {
+  display: flex; align-items: center; gap: .55rem; margin: 0 0 .25rem;
+  padding: .22rem .35rem; border: 1px solid var(--border-color-primary);
+  border-radius: .4rem; background: var(--background-fill-secondary);
+}
+.intuitive-timeline-toolbox > span {
+  flex: 0 0 auto; font-size: .78rem; color: var(--body-text-color-subdued);
+}
+.intuitive-timeline-toolbox .intuitive-tool-buttons {
+  flex: 0 1 34rem; margin: 0;
+}
+.intuitive-timeline-toolbox .intuitive-tool-button { padding-block: .16rem; }
+.intuitive-timeline-scale {
+  display: flex; justify-content: space-between; color: var(--body-text-color-subdued);
+  font-size: .8rem; margin-bottom: .25rem;
+}
+.intuitive-overview-track, .intuitive-zoom-track {
+  position: relative; overflow: hidden; border: 1px solid var(--border-color-primary);
+  border-radius: .45rem; background: var(--neutral-200);
+}
+.intuitive-overview-track { height: 1rem; overflow: visible; }
+.intuitive-overview-window {
+  position: absolute; left: 28%; width: 44%; inset-block: .1rem;
+  border: 2px solid var(--primary-500); background: color-mix(in srgb, var(--primary-500) 22%, transparent);
+  cursor: grab; z-index: 2;
+}
+.intuitive-viewport-summary {
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: .25rem .8rem;
+  margin-top: .28rem; color: var(--body-text-color-subdued); font-size: .78rem;
+}
+.intuitive-viewport-summary strong { color: var(--body-text-color); font-weight: 600; }
+.intuitive-overall-window {
+  position: absolute; inset-block: .2rem; border-radius: .2rem;
+  background: color-mix(in srgb, #4aa3df 35%, transparent); z-index: 1;
+}
+.intuitive-viewport-grip {
+  position: absolute; top: -2px; bottom: -2px; width: .55rem;
+  background: var(--primary-500); cursor: ew-resize;
+}
+.intuitive-viewport-grip.start { left: -.25rem; }
+.intuitive-viewport-grip.end { right: -.25rem; }
+.intuitive-viewport-interaction {
+  position: absolute; left: 50%; top: -7px; bottom: -7px;
+  width: max(100%, 32px); transform: translateX(-50%); z-index: 5;
+}
+.intuitive-viewport-move { position: absolute; inset: 0 10px; cursor: grab; }
+.intuitive-viewport-interaction .intuitive-viewport-grip { width: 10px; top: 0; bottom: 0; }
+.intuitive-viewport-interaction .intuitive-viewport-grip.start { left: 0; }
+.intuitive-viewport-interaction .intuitive-viewport-grip.end { right: 0; }
+.intuitive-zoom-track { height: 3rem; background: var(--neutral-300); cursor: crosshair; }
+.intuitive-zoom-overall {
+  position: absolute; inset-block: 0; background: var(--primary-500); opacity: .82;
+}
+.intuitive-transcript-window {
+  position: absolute; top: 0; height: .38rem; z-index: 5; pointer-events: none;
+  background: #7e57c2; box-shadow: 0 1px 0 rgba(255,255,255,.75);
+}
+.intuitive-zoom-hint {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  pointer-events: none; color: rgba(255,255,255,.78); font-size: .78rem;
+  text-shadow: 0 1px 2px #222;
+}
+.intuitive-cut-zone {
+  position: absolute; left: 37%; width: 18%; inset-block: 0;
+  background: repeating-linear-gradient(135deg, #333 0, #333 5px, #eee 5px, #eee 10px);
+  cursor: pointer;
+}
+.intuitive-cut-zone.is-selected-cut { outline: 3px solid #ff9800; outline-offset: -3px; z-index: 3; }
+.intuitive-cut-handle {
+  position: absolute; top: 0; bottom: 0; width: .55rem; background: #ff8a00;
+  cursor: ew-resize; z-index: 3;
+}
+.intuitive-cut-handle.start { left: 0; }
+.intuitive-cut-handle.end { right: 0; }
+.intuitive-handle {
+  position: absolute; top: .2rem; bottom: .2rem; width: .7rem;
+  border-radius: .25rem; background: #ff8a00; border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35); cursor: ew-resize;
+  transform: translateX(-50%); z-index: 4;
+}
+.intuitive-playhead {
+  position: absolute; left: 68%; inset-block: 0; width: 3px; background: #e53935;
+}
+.intuitive-playhead::before {
+  content: ""; position: absolute; left: -5px; top: 0;
+  border-left: 6px solid transparent; border-right: 6px solid transparent;
+  border-top: 8px solid #e53935;
+}
+.intuitive-timeline-legend { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: .35rem; font-size: .85rem; }
+.intuitive-legend-keep { color: var(--primary-500); }
+.intuitive-legend-cut { color: var(--body-text-color-subdued); }
+.intuitive-legend-position { color: #e53935; }
+.intuitive-legend-transcript { color: #7e57c2; }
+#intuitive-command-json, #intuitive-command-submit { display: none !important; }
+body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-before,
+body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-before button,
+body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-after,
+body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-after button,
+body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-step {
+  pointer-events: none !important; opacity: .5 !important;
+}
 """
+
+
+_INTUITIVE_EDITOR_JS = r"""() => {
+  if (document.__intuitiveEditorInstalled) return;
+  document.__intuitiveEditorInstalled = true;
+  let drag = null;
+  let commandBusy = false;
+  let transcriptFocusPending = null;
+  const commandQueue = [];
+
+  const editorMeta = () => {
+    const root = document.querySelector('#intuitive-toolbox [data-intuitive-root]');
+    if (!root) return null;
+    const meta = {
+      revision: Number(root.dataset.revision), nonce: root.dataset.nonce,
+      previewMode: root.dataset.previewMode || 'source',
+      activeTool: root.dataset.activeTool || '',
+      transcriptStart: Number(root.dataset.transcriptStart),
+      transcriptEnd: Number(root.dataset.transcriptEnd),
+      viewportStart: Number(root.dataset.viewportStart),
+      viewportEnd: Number(root.dataset.viewportEnd)
+    };
+    if (transcriptFocusPending && transcriptFocusPending.nonce === meta.nonce
+        && transcriptFocusPending.time >= meta.transcriptStart
+        && transcriptFocusPending.time <= meta.transcriptEnd) {
+      transcriptFocusPending = null;
+    }
+    return meta;
+  };
+  const flushCommandQueue = () => {
+    if (commandBusy || !commandQueue.length) return;
+    const queued = commandQueue.shift();
+    const meta = editorMeta();
+    if (!meta) {
+      commandQueue.unshift(queued);
+      setTimeout(flushCommandQueue, 100);
+      return;
+    }
+    if (queued.nonce !== meta.nonce) {
+      flushCommandQueue();
+      return;
+    }
+    const payload = queued.payload;
+    const field = document.querySelector('#intuitive-command-json textarea, #intuitive-command-json input');
+    const button = document.querySelector(
+      '#intuitive-command-submit button, button#intuitive-command-submit, #intuitive-command-submit'
+    );
+    if (!field || !button) { setTimeout(flushCommandQueue, 100); return; }
+    commandBusy = true;
+    const previousRevision = meta.revision;
+    const prototype = field instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
+    setter.call(field, JSON.stringify({...payload, ...meta}));
+    field.dispatchEvent(new InputEvent('input', {
+      bubbles: true, composed: true, inputType: 'insertText', data: null
+    }));
+    requestAnimationFrame(() => button.click());
+    const started = performance.now();
+    const awaitRevision = () => {
+      const current = editorMeta();
+      if ((current && current.revision !== previousRevision) || performance.now() - started > 60000) {
+        commandBusy = false;
+        flushCommandQueue();
+      } else {
+        setTimeout(awaitRevision, 50);
+      }
+    };
+    setTimeout(awaitRevision, 50);
+  };
+  const send = (payload) => {
+    const meta = editorMeta();
+    if (!meta) return;
+    commandQueue.push({payload, nonce: meta.nonce});
+    flushCommandQueue();
+  };
+  const timeAtPointer = (track, event, lo, hi) => {
+    const rect = track.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(rect.width, 1)));
+    return lo + ratio * (hi - lo);
+  };
+  const requestTranscriptFocus = (absolute) => {
+    const meta = editorMeta();
+    if (!meta || meta.previewMode === 'result' || !Number.isFinite(absolute)) return;
+    const span = Math.max(0, meta.transcriptEnd - meta.transcriptStart);
+    const margin = Math.min(8, span * .2);
+    if (absolute >= meta.transcriptStart + margin && absolute <= meta.transcriptEnd - margin) {
+      transcriptFocusPending = null;
+      return;
+    }
+    const inside = absolute >= meta.transcriptStart && absolute <= meta.transcriptEnd;
+    const cannotShiftLeft = meta.transcriptStart <= meta.viewportStart + .001;
+    const cannotShiftRight = meta.transcriptEnd >= meta.viewportEnd - .001;
+    if (inside && ((absolute < meta.transcriptStart + margin && cannotShiftLeft)
+        || (absolute > meta.transcriptEnd - margin && cannotShiftRight))) {
+      transcriptFocusPending = null;
+      return;
+    }
+    if (transcriptFocusPending && transcriptFocusPending.nonce === meta.nonce
+        && Math.abs(transcriptFocusPending.time - absolute) < 1) return;
+    transcriptFocusPending = {nonce: meta.nonce, time: absolute};
+    send({type: 'set_transcript_focus', time: absolute});
+  };
+  const formatTimelineTime = (value) => {
+    const totalCentiseconds = Math.round(Math.max(0, Number(value) || 0) * 100);
+    const hours = Math.floor(totalCentiseconds / 360000);
+    const minutes = Math.floor((totalCentiseconds % 360000) / 6000);
+    const remainder = ((totalCentiseconds % 6000) / 100).toFixed(2).padStart(5, '0');
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${remainder}`;
+  };
+  const updateViewportDrag = (currentDrag, event) => {
+    const rect = currentDrag.track.getBoundingClientRect();
+    const delta = (event.clientX - currentDrag.startX) / Math.max(rect.width, 1) * currentDrag.duration;
+    const minSpan = currentDrag.minSpan;
+    const maxSpan = currentDrag.maxSpan;
+    let start = currentDrag.start, end = currentDrag.end;
+    if (currentDrag.mode === 'move') {
+      const width = end - start;
+      start = Math.max(currentDrag.previewStart, Math.min(currentDrag.previewEnd - width, start + delta));
+      end = start + width;
+    } else if (currentDrag.mode === 'start') {
+      start = Math.max(currentDrag.previewStart, Math.min(end - minSpan, start + delta));
+      if (end - start > maxSpan) start = end - maxSpan;
+    } else {
+      end = Math.min(currentDrag.previewEnd, Math.max(start + minSpan, end + delta));
+      if (end - start > maxSpan) end = start + maxSpan;
+    }
+    currentDrag.nextStart = start;
+    currentDrag.nextEnd = end;
+    currentDrag.overlay.style.left = `${start / currentDrag.duration * 100}%`;
+    currentDrag.overlay.style.width = `${(end - start) / currentDrag.duration * 100}%`;
+    if (currentDrag.summary) {
+      currentDrag.summary.textContent = `${formatTimelineTime(start)} ～ ${formatTimelineTime(end)}（${(end - start).toFixed(1)}秒）`;
+    }
+  };
+  const seekZoom = (zoom, event) => {
+    if (!zoom || zoom.dataset.previewMode === 'result') return;
+    const track = zoom.querySelector('.intuitive-zoom-track');
+    const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
+    const absolute = timeAtPointer(track, event, lo, hi);
+    const video = document.querySelector('#intuitive-preview-video video');
+    const previewStart = Number(zoom.dataset.previewStart), previewEnd = Number(zoom.dataset.previewEnd);
+    if (video && absolute >= previewStart && absolute <= previewEnd) {
+      video.currentTime = Math.max(0, absolute - previewStart);
+    }
+    const playhead = zoom.querySelector('.intuitive-playhead');
+    if (playhead) playhead.style.left = `${(absolute - lo) / (hi - lo) * 100}%`;
+    requestTranscriptFocus(absolute);
+  };
+
+  document.addEventListener('timeupdate', (event) => {
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement) || !video.closest('#intuitive-preview-video')) return;
+    const zoom = document.querySelector('[data-intuitive-zoom]');
+    if (!zoom || zoom.dataset.previewMode === 'result') return;
+    const absolute = Number(zoom.dataset.previewStart) + Number(video.currentTime || 0);
+    requestTranscriptFocus(absolute);
+  }, true);
+
+  document.addEventListener('click', (event) => {
+    const meta = editorMeta();
+    const adjustButton = event.target.closest(
+      'button#intuitive-adjust-before, #intuitive-adjust-before button, ' +
+      'button#intuitive-adjust-after, #intuitive-adjust-after button'
+    );
+    if (adjustButton) {
+      if (meta && meta.previewMode === 'result') return;
+      // 秒数調整もHTMLツールやタイムラインと同じFIFOへ通す。
+      // Gradioの独立callbackにすると、完了前のタイムライン操作が古い
+      // revisionを保持したまま実行され、直前の境界編集と競合する。
+      const selected = document.querySelector('#intuitive-adjust-step input:checked');
+      const step = Number(selected ? selected.value : 1.0);
+      const direction = adjustButton.matches('#intuitive-adjust-before')
+        || adjustButton.closest('#intuitive-adjust-before') ? -1 : 1;
+      send({type: 'adjust_selected', delta: direction * (Number.isFinite(step) ? step : 1.0)});
+      event.preventDefault();
+      return;
+    }
+    const tool = event.target.closest('[data-intuitive-tool]');
+    if (tool) {
+      send({type: 'set_tool', tool: tool.dataset.intuitiveTool});
+      return;
+    }
+    const word = event.target.closest('#intuitive-transcript-words .intuitive-word');
+    if (word) {
+      if (meta && meta.previewMode === 'result') return;
+      send({type: 'set_from_word', start: Number(word.dataset.start), end: Number(word.dataset.end)});
+      return;
+    }
+    const cut = event.target.closest('[data-cut-id]');
+    if (cut && !event.target.closest('[data-boundary-kind]')) {
+      if (meta && meta.previewMode === 'result') return;
+      send({type: 'select_boundary', kind: 'exclusion_start', id: cut.dataset.cutId});
+      return;
+    }
+    const zoom = event.target.closest('[data-intuitive-zoom]');
+    if (zoom && !event.target.closest('[data-boundary-kind], .intuitive-timeline-toolbox')) {
+      if (meta && meta.previewMode !== 'result' && meta.activeTool) {
+        const track = zoom.querySelector('.intuitive-zoom-track');
+        const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
+        send({type: 'set_from_timeline', time: timeAtPointer(track, event, lo, hi)});
+      } else {
+        seekZoom(zoom, event);
+      }
+    }
+  });
+
+  document.addEventListener('pointerdown', (event) => {
+    if (event.target.closest('.intuitive-timeline-toolbox')) return;
+    const viewportPart = event.target.closest('[data-viewport-drag]');
+    if (viewportPart) {
+      const root = viewportPart.closest('[data-intuitive-overview]');
+      const track = root.querySelector('.intuitive-overview-track');
+      drag = {
+        type: 'viewport', mode: viewportPart.dataset.viewportDrag,
+        root, track, startX: event.clientX,
+        start: Number(root.dataset.viewportStart), end: Number(root.dataset.viewportEnd),
+        previewStart: 0, previewEnd: Number(root.dataset.duration),
+        duration: Number(root.dataset.duration), overlay: root.querySelector('.intuitive-overview-window'),
+        minSpan: Number(root.dataset.viewportMinSpan), maxSpan: Number(root.dataset.viewportMaxSpan),
+        summary: root.querySelector('[data-viewport-summary]'),
+        pointerId: event.pointerId, captureTarget: viewportPart
+      };
+      if (viewportPart.setPointerCapture) viewportPart.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      return;
+    }
+    const boundary = event.target.closest('[data-boundary-kind]');
+    if (boundary) {
+      const root = boundary.closest('[data-intuitive-zoom]');
+      if (root && root.dataset.previewMode === 'result') return;
+      drag = {
+        type: 'boundary', root, track: root.querySelector('.intuitive-zoom-track'),
+        kind: boundary.dataset.boundaryKind, id: boundary.dataset.cutId || null,
+        element: boundary
+      };
+      drag.pointerId = event.pointerId; drag.captureTarget = boundary;
+      if (boundary.setPointerCapture) boundary.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      return;
+    }
+    const zoom = event.target.closest('[data-intuitive-zoom]');
+    if (zoom && !event.target.closest('[data-cut-id]')) {
+      if (zoom.dataset.previewMode === 'result') return;
+      const meta = editorMeta();
+      // ツール選択中の短いクリックは境界指定としてclickハンドラへ渡す。
+      // 未選択時だけ従来どおり横ドラッグによる途中カットを開始する。
+      if (meta && meta.activeTool) return;
+      const track = zoom.querySelector('.intuitive-zoom-track');
+      const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
+      const startTime = timeAtPointer(track, event, lo, hi);
+      const overallStart = Number(zoom.dataset.overallStart);
+      const overallEnd = Number(zoom.dataset.overallEnd);
+      if (startTime < overallStart || startTime > overallEnd) return;
+      const marker = document.createElement('div');
+      marker.className = 'intuitive-cut-zone intuitive-new-cut';
+      marker.style.left = `${(startTime - lo) / (hi - lo) * 100}%`;
+      marker.style.width = '0%';
+      track.appendChild(marker);
+      drag = {
+        type: 'new_cut', root: zoom, track, lo, hi,
+        startTime, startX: event.clientX, marker, overallStart, overallEnd
+      };
+      drag.pointerId = event.pointerId; drag.captureTarget = track;
+      if (track.setPointerCapture) track.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    }
+  });
+
+  document.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (drag.type === 'boundary') {
+      const lo = Number(drag.root.dataset.viewStart), hi = Number(drag.root.dataset.viewEnd);
+      const time = timeAtPointer(drag.track, event, lo, hi);
+      drag.time = time;
+      drag.element.style.left = `${(time - lo) / (hi - lo) * 100}%`;
+      return;
+    }
+    if (drag.type === 'new_cut') {
+      const time = Math.max(
+        drag.overallStart,
+        Math.min(drag.overallEnd, timeAtPointer(drag.track, event, drag.lo, drag.hi))
+      );
+      drag.endTime = time;
+      drag.distance = Math.abs(event.clientX - drag.startX);
+      const left = Math.min(drag.startTime, time), right = Math.max(drag.startTime, time);
+      drag.marker.style.left = `${(left - drag.lo) / (drag.hi - drag.lo) * 100}%`;
+      drag.marker.style.width = `${(right - left) / (drag.hi - drag.lo) * 100}%`;
+      return;
+    }
+    updateViewportDrag(drag, event);
+  });
+
+  const finishDrag = (event, cancelled = false) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!cancelled && drag.type === 'viewport') {
+      // pointerup can arrive without a final pointermove (especially on a quick
+      // resize), so always derive the committed range from the release point.
+      updateViewportDrag(drag, event);
+    }
+    if (!cancelled && drag.type === 'new_cut') {
+      drag.endTime = Math.max(
+        drag.overallStart,
+        Math.min(drag.overallEnd, timeAtPointer(drag.track, event, drag.lo, drag.hi))
+      );
+      drag.distance = Math.abs(event.clientX - drag.startX);
+    }
+    if (!cancelled && drag.type === 'boundary' && Number.isFinite(drag.time)) {
+      send({type: 'set_boundary', kind: drag.kind, id: drag.id, time: drag.time});
+    } else if (!cancelled &&
+      drag.type === 'new_cut' && Number.isFinite(drag.endTime)
+      && drag.distance >= 5
+    ) {
+      send({type: 'add_exclusion', start: drag.startTime, end: drag.endTime});
+    } else if (!cancelled && drag.type === 'viewport' && Number.isFinite(drag.nextStart)) {
+      send({type: 'set_viewport', start: drag.nextStart, end: drag.nextEnd});
+    } else if (!cancelled && drag.type === 'new_cut' && drag.distance < 5) {
+      seekZoom(drag.root, event);
+    }
+    if (drag.marker) drag.marker.remove();
+    if (drag.captureTarget && drag.captureTarget.releasePointerCapture) {
+      try { drag.captureTarget.releasePointerCapture(drag.pointerId); } catch (_) {}
+    }
+    drag = null;
+  };
+  document.addEventListener('pointerup', (event) => finishDrag(event, false));
+  document.addEventListener('pointercancel', (event) => finishDrag(event, true));
+}"""
 
 
 with gr.Blocks(title="動画シーン検索") as demo:
@@ -1762,6 +3540,280 @@ with gr.Blocks(title="動画シーン検索") as demo:
             ],
             outputs=[saved_path],
         )
+
+    with gr.Tab("直感編集（試作）", elem_id="intuitive-editor-prototype-tab"):
+        gr.Markdown(
+            "**直感編集の実動プロトタイプです。** 文字・タイムライン・秒調整は"
+            "同じ編集状態へ反映されます。Undo/Redoは未実装です。",
+            elem_classes=["intuitive-prototype-note"],
+        )
+        intuitive_state = gr.State(None)
+
+        with gr.Row(elem_classes=["intuitive-compact-row"]):
+            intuitive_video_select = gr.Dropdown(
+                choices=list_video_choices_only(),
+                label="動画を選択（選ぶと先頭発話付近を自動プレビュー）",
+                scale=5,
+                elem_id="intuitive-video-select",
+            )
+            intuitive_load_btn = gr.Button(
+                "選択動画を再読み込み", variant="secondary", scale=1,
+                elem_id="intuitive-load-video",
+            )
+            intuitive_reload_btn = gr.Button(
+                "一覧更新", scale=1, elem_id="intuitive-reload-videos",
+            )
+        intuitive_search_results = gr.State([])
+        with gr.Accordion("検索して候補区間から編集を始める", open=False):
+            with gr.Row(elem_classes=["intuitive-compact-row"]):
+                intuitive_query = gr.Textbox(
+                    label="検索クエリ", placeholder="例: 命令について話しているところ", scale=4,
+                    elem_id="intuitive-search-query",
+                )
+                intuitive_search_target = gr.Dropdown(
+                    choices=list_video_choices(), value=ALL_VIDEOS_VALUE,
+                    label="検索対象", scale=3,
+                    elem_id="intuitive-search-target",
+                )
+                intuitive_search_btn = gr.Button(
+                    "検索", variant="primary", scale=1,
+                    elem_id="intuitive-search-button",
+                )
+            intuitive_result_table = gr.Dataframe(
+                headers=["#", "動画", "開始", "終了", "一致方法", "類似度", "テキスト"],
+                interactive=False,
+                label="検索結果（行を選ぶとその区間を読み込み）",
+                elem_id="intuitive-search-results",
+            )
+        with gr.Row(elem_id="intuitive-mode-row"):
+            intuitive_video_info = gr.Markdown(
+                "**選択動画:** 未選択　｜　**表示区間:** 未読み込み",
+                elem_id="intuitive-video-info",
+                scale=8,
+            )
+            intuitive_preview_result_btn = gr.Button(
+                "編集結果を確認", scale=0, min_width=138,
+                elem_id="intuitive-preview-result",
+            )
+            intuitive_return_source_btn = gr.Button(
+                "元動画へ戻る", scale=0, min_width=126,
+                elem_id="intuitive-return-source",
+            )
+
+        with gr.Row(equal_height=True):
+            with gr.Column(scale=5, min_width=480):
+                intuitive_preview = gr.Video(
+                    label="直感編集プレビュー",
+                    autoplay=False,
+                    interactive=False,
+                    height=420,
+                    elem_id="intuitive-preview-video",
+                )
+            with gr.Column(
+                scale=4,
+                min_width=400,
+                elem_id="intuitive-transcript-panel",
+            ):
+                intuitive_toolbar = gr.HTML(
+                    '<div class="intuitive-toolbox"><strong>文字起こし編集ツール</strong>'
+                    '<div class="intuitive-tool-buttons">'
+                    '<button disabled>全体開始</button><button disabled>全体終了</button>'
+                    '<button disabled>除外開始</button><button disabled>除外終了</button></div>'
+                    '<div class="intuitive-tool-status">動画を読み込んでください。</div></div>',
+                    elem_id="intuitive-toolbox",
+                    elem_classes=["intuitive-tool-header"],
+                )
+                intuitive_transcript = gr.HTML(
+                    render_intuitive_transcript([]),
+                    elem_id="intuitive-transcript-words",
+                )
+
+        with gr.Row(elem_classes=["intuitive-compact-row"]):
+            intuitive_selected_boundary = gr.Markdown(
+                "**選択中の境界:** 未選択　｜　文字起こしまたはタイムラインから選択",
+                elem_id="intuitive-selected-boundary",
+                elem_classes=["intuitive-boundary-box"],
+            )
+            intuitive_adjust_step = gr.Radio(
+                choices=ADJUST_STEPS,
+                value=1.0,
+                label="調整幅 (秒)",
+                interactive=True,
+                scale=4,
+                elem_id="intuitive-adjust-step",
+            )
+            intuitive_before_btn = gr.Button(
+                "前へ", interactive=True, scale=1,
+                elem_id="intuitive-adjust-before",
+            )
+            intuitive_after_btn = gr.Button(
+                "後ろへ", interactive=True, scale=1,
+                elem_id="intuitive-adjust-after",
+            )
+
+        gr.Markdown("**動画全体の概要タイムライン**")
+        intuitive_overview_timeline = gr.HTML(
+            render_intuitive_overview_timeline(1.0, 0.0, 1.0),
+            elem_id="intuitive-overview-timeline",
+        )
+
+        gr.Markdown("**拡大編集タイムライン（切り出し範囲を標準表示）**")
+        intuitive_zoom_timeline = gr.HTML(
+            render_intuitive_zoom_timeline(0.0, 1.0),
+            elem_id="intuitive-zoom-timeline",
+        )
+        gr.Markdown(
+            "※ 青枠viewportを確定すると、その範囲（5～600秒）の元動画プレビューと"
+            "再生・編集位置付近（最大90秒）の文字起こしを再取得します。"
+        )
+
+        with gr.Row(elem_classes=["intuitive-compact-row"]):
+            intuitive_out_dir = gr.Textbox(
+                value=DEFAULT_CLIPS_DIR, label="保存先", scale=2,
+            )
+            intuitive_filename = gr.Textbox(
+                value="", label="ファイル名（空なら自動）", scale=2,
+            )
+            intuitive_precise = gr.Checkbox(
+                value=True, label="フレーム精度", scale=1,
+            )
+            intuitive_save_btn = gr.Button("保存", variant="primary", scale=1)
+        intuitive_saved_path = gr.Textbox(label="保存先", interactive=False)
+
+        intuitive_command_json = gr.Textbox(
+            value="", elem_id="intuitive-command-json",
+        )
+        intuitive_command_submit = gr.Button(
+            "command", elem_id="intuitive-command-submit",
+        )
+        intuitive_render_outputs = [
+            intuitive_state,
+            intuitive_toolbar,
+            intuitive_selected_boundary,
+            intuitive_overview_timeline,
+            intuitive_zoom_timeline,
+            intuitive_preview,
+            intuitive_transcript,
+            intuitive_video_info,
+        ]
+
+        intuitive_load_outputs = [
+            intuitive_state,
+            intuitive_preview,
+            intuitive_transcript,
+            intuitive_video_info,
+            intuitive_toolbar,
+            intuitive_selected_boundary,
+            intuitive_overview_timeline,
+            intuitive_zoom_timeline,
+        ]
+        intuitive_load_btn.click(
+            load_intuitive_editor,
+            inputs=[intuitive_video_select],
+            outputs=intuitive_load_outputs,
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        # Selecting a video is itself a safe preview action.  Keep the button as
+        # an explicit retry, while rapid selection changes collapse to the last
+        # queued value and each completed load receives a fresh editor nonce.
+        intuitive_video_select.change(
+            load_intuitive_editor,
+            inputs=[intuitive_video_select],
+            outputs=intuitive_load_outputs,
+            trigger_mode="always_last",
+            show_progress="minimal",
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_reload_btn.click(
+            lambda: (
+                gr.update(choices=list_video_choices_only()),
+                gr.update(choices=list_video_choices()),
+            ),
+            outputs=[intuitive_video_select, intuitive_search_target],
+        )
+        intuitive_search_outputs = [
+            intuitive_result_table,
+            intuitive_search_results,
+            intuitive_state,
+            intuitive_preview,
+            intuitive_transcript,
+            intuitive_video_info,
+            intuitive_toolbar,
+            intuitive_selected_boundary,
+            intuitive_overview_timeline,
+            intuitive_zoom_timeline,
+        ]
+        intuitive_search_btn.click(
+            do_intuitive_search,
+            inputs=[
+                intuitive_query, intuitive_search_target,
+                gr.State(5), gr.State(config.MIN_SCORE), intuitive_state,
+            ],
+            outputs=intuitive_search_outputs,
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_query.submit(
+            do_intuitive_search,
+            inputs=[
+                intuitive_query, intuitive_search_target,
+                gr.State(5), gr.State(config.MIN_SCORE), intuitive_state,
+            ],
+            outputs=intuitive_search_outputs,
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_result_table.select(
+            on_intuitive_search_select,
+            inputs=[intuitive_search_results],
+            outputs=[
+                intuitive_result_table,
+                intuitive_state,
+                intuitive_preview,
+                intuitive_transcript,
+                intuitive_video_info,
+                intuitive_toolbar,
+                intuitive_selected_boundary,
+                intuitive_overview_timeline,
+                intuitive_zoom_timeline,
+            ],
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_command_submit.click(
+            handle_intuitive_command,
+            inputs=[intuitive_command_json, intuitive_state],
+            outputs=intuitive_render_outputs,
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_preview_result_btn.click(
+            preview_intuitive_editor,
+            inputs=[intuitive_state],
+            outputs=intuitive_render_outputs,
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_return_source_btn.click(
+            return_intuitive_source,
+            inputs=[intuitive_state],
+            outputs=intuitive_render_outputs,
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        intuitive_save_btn.click(
+            save_intuitive_editor,
+            inputs=[
+                intuitive_state, intuitive_precise,
+                intuitive_out_dir, intuitive_filename,
+            ],
+            outputs=[intuitive_saved_path],
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
+        demo.load(fn=None, js=_INTUITIVE_EDITOR_JS)
 
     with gr.Tab("動画の追加"):
         gr.Markdown(

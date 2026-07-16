@@ -37,6 +37,10 @@ ALL_VIDEOS_IMAGE = Path("assets/all_videos.svg")
 VIDEO_UNAVAILABLE_IMAGE = Path("assets/video_unavailable.svg")
 DEFAULT_CLIPS_DIR = "clips"
 APP_PORT = 7860
+# 直感編集のカードグリッドは生HTMLでサムネイルを埋め込むため、Gradioのファイル配信
+# キャッシュへ手動でコピーする必要がある。Blocksコンテキスト外でも動作する
+# (`Block.__init__`がGRADIO_CACHEを設定するだけで、UIには一切表示しない)。
+_THUMB_CACHE_BLOCK = gr.HTML()
 INDEX_JOB_PIDFILE = Path("data/index_job.pid")
 ALL_VIDEOS_VALUE = "__all_videos__"
 
@@ -177,8 +181,8 @@ def selected_video_info(video_choice: str):
     return gr.update(value=thumbnail, visible=bool(thumbnail)), detail
 
 
-def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDEOS_VALUE):
-    """サムネイル付きの動画選択メニューと、各カードに対応する内部IDを返す。"""
+def _video_gallery_data(filter_text: str = "", include_all: bool = True):
+    """Build cached thumbnail cards once for either video-picker variant."""
     conn = db.get_conn()
     try:
         db.init_db(conn)
@@ -187,8 +191,11 @@ def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDE
         conn.close()
 
     needle = (filter_text or "").strip().casefold()
-    items = [(str(ALL_VIDEOS_IMAGE.resolve()), f"すべての動画（{len(videos)}本）")]
-    video_ids = [ALL_VIDEOS_VALUE]
+    items = []
+    video_ids = []
+    if include_all:
+        items.append((str(ALL_VIDEOS_IMAGE.resolve()), f"すべての動画（{len(videos)}本）"))
+        video_ids.append(ALL_VIDEOS_VALUE)
     for video in videos:
         name = Path(video["path"]).name
         if needle and needle not in name.casefold():
@@ -198,6 +205,12 @@ def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDE
         caption = f"{name}\n{utils.format_timestamp(video['duration'])}"
         items.append((image, caption))
         video_ids.append(video["video_id"])
+    return items, video_ids
+
+
+def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDEOS_VALUE):
+    """サムネイル付きの検索対象メニューと、各カードの内部IDを返す。"""
+    items, video_ids = _video_gallery_data(filter_text, include_all=True)
 
     try:
         selected_index = video_ids.index(selected_video_id)
@@ -206,11 +219,126 @@ def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDE
     return gr.update(value=items, selected_index=selected_index), video_ids
 
 
-def select_video_from_gallery(video_ids: list[str], evt: gr.SelectData):
-    """カードを検索対象にして選択中表示を更新する。"""
+def _intuitive_video_cards_data(filter_text: str = "") -> list[dict]:
+    """Individual videos (never the ALL card) enriched with picker metadata.
+
+    Filtering happens here (before thumbnail generation) so that both the
+    hidden selection-proxy Gallery and the visible card grid are built from
+    the exact same filtered, ordered list -- this keeps their indices in sync.
+    """
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        videos = db.list_videos(conn)
+        indexed_ids = db.get_indexed_video_ids(conn)
+    finally:
+        conn.close()
+
+    needle = (filter_text or "").strip().casefold()
+    cards = []
+    for video in videos:
+        name = Path(video["path"]).name
+        if needle and needle not in name.casefold():
+            continue
+        cards.append({
+            "video_id": video["video_id"],
+            "name": name,
+            "duration": float(video.get("duration") or 0.0),
+            "thumbnail_path": _make_video_thumbnail(video),
+            "asr_complete": bool(video.get("asr_complete")),
+            "indexed": video["video_id"] in indexed_ids,
+        })
+    return cards
+
+
+def _intuitive_gallery_items(cards: list[dict]) -> list[tuple[str, str]]:
+    """Local-path (image, caption) tuples for the hidden gr.Gallery selection proxy."""
+    return [
+        (
+            card["thumbnail_path"] or str(VIDEO_UNAVAILABLE_IMAGE.resolve()),
+            f'{card["name"]}\n{utils.format_timestamp(card["duration"])}',
+        )
+        for card in cards
+    ]
+
+
+def _thumbnail_servable_url(path: str | None) -> str:
+    """Convert a local thumbnail (or the placeholder asset) into a URL the raw HTML
+    card grid can embed. Raw local paths cannot be used directly in an <img src>
+    because Gradio only serves files it knows about (upload dir / its own cache)."""
+    resolved = path or str(VIDEO_UNAVAILABLE_IMAGE.resolve())
+    cached = _THUMB_CACHE_BLOCK.move_resource_to_block_cache(resolved)
+    if not cached:
+        return ""
+    return "/gradio_api/file=" + Path(cached).as_posix()
+
+
+def render_intuitive_video_cards(
+    cards: list[dict], selected_video_id: str | None = None
+) -> str:
+    """Pure: badge-annotated card grid markup. `cards` must already be filtered
+    and carry a `thumbnail_url` (a servable URL, not a raw filesystem path)."""
+    if not cards:
+        return '<div class="intuitive-video-card-empty">該当する動画がありません。</div>'
+
+    selected_id = str(selected_video_id) if selected_video_id else None
+    parts = ['<div class="intuitive-video-card-grid">']
+    for index, card in enumerate(cards):
+        video_id = str(card.get("video_id") or "")
+        name = str(card.get("name") or "")
+        duration = float(card.get("duration") or 0.0)
+        escaped_name = html.escape(name)
+        escaped_id = html.escape(video_id, quote=True)
+        escaped_thumb = html.escape(str(card.get("thumbnail_url") or ""), quote=True)
+        badges = []
+        if card.get("asr_complete"):
+            badges.append('<span class="intuitive-video-badge">文字起こし済み</span>')
+        if card.get("indexed"):
+            badges.append('<span class="intuitive-video-badge">索引あり</span>')
+        selected_class = " is-selected" if selected_id and video_id == selected_id else ""
+        parts.append(
+            f'<button type="button" class="intuitive-video-card{selected_class}" '
+            f'data-index="{index}" data-video-id="{escaped_id}" title="{escaped_name}">'
+            '<span class="intuitive-video-thumb">'
+            f'<img src="{escaped_thumb}" alt="" loading="lazy">'
+            f'<span class="intuitive-video-duration">{utils.format_timestamp(duration)}</span>'
+            '</span>'
+            f'<span class="intuitive-video-name">{escaped_name}</span>'
+            f'<span class="intuitive-video-badges">{"".join(badges)}</span>'
+            '</button>'
+        )
+    parts.append('</div>')
+    return "".join(parts)
+
+
+def build_intuitive_video_gallery(filter_text: str = "", selected_video_id: str = ""):
+    """Return individual-video cards for intuitive editing (never the ALL card)."""
+    cards = _intuitive_video_cards_data(filter_text)
+    items = _intuitive_gallery_items(cards)
+    video_ids = [card["video_id"] for card in cards]
+    selected_video_id = parse_video_choice(selected_video_id)
+    try:
+        selected_index = video_ids.index(selected_video_id)
+    except ValueError:
+        selected_index = None
+    display_cards = [
+        {**card, "thumbnail_url": _thumbnail_servable_url(card.get("thumbnail_path"))}
+        for card in cards
+    ]
+    cards_html = render_intuitive_video_cards(display_cards, selected_video_id)
+    return gr.update(value=items, selected_index=selected_index), video_ids, cards_html
+
+
+def _selected_gallery_index(video_ids: list[str], evt: gr.SelectData) -> int:
     index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
     if not isinstance(index, int) or not 0 <= index < len(video_ids):
         raise gr.Error("動画を選択できませんでした。一覧を更新してください。")
+    return index
+
+
+def select_video_from_gallery(video_ids: list[str], evt: gr.SelectData):
+    """カードを検索対象にして選択中表示を更新する。"""
+    index = _selected_gallery_index(video_ids, evt)
     video_id = video_ids[index]
     thumbnail_update, detail = selected_video_info(video_id)
     return video_id, thumbnail_update, detail, gr.update(selected_index=index)
@@ -507,11 +635,28 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
             timed_words.append((str(word["word"]), start, end))
         return timed_words
 
+    def row_time_chip(segment: dict) -> str:
+        """Display-only start-time chip for the row; never invents a missing time."""
+        raw_start = segment.get("start_sec")
+        if raw_start is None:
+            return ""
+        try:
+            row_start = float(raw_start)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(row_start):
+            return ""
+        return (
+            '<span class="intuitive-ts-chip">'
+            f'{utils.format_timestamp(row_start)}</span>'
+        )
+
     rendered_segments = []
     granularities = set()
     for raw_segment in segments:
         segment = dict(raw_segment)
         words = timed_words_for(segment)
+        chip = row_time_chip(segment)
 
         word_spans = []
         for word in words or []:
@@ -527,7 +672,11 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
 
         if word_spans:
             granularities.add("word")
-            rendered_segments.append("".join(word_spans))
+            rendered_segments.append(
+                '<div class="intuitive-segment-row">'
+                f'{chip}<div class="intuitive-segment-row-content">'
+                f'{"".join(word_spans)}</div></div>'
+            )
             continue
 
         granularities.add("segment")
@@ -537,15 +686,20 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
             "発話区間（単語時刻なし）: "
             f"{utils.format_timestamp(start)} - {utils.format_timestamp(end)}"
         )
-        rendered_segments.append(
+        segment_span = (
             f'<span class="{classes_for(start, end, segment=True)}" '
             f'data-time-granularity="segment" '
             f'data-start="{start:.3f}" data-end="{end:.3f}" '
             f'title="{html.escape(label, quote=True)}">'
             f'{html.escape(str(segment.get("text") or ""))}</span>'
         )
+        rendered_segments.append(
+            '<div class="intuitive-segment-row">'
+            f'{chip}<div class="intuitive-segment-row-content">'
+            f'{segment_span}</div></div>'
+        )
 
-    content = "<br>".join(rendered_segments)
+    content = "".join(rendered_segments)
     if not content:
         content = '<span class="intuitive-transcript-empty">この区間に文字起こしはありません。</span>'
         granularity_label = "時刻指定できる文字起こしがありません"
@@ -743,9 +897,31 @@ def _new_intuitive_state(video: dict, start: float, end: float) -> dict:
         "viewport_start": float(start),
         "viewport_end": float(end),
         "playhead_sec": float(start),
+        "edit_dirty": False,
+        # OFF by default: the zoom timeline only seeks until the user
+        # explicitly turns editing on (handle drag / cut-add drag / click-to-
+        # set-boundary are otherwise disabled -- see set_timeline_edit_mode).
+        "timeline_edit_mode": False,
     }
     _set_intuitive_transcript_focus(state, start)
     return state
+
+
+def _intuitive_edit_signature(state: dict) -> tuple:
+    """Canonical saved-plan signature; viewport/tool/selection state is excluded."""
+    exclusions = tuple(
+        (
+            str(cut.get("id") or ""),
+            float(cut["start"]),
+            float(cut["end"]),
+        )
+        for cut in _clip_intuitive_exclusions(state)
+    )
+    return (
+        float(state["overall_start"]),
+        float(state["overall_end"]),
+        exclusions,
+    )
 
 
 def _finite_time(value, name: str) -> float:
@@ -932,6 +1108,9 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
     ):
         raise gr.Error("編集結果のプレビュー中です。動画を再読み込みして編集を再開してください。")
 
+    initial_edit_signature = _intuitive_edit_signature(state)
+    was_edit_dirty = bool(state.get("edit_dirty", False))
+
     next_state = {
         **state,
         "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
@@ -951,6 +1130,11 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
             tool = command.get("tool")
             if tool not in _INTUITIVE_TOOLS:
                 raise ValueError("不明な編集ツールです。")
+            if command.get("enable_timeline_edit_mode"):
+                # A tool button pressed from the zoom timeline's own toolbox
+                # is itself the "I want to edit" gesture required by B, so it
+                # both arms the tool and turns editing on in one round trip.
+                next_state["timeline_edit_mode"] = True
             if next_state.get("preview_mode") == "result":
                 # 連結済みプレビューの再生時刻を元動画の絶対時刻として扱わない。
                 # 元動画への復帰はhandle_intuitive_command側で完了してから、
@@ -983,6 +1167,20 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
             transcript_focus = timeline_time
             _apply_intuitive_word_tool(
                 next_state, {"start": timeline_time, "end": timeline_time}
+            )
+        elif action == "set_current_position":
+            if next_state.get("active_tool") not in _INTUITIVE_TOOLS:
+                raise ValueError("先に適用する編集ツールを選んでください。")
+            current_time = _finite_time(command.get("time"), "現在の再生位置")
+            if not (
+                float(next_state["preview_start"]) - 0.001
+                <= current_time
+                <= float(next_state["preview_end"]) + 0.001
+            ):
+                raise ValueError("現在の再生位置がプレビュー範囲外です。")
+            transcript_focus = current_time
+            _apply_intuitive_word_tool(
+                next_state, {"start": current_time, "end": current_time}
             )
         elif action == "set_transcript_focus":
             transcript_focus = _finite_time(
@@ -1022,6 +1220,16 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
             next_state["selected_boundary"] = _remap_intuitive_boundary(
                 next_state, boundary, adjusted_time
             )
+        elif action == "set_selected_time":
+            boundary = next_state.get("selected_boundary")
+            if not boundary:
+                raise ValueError("先に時刻を変更する境界を選択してください。")
+            selected_time = _finite_time(command.get("time"), "境界時刻")
+            transcript_focus = selected_time
+            _set_intuitive_boundary(next_state, boundary, selected_time)
+            next_state["selected_boundary"] = _remap_intuitive_boundary(
+                next_state, boundary, selected_time
+            )
         elif action == "add_exclusion":
             start = _finite_time(command.get("start"), "除外開始")
             end = _finite_time(command.get("end"), "除外終了")
@@ -1047,6 +1255,32 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
                 "kind": "exclusion_end", "id": chosen["id"]
             }
             transcript_focus = (start + end) / 2.0
+        elif action == "remove_exclusion":
+            cut_id = str(command.get("id") or "")
+            if not cut_id or not any(
+                str(cut.get("id")) == cut_id for cut in next_state["exclusions"]
+            ):
+                raise ValueError("削除する途中カットが見つかりません。")
+            next_state["exclusions"] = [
+                cut for cut in next_state["exclusions"]
+                if str(cut.get("id")) != cut_id
+            ]
+            if (next_state.get("selected_boundary") or {}).get("id") == cut_id:
+                next_state["selected_boundary"] = None
+            next_state["pending_cut_start"] = None
+            if next_state.get("active_tool") == "exclude_end":
+                next_state["active_tool"] = None
+            if (next_state.get("selected_boundary") or {}).get("kind") == "pending_cut_start":
+                next_state["selected_boundary"] = None
+        elif action == "clear_exclusions":
+            next_state["exclusions"] = []
+            next_state["pending_cut_start"] = None
+            if next_state.get("active_tool") == "exclude_end":
+                next_state["active_tool"] = None
+            if (next_state.get("selected_boundary") or {}).get("kind") in {
+                "pending_cut_start", "exclusion_start", "exclusion_end",
+            }:
+                next_state["selected_boundary"] = None
         elif action == "set_viewport":
             start = _finite_time(command.get("start"), "表示開始")
             end = _finite_time(command.get("end"), "表示終了")
@@ -1069,6 +1303,13 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
             if next_state.get("preview_mode") == "result":
                 next_state["preview_mode"] = "source"
                 next_state["active_tool"] = None
+        elif action == "set_timeline_edit_mode":
+            next_state["timeline_edit_mode"] = bool(command.get("enabled"))
+            if not next_state["timeline_edit_mode"]:
+                # Turning editing off mid-gesture should not leave a tool
+                # armed or a half-made cut waiting for its end boundary.
+                next_state["active_tool"] = None
+                next_state["pending_cut_start"] = None
         else:
             raise ValueError("不明な編集コマンドです。")
     except ValueError as exc:
@@ -1089,6 +1330,10 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
         next_state["viewport_end"],
     )
     _set_intuitive_transcript_focus(next_state, transcript_focus)
+    next_state["edit_dirty"] = (
+        was_edit_dirty
+        or _intuitive_edit_signature(next_state) != initial_edit_signature
+    )
     next_state["revision"] = int(next_state["revision"]) + 1
     return next_state
 
@@ -1131,11 +1376,114 @@ def intuitive_state_to_clip_plan(state: dict) -> dict:
     return {"base_start": start, "base_end": end, "ranges": ranges}
 
 
+def _intuitive_edit_summary(state: dict) -> tuple[float, float, int, float, float]:
+    """Return values derived from canonical edit state without caching them in it."""
+    start = float(state["overall_start"])
+    end = float(state["overall_end"])
+    exclusions = _clip_intuitive_exclusions(state)
+    total = max(0.0, end - start)
+    removed = sum(max(0.0, cut["end"] - cut["start"]) for cut in exclusions)
+    return start, end, len(exclusions), removed, max(0.0, total - removed)
+
+
+def render_intuitive_summary(state: dict) -> str:
+    start, end, count, removed, completed = _intuitive_edit_summary(state)
+    return (
+        '<div class="intuitive-edit-summary" aria-live="polite">'
+        '<span class="intuitive-stat">'
+        f'<strong>全体</strong> {utils.format_timestamp(start)} ～ '
+        f'{utils.format_timestamp(end)}（{end - start:.1f}秒）'
+        '</span>'
+        '<span class="intuitive-stat">'
+        f'<strong>途中カット</strong> {count}箇所 / {removed:.1f}秒'
+        '</span>'
+        '<span class="intuitive-stat">'
+        f'<strong>完成予定</strong> {completed:.1f}秒'
+        '</span>'
+        '</div>'
+    )
+
+
+def render_intuitive_exclusion_list(state: dict) -> str:
+    exclusions = _clip_intuitive_exclusions(state)
+    result_mode = state.get("preview_mode", "source") == "result"
+    selected = state.get("selected_boundary") or {}
+    selected_id = (
+        str(selected.get("id"))
+        if selected.get("kind") in {"exclusion_start", "exclusion_end"}
+        else None
+    )
+    rows = []
+    for index, cut in enumerate(exclusions, 1):
+        cut_id = html.escape(str(cut["id"]), quote=True)
+        selected_class = " is-selected" if str(cut["id"]) == selected_id else ""
+        disabled = " disabled" if result_mode else ""
+        rows.append(
+            f'<div class="intuitive-exclusion-row{selected_class}">'
+            f'<span class="intuitive-exclusion-index">{index}</span>'
+            f'<span>{utils.format_timestamp(cut["start"])} ～ '
+            f'{utils.format_timestamp(cut["end"])}</span>'
+            f'<span class="intuitive-exclusion-length">{cut["end"] - cut["start"]:.1f}秒</span>'
+            f'<button type="button" data-intuitive-remove-exclusion="{cut_id}"'
+            f'{disabled}>削除</button></div>'
+        )
+    if not rows:
+        body = '<div class="intuitive-exclusion-empty">途中カットはありません。</div>'
+    else:
+        body = "".join(rows)
+    clear_disabled = " disabled" if result_mode or not exclusions else ""
+    return (
+        '<details class="intuitive-exclusion-list">'
+        f'<summary>途中カット一覧（{len(exclusions)}箇所）</summary>'
+        f'<div class="intuitive-exclusion-list-body">{body}'
+        f'<button type="button" class="intuitive-clear-exclusions" '
+        f'data-intuitive-clear-exclusions{clear_disabled}>すべて削除</button>'
+        '</div></details>'
+    )
+
+
+def intuitive_selected_time_update(state: dict):
+    boundary = state.get("selected_boundary")
+    if not boundary:
+        return gr.update(value=None, interactive=False)
+    try:
+        value = _intuitive_boundary_value(state, boundary)
+    except ValueError:
+        return gr.update(value=None, interactive=False)
+    return gr.update(
+        value=round(value, 3),
+        interactive=state.get("preview_mode", "source") != "result",
+    )
+
+
+_INTUITIVE_BOUNDARY_LABELS = {
+    "overall_start": "全体開始",
+    "overall_end": "全体終了",
+    "pending_cut_start": "除外開始（確定待ち）",
+    "exclusion_start": "除外開始",
+    "exclusion_end": "除外終了",
+}
+
+
+def _intuitive_selected_boundary_label(state: dict) -> str | None:
+    """Short "<種別> <時刻>" label for the currently selected boundary, or None."""
+    boundary = state.get("selected_boundary")
+    if not boundary:
+        return None
+    try:
+        value = _intuitive_boundary_value(state, boundary)
+    except ValueError:
+        return None
+    label = _INTUITIVE_BOUNDARY_LABELS.get(boundary.get("kind"), "境界")
+    return f"{label} {utils.format_timestamp(value)}"
+
+
 def render_intuitive_toolbar(state: dict) -> str:
     revision = int(state.get("revision", 0))
     nonce = html.escape(str(state.get("nonce", "")), quote=True)
     active = state.get("active_tool")
     result_mode = state.get("preview_mode", "source") == "result"
+    has_selected_boundary = bool(state.get("selected_boundary"))
     transcript_start, transcript_end = _intuitive_transcript_bounds(state)
     buttons = "".join(
         f'<button type="button" class="intuitive-tool-button'
@@ -1153,36 +1501,29 @@ def render_intuitive_toolbar(state: dict) -> str:
         status = f"{dict(_INTUITIVE_TOOL_LABELS).get(active)}にする文字起こし範囲またはタイムライン位置を選んでください。"
     else:
         status = "時刻付きの文字起こし範囲、または編集ツールを選んでください。"
+    boundary_label = _intuitive_selected_boundary_label(state)
+    selected_html = (
+        f'<span class="intuitive-selected-boundary-chip">選択中: {html.escape(boundary_label)}</span>'
+        if boundary_label else
+        '<span class="intuitive-selected-boundary-chip is-empty">未選択</span>'
+    )
     return (
         f'<div class="intuitive-toolbox" data-intuitive-root data-revision="{revision}" '
         f'data-nonce="{nonce}" data-preview-mode="{state.get("preview_mode", "source")}" '
         f'data-active-tool="{html.escape(str(active or ""), quote=True)}" '
+        f'data-edit-dirty="{str(bool(state.get("edit_dirty", False))).lower()}" '
+        f'data-has-selected-boundary="{str(has_selected_boundary).lower()}" '
+        f'data-timeline-edit-mode="{str(bool(state.get("timeline_edit_mode", False))).lower()}" '
         f'data-transcript-start="{transcript_start:.3f}" '
         f'data-transcript-end="{transcript_end:.3f}" '
         f'data-viewport-start="{float(state["viewport_start"]):.3f}" '
-        f'data-viewport-end="{float(state["viewport_end"]):.3f}">'
-        f'<div class="intuitive-tool-heading"><strong>文字起こし編集ツール</strong></div>'
+        f'data-viewport-end="{float(state["viewport_end"]):.3f}" '
+        f'data-preview-start="{float(state["preview_start"]):.3f}" '
+        f'data-preview-end="{float(state["preview_end"]):.3f}">'
+        f'<div class="intuitive-tool-heading"><strong>境界ツール（文字・タイムライン共通）</strong></div>'
         f'<div class="intuitive-tool-buttons">{buttons}</div>'
-        f'<div class="intuitive-tool-status">{status}</div></div>'
+        f'<div class="intuitive-tool-status">{selected_html}{status}</div></div>'
     )
-
-
-def render_intuitive_selected_boundary(state: dict) -> str:
-    boundary = state.get("selected_boundary")
-    if not boundary:
-        return "**選択中の境界:** 未選択　｜　文字起こしまたはタイムラインから選択"
-    labels = {
-        "overall_start": "全体開始",
-        "overall_end": "全体終了",
-        "pending_cut_start": "除外開始（確定待ち）",
-        "exclusion_start": "除外開始",
-        "exclusion_end": "除外終了",
-    }
-    try:
-        value = _intuitive_boundary_value(state, boundary)
-    except ValueError:
-        return "**選択中の境界:** 未選択"
-    return f"**選択中の境界:** {labels.get(boundary.get('kind'), '境界')}　{utils.format_timestamp(value)}"
 
 
 def render_intuitive_state_overview(state: dict) -> str:
@@ -1261,20 +1602,33 @@ def render_intuitive_state_zoom(state: dict) -> str:
     transcript_left = percent(transcript_start)
     transcript_right = percent(transcript_end)
     playhead_position = percent(state.get("playhead_sec", view_start))
+    edit_mode = bool(state.get("timeline_edit_mode", False))
+    timeline_tool_title = (
+        "" if edit_mode else "クリックで編集モードをONにして選択します。"
+    )
     timeline_tools = "".join(
         f'<button type="button" class="intuitive-tool-button'
         f'{" is-selected" if state.get("active_tool") == key else ""}" '
-        f'data-intuitive-tool="{key}">'
+        f'data-intuitive-tool="{key}" title="{timeline_tool_title}">'
         f'{label}</button>'
         for key, label in _INTUITIVE_TOOL_LABELS
+    )
+    edit_mode_label = "編集モード: ON" if edit_mode else "編集モード: OFF"
+    edit_mode_hint = (
+        "ハンドルドラッグ・カット追加・境界クリックが行えます。"
+        if edit_mode else
+        "クリックはシークのみです。編集するには上のボタンをONにしてください。"
     )
     return f"""
     <div class="intuitive-timeline" data-intuitive-zoom data-view-start="{view_start:.3f}" data-view-end="{view_end:.3f}"
          data-preview-start="{state['preview_start']:.3f}" data-preview-end="{state['preview_end']:.3f}"
          data-preview-mode="{html.escape(state.get('preview_mode', 'source'), quote=True)}"
+         data-timeline-edit-mode="{str(edit_mode).lower()}"
          data-overall-start="{state['overall_start']:.3f}" data-overall-end="{state['overall_end']:.3f}">
       <div class="intuitive-timeline-toolbox" aria-label="拡大タイムライン編集ツール">
-        <span>ツール選択 → 位置をクリック</span><div class="intuitive-tool-buttons">{timeline_tools}</div>
+        <button type="button" class="intuitive-edit-mode-toggle{' is-on' if edit_mode else ''}"
+                data-intuitive-toggle-edit-mode title="{edit_mode_hint}">{edit_mode_label}</button>
+        <span>共通境界ツール → 位置をクリック</span><div class="intuitive-tool-buttons">{timeline_tools}</div>
       </div>
       <div class="intuitive-timeline-scale"><span>{utils.format_timestamp(view_start)}</span><span>{utils.format_timestamp(midpoint)}</span><span>{utils.format_timestamp(view_end)}</span></div>
       <div class="intuitive-zoom-track" role="img" aria-label="保存範囲、除外範囲、再生位置">
@@ -1351,12 +1705,14 @@ def _intuitive_render_outputs(state: dict, source_updates=None):
     return (
         state,
         render_intuitive_toolbar(state),
-        render_intuitive_selected_boundary(state),
         render_intuitive_state_overview(state),
         render_intuitive_state_zoom(state),
         preview,
         transcript,
         info,
+        render_intuitive_summary(state),
+        render_intuitive_exclusion_list(state),
+        intuitive_selected_time_update(state),
     )
 
 
@@ -1458,9 +1814,46 @@ def load_intuitive_editor(video_choice: str):
     return (
         state, preview, transcript, "**表示モード:** 元動画プレビュー　｜　" + info,
         render_intuitive_toolbar(state),
-        render_intuitive_selected_boundary(state),
         render_intuitive_state_overview(state),
         render_intuitive_state_zoom(state),
+        render_intuitive_summary(state),
+        render_intuitive_exclusion_list(state),
+        intuitive_selected_time_update(state),
+    )
+
+
+def select_intuitive_video_from_gallery(
+    video_ids: list[str], filter_text: str, evt: gr.SelectData
+):
+    """Select one card and immediately initialize a fresh intuitive edit session."""
+    index = _selected_gallery_index(video_ids, evt)
+    video_id = video_ids[index]
+    if video_id == ALL_VIDEOS_VALUE:
+        raise gr.Error("直感編集では個別の動画を選択してください。")
+    # Rebuild through the same function used to render the card grid so the
+    # highlighted "selected" card always matches the freshly loaded video.
+    _, _, cards_html = build_intuitive_video_gallery(filter_text, video_id)
+    return (
+        gr.update(selected_index=index), video_id, cards_html,
+        *load_intuitive_editor(video_id),
+    )
+
+
+def refresh_intuitive_video_picker(filter_text: str, selected_video_id: str):
+    """Refresh cards and both fallback/search dropdowns without rebuilding thumbnails."""
+    gallery_update, video_ids, cards_html = build_intuitive_video_gallery(
+        filter_text, selected_video_id
+    )
+    choices = [
+        (str(caption).replace("\n", "  —  "), video_id)
+        for (_, caption), video_id in zip(gallery_update["value"], video_ids)
+    ]
+    return (
+        gallery_update,
+        video_ids,
+        cards_html,
+        gr.update(choices=choices),
+        gr.update(choices=[("すべての動画", ALL_VIDEOS_VALUE), *choices]),
     )
 
 
@@ -1519,9 +1912,11 @@ def _load_intuitive_search_result(index: int, results: list[dict]):
         render_intuitive_transcript(segments, state),
         f"**表示モード:** 元動画プレビュー　｜　**検索結果:** {html.escape(filename)}　｜　**表示区間:** {interval}",
         render_intuitive_toolbar(state),
-        render_intuitive_selected_boundary(state),
         render_intuitive_state_overview(state),
         render_intuitive_state_zoom(state),
+        render_intuitive_summary(state),
+        render_intuitive_exclusion_list(state),
+        intuitive_selected_time_update(state),
     )
 
 
@@ -1535,7 +1930,8 @@ def do_intuitive_search(
             gr.Info("該当するシーンが見つかりませんでした。")
         return (
             [], [], current_state,
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(),
         )
     return (_build_table(results, selected_idx=0), results, *_load_intuitive_search_result(0, results))
 
@@ -2395,16 +2791,83 @@ _APP_CSS = """
 .clip-timeline-hatch-key { padding: .05rem .35rem; border-radius: .2rem; color: #fff; }
 .clip-timeline-empty { color: var(--body-text-color-subdued); font-size: .9rem; }
 .intuitive-prototype-note {
-  border-left: .3rem solid var(--primary-500); padding: .55rem .8rem;
+  border-left: .3rem solid var(--primary-500); padding: .25rem .6rem;
+  margin: 0 0 .2rem !important;
   background: var(--background-fill-secondary); border-radius: .35rem;
+}
+.intuitive-prototype-note .prose, .intuitive-prototype-note p { margin: 0 !important; }
+#intuitive-video-picker { margin: 0 0 .2rem !important; }
+#intuitive-video-picker > button { min-height: 2rem !important; padding-block: .25rem !important; }
+.intuitive-fallback-picker { margin-top: .2rem !important; }
+/* The real Gallery only exists to keep the original selection/nonce/FIFO
+   wiring intact; the card grid above it is what the user actually sees. */
+.intuitive-gallery-proxy {
+  position: absolute !important; height: 0 !important; min-height: 0 !important;
+  margin: 0 !important; padding: 0 !important; border: 0 !important;
+  overflow: hidden !important; opacity: 0; pointer-events: none;
+}
+.intuitive-video-card-empty {
+  padding: .6rem; color: var(--body-text-color-subdued); font-size: .9rem;
+}
+.intuitive-video-card-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: .6rem; max-height: 380px; overflow-y: auto; padding: .1rem;
+}
+.intuitive-video-card {
+  display: flex; flex-direction: column; gap: .3rem; text-align: left;
+  border: 1px solid var(--border-color-primary); border-radius: .5rem;
+  background: var(--background-fill-primary); padding: .4rem; cursor: pointer;
+  font: inherit; color: inherit;
+}
+.intuitive-video-card:hover {
+  border-color: var(--primary-500); box-shadow: 0 0 0 1px var(--primary-500);
+}
+.intuitive-video-card.is-selected {
+  border-color: var(--primary-500); box-shadow: 0 0 0 2px var(--primary-500);
+  background: var(--background-fill-secondary);
+}
+.intuitive-video-thumb {
+  position: relative; display: block; border-radius: .35rem; overflow: hidden;
+  background: var(--background-fill-secondary); aspect-ratio: 16 / 9;
+}
+.intuitive-video-thumb img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
+.intuitive-video-duration {
+  position: absolute; right: .3rem; bottom: .3rem; padding: .05rem .35rem;
+  border-radius: .25rem; background: rgba(0, 0, 0, .72); color: #fff;
+  font-size: .74rem; font-family: var(--font-mono, monospace);
+}
+.intuitive-video-name {
+  font-size: .86rem; line-height: 1.3; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.intuitive-video-badges { display: flex; flex-wrap: wrap; gap: .25rem; min-height: 1.3rem; }
+.intuitive-video-badge {
+  font-size: .7rem; padding: .05rem .4rem; border-radius: .35rem;
+  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
+  border: 1px solid var(--border-color-primary);
+}
+.intuitive-video-duration, .intuitive-ts-chip, .intuitive-stat,
+.intuitive-selected-boundary-chip, .intuitive-timeline-scale,
+.intuitive-viewport-summary, .intuitive-exclusion-length,
+#intuitive-selected-time input {
+  font-variant-numeric: tabular-nums;
 }
 #intuitive-transcript-panel {
   border: 1px solid var(--border-color-primary); border-radius: .55rem;
-  overflow: hidden; height: 420px; background: var(--background-fill-primary);
+  overflow: hidden; height: 310px; background: var(--background-fill-primary);
   display: flex !important; flex-direction: column !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+}
+#intuitive-header {
+  border: 1px solid var(--border-color-primary); border-radius: .55rem;
+  background: var(--background-fill-secondary);
+  padding: .4rem .6rem; margin: 0 0 1rem !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
 }
 #intuitive-mode-row {
-  align-items: center !important; gap: .45rem !important; margin-bottom: .15rem;
+  align-items: center !important; gap: .35rem !important; margin: .05rem 0 !important;
 }
 #intuitive-video-info { min-width: 0; }
 #intuitive-video-info .prose { margin: 0 !important; }
@@ -2485,14 +2948,93 @@ button#intuitive-preview-result, #intuitive-preview-result button {
 .intuitive-transcript-range { color: var(--body-text-color); font-weight: 600; }
 .intuitive-segment {
   border-radius: .25rem;
-  outline: 1px dashed var(--border-color-primary);
 }
-.intuitive-boundary-box {
-  padding: .45rem .65rem; border: 1px solid var(--border-color-primary);
-  border-radius: .45rem; background: var(--background-fill-secondary);
+.intuitive-segment-row {
+  display: flex; align-items: baseline; gap: .5rem;
+  padding: .25rem 0; margin: 0 0 .1rem;
+  border-bottom: 1px solid var(--border-color-primary);
 }
+.intuitive-segment-row:last-child { border-bottom: none; }
+.intuitive-segment-row-content { flex: 1 1 auto; min-width: 0; }
+.intuitive-ts-chip {
+  flex: 0 0 auto; font-family: var(--font-mono, monospace); font-size: .78rem;
+  padding: .05rem .35rem; border-radius: .35rem;
+  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
+}
+.intuitive-selected-boundary-chip {
+  display: inline-flex; align-items: center; margin-right: .5rem;
+  padding: .1rem .5rem; border-radius: .35rem; font-weight: 600;
+  background: var(--primary-500); color: #fff; font-variant-numeric: tabular-nums;
+}
+.intuitive-selected-boundary-chip.is-empty {
+  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
+  font-weight: 400;
+}
+.intuitive-control-group-start {
+  position: relative;
+  margin-left: .25rem !important; padding-left: .5rem !important;
+}
+.intuitive-control-group-start::before {
+  content: ""; position: absolute; left: -.15rem; top: .2rem; bottom: .2rem;
+  width: 1px; background: var(--border-color-primary); pointer-events: none;
+}
+#intuitive-reselect-video { flex: 0 0 auto !important; }
+.intuitive-edit-summary {
+  display: flex; flex-wrap: wrap; gap: .3rem .55rem; align-items: center;
+  padding: .2rem 0 0; margin: 0; border-radius: 0;
+  background: transparent; font-size: .9rem;
+  white-space: nowrap; overflow-x: auto;
+}
+#intuitive-header .intuitive-edit-summary { border-top: 1px dashed var(--border-color-primary); }
+.intuitive-stat {
+  display: inline-flex; align-items: center; gap: .25rem;
+  padding: .15rem .5rem; border-radius: .35rem;
+  background: var(--background-fill-primary);
+  border: 1px solid var(--border-color-primary);
+}
+.intuitive-stat strong { white-space: nowrap; }
+#intuitive-save-bar {
+  position: sticky; bottom: 0; z-index: 10;
+  background: var(--background-fill-primary);
+  border-top: 1px solid var(--border-color-primary);
+  box-shadow: 0 -.25rem .5rem rgba(0, 0, 0, .12);
+  padding: .4rem .55rem .25rem; margin-top: .3rem !important;
+}
+.intuitive-exclusion-list {
+  margin: .25rem 0 .35rem; border: 1px solid var(--border-color-primary);
+  border-radius: .45rem; background: var(--background-fill-primary);
+}
+.intuitive-exclusion-list summary { cursor: pointer; padding: .35rem .6rem; font-weight: 600; }
+.intuitive-exclusion-list-body { padding: 0 .55rem .45rem; }
+.intuitive-exclusion-row {
+  display: grid; grid-template-columns: 1.7rem minmax(13rem, 1fr) 5rem auto;
+  gap: .5rem; align-items: center; padding: .25rem .35rem;
+  border-top: 1px solid var(--border-color-primary); font-size: .88rem;
+}
+.intuitive-exclusion-row.is-selected { background: var(--background-fill-secondary); }
+.intuitive-exclusion-index { text-align: center; color: var(--body-text-color-subdued); }
+.intuitive-exclusion-length { text-align: right; }
+.intuitive-exclusion-row button, .intuitive-clear-exclusions {
+  min-height: 1.8rem; padding: .15rem .55rem; border: 1px solid var(--border-color-primary);
+  border-radius: .35rem; background: var(--button-secondary-background-fill);
+}
+.intuitive-clear-exclusions { margin-top: .35rem; }
+.intuitive-exclusion-empty { padding: .3rem; color: var(--body-text-color-subdued); }
 .intuitive-compact-row { align-items: end !important; }
-.intuitive-timeline { margin: .2rem 0 .45rem; }
+.intuitive-section-heading {
+  margin: 1rem 0 .4rem !important; min-height: 0 !important;
+  padding-bottom: .2rem; border-bottom: 1px solid var(--border-color-primary);
+}
+.intuitive-section-heading .prose, .intuitive-section-heading p {
+  margin: 0 !important; font-size: .74rem !important; font-weight: 700 !important;
+  letter-spacing: .06em; text-transform: uppercase;
+  color: var(--body-text-color-subdued) !important;
+}
+.intuitive-section-heading .prose strong, .intuitive-section-heading p strong { font-weight: 700; }
+.intuitive-compact-note { margin: 0 !important; min-height: 0 !important; font-size: .78rem; }
+.intuitive-compact-note .prose, .intuitive-compact-note p { margin: 0 !important; }
+#intuitive-overview-timeline, #intuitive-zoom-timeline { margin: 0 !important; min-height: 0 !important; }
+.intuitive-timeline { margin: .05rem 0 .2rem; }
 .intuitive-timeline-toolbox {
   display: flex; align-items: center; gap: .55rem; margin: 0 0 .25rem;
   padding: .22rem .35rem; border: 1px solid var(--border-color-primary);
@@ -2505,6 +3047,31 @@ button#intuitive-preview-result, #intuitive-preview-result button {
   flex: 0 1 34rem; margin: 0;
 }
 .intuitive-timeline-toolbox .intuitive-tool-button { padding-block: .16rem; }
+.intuitive-edit-mode-toggle {
+  flex: 0 0 auto; padding: .18rem .55rem; border-radius: .35rem;
+  border: 1px solid var(--border-color-primary);
+  background: var(--button-secondary-background-fill); color: var(--body-text-color);
+  font-size: .78rem; cursor: pointer; white-space: nowrap;
+}
+.intuitive-edit-mode-toggle.is-on {
+  background: var(--primary-500); color: #fff; border-color: var(--primary-500);
+}
+/* B: with editing OFF (default), handles look inert so it's clear a plain
+   click on the track only seeks. The timeline toolbox's tool buttons stay
+   dimmed for the same "off" affordance, but MUST remain clickable: pressing
+   one is what turns editing on (see the click handler's
+   `enable_timeline_edit_mode` flag) -- pointer-events:none here would make
+   them look clickable-but-dead, the exact bug this comment now prevents. */
+[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-handle,
+[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-cut-handle {
+  opacity: .45; cursor: default; pointer-events: none;
+}
+[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-zoom-track {
+  cursor: pointer;
+}
+[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-timeline-toolbox .intuitive-tool-button {
+  opacity: .65;
+}
 .intuitive-timeline-scale {
   display: flex; justify-content: space-between; color: var(--body-text-color-subdued);
   font-size: .8rem; margin-bottom: .25rem;
@@ -2560,16 +3127,22 @@ button#intuitive-preview-result, #intuitive-preview-result button {
   background: repeating-linear-gradient(135deg, #333 0, #333 5px, #eee 5px, #eee 10px);
   cursor: pointer;
 }
-.intuitive-cut-zone.is-selected-cut { outline: 3px solid #ff9800; outline-offset: -3px; z-index: 3; }
+.intuitive-cut-zone.is-selected-cut {
+  outline: 3px solid var(--primary-500); outline-offset: -3px; z-index: 3;
+}
+/* C: timeline colors are limited to three -- primary (save range), grey
+   hatch (excluded), red (playhead). Handles reuse primary at reduced
+   saturation instead of introducing a fourth (orange) hue. */
 .intuitive-cut-handle {
-  position: absolute; top: 0; bottom: 0; width: .55rem; background: #ff8a00;
+  position: absolute; top: 0; bottom: 0; width: .55rem;
+  background: color-mix(in srgb, var(--primary-500) 75%, #fff 25%);
   cursor: ew-resize; z-index: 3;
 }
 .intuitive-cut-handle.start { left: 0; }
 .intuitive-cut-handle.end { right: 0; }
 .intuitive-handle {
   position: absolute; top: .2rem; bottom: .2rem; width: .7rem;
-  border-radius: .25rem; background: #ff8a00; border: 2px solid #fff;
+  border-radius: .25rem; background: var(--primary-500); border: 2px solid #fff;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .35); cursor: ew-resize;
   transform: translateX(-50%); z-index: 4;
 }
@@ -2591,7 +3164,17 @@ body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjus
 body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-before button,
 body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-after,
 body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-after button,
-body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-step {
+body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-step,
+body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) button#intuitive-adjust-before,
+body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-adjust-before button,
+body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) button#intuitive-adjust-after,
+body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-adjust-after button {
+  pointer-events: none !important; opacity: .5 !important;
+}
+body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-apply-current,
+body:has(#intuitive-toolbox [data-active-tool=""]) #intuitive-apply-current,
+body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-apply-time,
+body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-apply-time {
   pointer-events: none !important; opacity: .5 !important;
 }
 """
@@ -2603,7 +3186,9 @@ _INTUITIVE_EDITOR_JS = r"""() => {
   let drag = null;
   let commandBusy = false;
   let transcriptFocusPending = null;
+  let fallbackSwitchArmed = false;
   const commandQueue = [];
+  const VIDEO_SWITCH_WARNING = '現在の編集内容はこの画面から失われます。動画を切り替えますか？';
 
   const editorMeta = () => {
     const root = document.querySelector('#intuitive-toolbox [data-intuitive-root]');
@@ -2612,10 +3197,15 @@ _INTUITIVE_EDITOR_JS = r"""() => {
       revision: Number(root.dataset.revision), nonce: root.dataset.nonce,
       previewMode: root.dataset.previewMode || 'source',
       activeTool: root.dataset.activeTool || '',
+      editDirty: root.dataset.editDirty === 'true',
       transcriptStart: Number(root.dataset.transcriptStart),
       transcriptEnd: Number(root.dataset.transcriptEnd),
       viewportStart: Number(root.dataset.viewportStart),
-      viewportEnd: Number(root.dataset.viewportEnd)
+      viewportEnd: Number(root.dataset.viewportEnd),
+      previewStart: Number(root.dataset.previewStart),
+      previewEnd: Number(root.dataset.previewEnd),
+      hasSelectedBoundary: root.dataset.hasSelectedBoundary === 'true',
+      timelineEditMode: root.dataset.timelineEditMode === 'true'
     };
     if (transcriptFocusPending && transcriptFocusPending.nonce === meta.nonce
         && transcriptFocusPending.time >= meta.transcriptStart
@@ -2624,6 +3214,77 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     }
     return meta;
   };
+  const intuitivePickerParts = () => {
+    const picker = document.getElementById('intuitive-video-picker');
+    const accordion = picker ? picker.closest('.gr-accordion') || picker : null;
+    return {
+      accordion,
+      content: accordion
+        ? accordion.querySelector(':scope > [data-testid="accordion-content"]') : null,
+      button: accordion ? accordion.querySelector(':scope > button.label-wrap') : null
+    };
+  };
+  const openIntuitivePicker = () => {
+    const {accordion, content, button} = intuitivePickerParts();
+    if (content && button && getComputedStyle(content).display === 'none') button.click();
+    if (accordion) accordion.scrollIntoView({block: 'start', behavior: 'smooth'});
+  };
+  const confirmDirtyVideoSwitch = () => {
+    const meta = editorMeta();
+    return !meta || !meta.editDirty || window.confirm(VIDEO_SWITCH_WARNING);
+  };
+
+  // Gradio's Gallery select listener runs in the bubble phase.  Reject a
+  // dirty-session switch in capture phase so its callback and fresh nonce are
+  // never started after cancellation.
+  document.addEventListener('click', (event) => {
+    const gallery = event.target.closest('#intuitive-video-gallery');
+    const card = event.target.closest('button, [role="button"], .gallery-item');
+    if (!gallery || !card || confirmDirtyVideoSwitch()) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+
+  // The visible card grid is a display-only layer. Forward its clicks (by
+  // index) onto the matching button inside the hidden proxy Gallery so the
+  // exact same selection path runs: the dirty-session confirm above, then
+  // Gradio's own Gallery `select` handler (nonce/FIFO, auto-preview,
+  // Accordion-close all stay wired to that Gallery, untouched).
+  document.addEventListener('click', (event) => {
+    const card = event.target.closest('#intuitive-video-card-grid .intuitive-video-card');
+    if (!card) return;
+    const index = Number(card.dataset.index);
+    if (!Number.isInteger(index) || index < 0) return;
+    const buttons = document.querySelectorAll('#intuitive-video-gallery .gallery-item button');
+    const target = buttons[index];
+    if (target) target.click();
+  }, true);
+
+  // The fallback Dropdown changes value before its Gradio callback.  Confirm
+  // on the opening pointer/key action so cancellation cannot leave a displayed
+  // value that was never loaded.  The reselect button itself does not confirm;
+  // confirmation remains at the actual choice, avoiding a double prompt.
+  const armFallbackSwitch = (event) => {
+    if (!event.target.closest('#intuitive-video-select') || fallbackSwitchArmed) return;
+    if (!confirmDirtyVideoSwitch()) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    fallbackSwitchArmed = true;
+  };
+  document.addEventListener('pointerdown', armFallbackSwitch, true);
+  document.addEventListener('keydown', (event) => {
+    if (['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(event.key)) armFallbackSwitch(event);
+  }, true);
+  document.addEventListener('focusout', (event) => {
+    if (event.target.closest('#intuitive-video-select')) {
+      setTimeout(() => { fallbackSwitchArmed = false; }, 0);
+    }
+  }, true);
+  document.addEventListener('input', (event) => {
+    if (event.target.closest('#intuitive-video-select')) fallbackSwitchArmed = false;
+  }, true);
   const flushCommandQueue = () => {
     if (commandBusy || !commandQueue.length) return;
     const queued = commandQueue.shift();
@@ -2756,12 +3417,65 @@ _INTUITIVE_EDITOR_JS = r"""() => {
 
   document.addEventListener('click', (event) => {
     const meta = editorMeta();
+    const reselectButton = event.target.closest(
+      'button#intuitive-reselect-video, #intuitive-reselect-video button'
+    );
+    if (reselectButton) {
+      event.preventDefault();
+      openIntuitivePicker();
+      return;
+    }
+    const currentButton = event.target.closest(
+      'button#intuitive-apply-current, #intuitive-apply-current button'
+    );
+    if (currentButton) {
+      event.preventDefault();
+      if (!meta || meta.previewMode === 'result' || !meta.activeTool) return;
+      const video = document.querySelector('#intuitive-preview-video video');
+      if (!(video instanceof HTMLVideoElement) || !Number.isFinite(video.currentTime)
+          || !Number.isFinite(meta.previewStart)) return;
+      const absolute = meta.previewStart + Number(video.currentTime);
+      if (absolute < meta.previewStart - .001 || absolute > meta.previewEnd + .001) return;
+      send({type: 'set_current_position', time: absolute});
+      return;
+    }
+    const timeButton = event.target.closest(
+      'button#intuitive-apply-time, #intuitive-apply-time button'
+    );
+    if (timeButton) {
+      event.preventDefault();
+      if (!meta || meta.previewMode === 'result' || !meta.hasSelectedBoundary) return;
+      const input = document.querySelector('#intuitive-selected-time input');
+      const value = Number(input ? input.value : NaN);
+      if (!Number.isFinite(value)) return;
+      send({type: 'set_selected_time', time: value});
+      return;
+    }
+    const removeButton = event.target.closest('[data-intuitive-remove-exclusion]');
+    if (removeButton) {
+      event.preventDefault();
+      if (!meta || meta.previewMode === 'result' || removeButton.disabled) return;
+      send({type: 'remove_exclusion', id: removeButton.dataset.intuitiveRemoveExclusion});
+      return;
+    }
+    const clearButton = event.target.closest('[data-intuitive-clear-exclusions]');
+    if (clearButton) {
+      event.preventDefault();
+      if (!meta || meta.previewMode === 'result' || clearButton.disabled) return;
+      send({type: 'clear_exclusions'});
+      return;
+    }
     const adjustButton = event.target.closest(
       'button#intuitive-adjust-before, #intuitive-adjust-before button, ' +
       'button#intuitive-adjust-after, #intuitive-adjust-after button'
     );
     if (adjustButton) {
-      if (meta && meta.previewMode === 'result') return;
+      event.preventDefault();
+      if (!meta || meta.previewMode === 'result') return;
+      // Sent even when no boundary is selected yet (e.g. reached via keyboard,
+      // bypassing the CSS pointer-events guard below): dispatch_intuitive_command
+      // rejects it server-side and handle_intuitive_command surfaces a visible
+      // gr.Warning ("先に調整する境界を選択してください。"), so this never fails silently.
       // 秒数調整もHTMLツールやタイムラインと同じFIFOへ通す。
       // Gradioの独立callbackにすると、完了前のタイムライン操作が古い
       // revisionを保持したまま実行され、直前の境界編集と競合する。
@@ -2770,12 +3484,26 @@ _INTUITIVE_EDITOR_JS = r"""() => {
       const direction = adjustButton.matches('#intuitive-adjust-before')
         || adjustButton.closest('#intuitive-adjust-before') ? -1 : 1;
       send({type: 'adjust_selected', delta: direction * (Number.isFinite(step) ? step : 1.0)});
+      return;
+    }
+    const editModeToggle = event.target.closest('[data-intuitive-toggle-edit-mode]');
+    if (editModeToggle) {
       event.preventDefault();
+      if (!meta || meta.previewMode === 'result') return;
+      send({type: 'set_timeline_edit_mode', enabled: !meta.timelineEditMode});
       return;
     }
     const tool = event.target.closest('[data-intuitive-tool]');
     if (tool) {
-      send({type: 'set_tool', tool: tool.dataset.intuitiveTool});
+      // Pressing a tool button in the zoom timeline's own toolbox is itself
+      // the "I want to edit" gesture, so it also turns editing on -- users
+      // should never have to find and press the separate toggle first just
+      // to make these buttons do anything.
+      const payload = {type: 'set_tool', tool: tool.dataset.intuitiveTool};
+      if (tool.closest('.intuitive-timeline-toolbox')) {
+        payload.enable_timeline_edit_mode = true;
+      }
+      send(payload);
       return;
     }
     const word = event.target.closest('#intuitive-transcript-words .intuitive-word');
@@ -2792,7 +3520,9 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     }
     const zoom = event.target.closest('[data-intuitive-zoom]');
     if (zoom && !event.target.closest('[data-boundary-kind], .intuitive-timeline-toolbox')) {
-      if (meta && meta.previewMode !== 'result' && meta.activeTool) {
+      // B: with the zoom timeline's edit mode OFF (default), a click here is
+      // always a seek -- boundary-setting-by-click requires editing to be on.
+      if (meta && meta.previewMode !== 'result' && meta.activeTool && meta.timelineEditMode) {
         const track = zoom.querySelector('.intuitive-zoom-track');
         const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
         send({type: 'set_from_timeline', time: timeAtPointer(track, event, lo, hi)});
@@ -2826,6 +3556,9 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     if (boundary) {
       const root = boundary.closest('[data-intuitive-zoom]');
       if (root && root.dataset.previewMode === 'result') return;
+      // B: handle drag (overall_start/overall_end/exclusion boundaries) is an
+      // edit operation -- only allowed once the zoom timeline's toggle is ON.
+      if (root && root.dataset.timelineEditMode !== 'true') return;
       drag = {
         type: 'boundary', root, track: root.querySelector('.intuitive-zoom-track'),
         kind: boundary.dataset.boundaryKind, id: boundary.dataset.cutId || null,
@@ -2839,6 +3572,9 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     const zoom = event.target.closest('[data-intuitive-zoom]');
     if (zoom && !event.target.closest('[data-cut-id]')) {
       if (zoom.dataset.previewMode === 'result') return;
+      // B: dragging on the track body to add a new cut is an edit operation --
+      // only allowed once the zoom timeline's toggle is ON.
+      if (zoom.dataset.timelineEditMode !== 'true') return;
       const meta = editorMeta();
       // ツール選択中の短いクリックは境界指定としてclickハンドラへ渡す。
       // 未選択時だけ従来どおり横ドラッグによる途中カットを開始する。
@@ -2922,6 +3658,23 @@ _INTUITIVE_EDITOR_JS = r"""() => {
   };
   document.addEventListener('pointerup', (event) => finishDrag(event, false));
   document.addEventListener('pointercancel', (event) => finishDrag(event, true));
+}"""
+
+
+_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS = r"""() => {
+  const picker = document.getElementById('intuitive-video-picker');
+  const accordion = picker ? picker.closest('.gr-accordion') || picker : null;
+  const content = accordion
+    ? accordion.querySelector(':scope > [data-testid="accordion-content"]')
+    : null;
+  const button = accordion
+    ? accordion.querySelector(':scope > button.label-wrap')
+    : null;
+  if (content && button && getComputedStyle(content).display !== 'none') button.click();
+  requestAnimationFrame(() => {
+    const editor = document.getElementById('intuitive-mode-row');
+    if (editor) editor.scrollIntoView({block: 'start', behavior: 'smooth'});
+  });
 }"""
 
 
@@ -3548,21 +4301,69 @@ with gr.Blocks(title="動画シーン検索") as demo:
             elem_classes=["intuitive-prototype-note"],
         )
         intuitive_state = gr.State(None)
+        # `open=True` does not emit an Accordion expand event on first render.
+        # Seed cards and their IDs together so the initially open picker is
+        # immediately usable; later filter/reload actions use the same helper.
+        _INTUITIVE_INITIAL_CARDS = _intuitive_video_cards_data("")
+        _INTUITIVE_INITIAL_GALLERY = _intuitive_gallery_items(_INTUITIVE_INITIAL_CARDS)
+        _INTUITIVE_INITIAL_VIDEO_IDS = [
+            card["video_id"] for card in _INTUITIVE_INITIAL_CARDS
+        ]
+        _INTUITIVE_INITIAL_CARDS_HTML = render_intuitive_video_cards([
+            {**card, "thumbnail_url": _thumbnail_servable_url(card.get("thumbnail_path"))}
+            for card in _INTUITIVE_INITIAL_CARDS
+        ])
+        intuitive_video_gallery_ids = gr.State(_INTUITIVE_INITIAL_VIDEO_IDS)
 
-        with gr.Row(elem_classes=["intuitive-compact-row"]):
-            intuitive_video_select = gr.Dropdown(
-                choices=list_video_choices_only(),
-                label="動画を選択（選ぶと先頭発話付近を自動プレビュー）",
-                scale=5,
-                elem_id="intuitive-video-select",
+        with gr.Accordion(
+            "サムネイルから編集する動画を選ぶ", open=True,
+            elem_id="intuitive-video-picker",
+        ) as intuitive_video_picker:
+            with gr.Row(elem_classes=["intuitive-compact-row"]):
+                intuitive_video_filter = gr.Textbox(
+                    label="ファイル名で絞り込み",
+                    placeholder="ファイル名の一部を入力",
+                    scale=4,
+                    elem_id="intuitive-video-filter",
+                )
+                intuitive_video_filter_btn = gr.Button(
+                    "絞り込む", scale=1, elem_id="intuitive-video-filter-button",
+                )
+                intuitive_reload_btn = gr.Button(
+                    "一覧更新", scale=1, elem_id="intuitive-reload-videos",
+                )
+            intuitive_video_gallery_html = gr.HTML(
+                value=_INTUITIVE_INITIAL_CARDS_HTML,
+                label="動画一覧（選ぶと自動で編集を開始）",
+                elem_id="intuitive-video-card-grid",
             )
-            intuitive_load_btn = gr.Button(
-                "選択動画を再読み込み", variant="secondary", scale=1,
-                elem_id="intuitive-load-video",
+            # Real selection wiring stays on a hidden gr.Gallery so nonce/FIFO,
+            # the dirty-session confirm, auto-preview and Accordion-close all
+            # keep working exactly as before. The visible card grid above is a
+            # pure display layer whose clicks are forwarded (by index) onto
+            # this Gallery's own buttons -- see the click-forward listener in
+            # `_INTUITIVE_EDITOR_JS`.
+            intuitive_video_gallery = gr.Gallery(
+                value=_INTUITIVE_INITIAL_GALLERY,
+                columns=4,
+                allow_preview=False,
+                object_fit="cover",
+                selected_index=None,
+                elem_id="intuitive-video-gallery",
+                elem_classes=["intuitive-gallery-proxy"],
+                show_label=False,
             )
-            intuitive_reload_btn = gr.Button(
-                "一覧更新", scale=1, elem_id="intuitive-reload-videos",
-            )
+            with gr.Row(elem_classes=["intuitive-fallback-picker"]):
+                intuitive_video_select = gr.Dropdown(
+                    choices=list_video_choices_only(),
+                    label="サムネイルを表示できない場合の動画選択",
+                    scale=5,
+                    elem_id="intuitive-video-select",
+                )
+                intuitive_load_btn = gr.Button(
+                    "選択動画を再読み込み", variant="secondary", scale=1,
+                    elem_id="intuitive-load-video",
+                )
         intuitive_search_results = gr.State([])
         with gr.Accordion("検索して候補区間から編集を始める", open=False):
             with gr.Row(elem_classes=["intuitive-compact-row"]):
@@ -3585,19 +4386,28 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 label="検索結果（行を選ぶとその区間を読み込み）",
                 elem_id="intuitive-search-results",
             )
-        with gr.Row(elem_id="intuitive-mode-row"):
-            intuitive_video_info = gr.Markdown(
-                "**選択動画:** 未選択　｜　**表示区間:** 未読み込み",
-                elem_id="intuitive-video-info",
-                scale=8,
-            )
-            intuitive_preview_result_btn = gr.Button(
-                "編集結果を確認", scale=0, min_width=138,
-                elem_id="intuitive-preview-result",
-            )
-            intuitive_return_source_btn = gr.Button(
-                "元動画へ戻る", scale=0, min_width=126,
-                elem_id="intuitive-return-source",
+        with gr.Group(elem_id="intuitive-header"):
+            with gr.Row(elem_id="intuitive-mode-row"):
+                intuitive_video_info = gr.Markdown(
+                    "**選択動画:** 未選択　｜　**表示区間:** 未読み込み",
+                    elem_id="intuitive-video-info",
+                    scale=8,
+                )
+                intuitive_reselect_video_btn = gr.Button(
+                    "動画を選び直す", scale=0, min_width=118, size="sm",
+                    elem_id="intuitive-reselect-video",
+                )
+                intuitive_preview_result_btn = gr.Button(
+                    "編集結果を確認", scale=0, min_width=138,
+                    elem_id="intuitive-preview-result",
+                )
+                intuitive_return_source_btn = gr.Button(
+                    "元動画へ戻る", scale=0, min_width=126,
+                    elem_id="intuitive-return-source",
+                )
+            intuitive_summary = gr.HTML(
+                '<div class="intuitive-edit-summary">動画を読み込むと編集内容を表示します。</div>',
+                elem_id="intuitive-edit-summary",
             )
 
         with gr.Row(equal_height=True):
@@ -3606,7 +4416,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     label="直感編集プレビュー",
                     autoplay=False,
                     interactive=False,
-                    height=420,
+                    height=310,
                     elem_id="intuitive-preview-video",
                 )
             with gr.Column(
@@ -3615,7 +4425,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 elem_id="intuitive-transcript-panel",
             ):
                 intuitive_toolbar = gr.HTML(
-                    '<div class="intuitive-toolbox"><strong>文字起こし編集ツール</strong>'
+                    '<div class="intuitive-toolbox"><strong>境界ツール（文字・タイムライン共通）</strong>'
                     '<div class="intuitive-tool-buttons">'
                     '<button disabled>全体開始</button><button disabled>全体終了</button>'
                     '<button disabled>除外開始</button><button disabled>除外終了</button></div>'
@@ -3629,56 +4439,93 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 )
 
         with gr.Row(elem_classes=["intuitive-compact-row"]):
-            intuitive_selected_boundary = gr.Markdown(
-                "**選択中の境界:** 未選択　｜　文字起こしまたはタイムラインから選択",
-                elem_id="intuitive-selected-boundary",
-                elem_classes=["intuitive-boundary-box"],
-            )
+            # 選択中の境界（種別＋時刻）は境界ツールのステータス行
+            # （.intuitive-tool-status、render_intuitive_toolbar）に統合済み。
+            # この行は調整操作だけのコンパクトな1行にする。
             intuitive_adjust_step = gr.Radio(
                 choices=ADJUST_STEPS,
                 value=1.0,
                 label="調整幅 (秒)",
                 interactive=True,
                 scale=4,
+                min_width=360,
+                container=False,
                 elem_id="intuitive-adjust-step",
             )
+            intuitive_selected_time = gr.Number(
+                value=None,
+                label="選択境界の時刻 (秒)",
+                interactive=False,
+                scale=2,
+                min_width=160,
+                elem_id="intuitive-selected-time",
+                elem_classes=["intuitive-control-group-start"],
+            )
+            intuitive_apply_time_btn = gr.Button(
+                "時刻を適用", scale=1, min_width=96, size="sm",
+                elem_id="intuitive-apply-time",
+            )
+            intuitive_apply_current_btn = gr.Button(
+                "現在位置を適用", scale=1, min_width=118, size="sm",
+                elem_id="intuitive-apply-current",
+                elem_classes=["intuitive-control-group-start"],
+            )
             intuitive_before_btn = gr.Button(
-                "前へ", interactive=True, scale=1,
+                "前へ", interactive=True, scale=1, min_width=80, size="sm",
                 elem_id="intuitive-adjust-before",
             )
             intuitive_after_btn = gr.Button(
-                "後ろへ", interactive=True, scale=1,
+                "後ろへ", interactive=True, scale=1, min_width=80, size="sm",
                 elem_id="intuitive-adjust-after",
             )
 
-        gr.Markdown("**動画全体の概要タイムライン**")
+        gr.Markdown(
+            "**動画全体の概要タイムライン**",
+            elem_classes=["intuitive-section-heading"],
+        )
         intuitive_overview_timeline = gr.HTML(
             render_intuitive_overview_timeline(1.0, 0.0, 1.0),
             elem_id="intuitive-overview-timeline",
         )
 
-        gr.Markdown("**拡大編集タイムライン（切り出し範囲を標準表示）**")
+        gr.Markdown(
+            "**拡大編集タイムライン（切り出し範囲を標準表示）**",
+            elem_classes=["intuitive-section-heading"],
+        )
         intuitive_zoom_timeline = gr.HTML(
             render_intuitive_zoom_timeline(0.0, 1.0),
             elem_id="intuitive-zoom-timeline",
         )
+        intuitive_exclusion_list = gr.HTML(
+            '<details class="intuitive-exclusion-list"><summary>途中カット一覧（0箇所）</summary>'
+            '<div class="intuitive-exclusion-list-body"><div class="intuitive-exclusion-empty">'
+            '途中カットはありません。</div></div></details>',
+            elem_id="intuitive-exclusion-list",
+        )
         gr.Markdown(
             "※ 青枠viewportを確定すると、その範囲（5～600秒）の元動画プレビューと"
-            "再生・編集位置付近（最大90秒）の文字起こしを再取得します。"
+            "再生・編集位置付近（最大90秒）の文字起こしを再取得します。",
+            elem_classes=["intuitive-compact-note"],
         )
 
-        with gr.Row(elem_classes=["intuitive-compact-row"]):
-            intuitive_out_dir = gr.Textbox(
-                value=DEFAULT_CLIPS_DIR, label="保存先", scale=2,
+        with gr.Group(elem_id="intuitive-save-bar"):
+            with gr.Row(elem_classes=["intuitive-compact-row"]):
+                intuitive_out_dir = gr.Textbox(
+                    value=DEFAULT_CLIPS_DIR, label="保存先", scale=2,
+                )
+                intuitive_folder_btn = gr.Button(
+                    "参照", scale=0, min_width=80, elem_id="intuitive-folder-browse",
+                )
+                intuitive_filename = gr.Textbox(
+                    value="", label="ファイル名（空なら自動）", scale=2,
+                )
+                intuitive_precise = gr.Checkbox(
+                    value=True, label="フレーム精度", scale=1,
+                )
+                intuitive_save_btn = gr.Button("保存", variant="primary", scale=1)
+            intuitive_saved_path = gr.Textbox(
+                label="保存先", interactive=False, lines=1,
             )
-            intuitive_filename = gr.Textbox(
-                value="", label="ファイル名（空なら自動）", scale=2,
-            )
-            intuitive_precise = gr.Checkbox(
-                value=True, label="フレーム精度", scale=1,
-            )
-            intuitive_save_btn = gr.Button("保存", variant="primary", scale=1)
-        intuitive_saved_path = gr.Textbox(label="保存先", interactive=False)
 
         intuitive_command_json = gr.Textbox(
             value="", elem_id="intuitive-command-json",
@@ -3689,12 +4536,14 @@ with gr.Blocks(title="動画シーン検索") as demo:
         intuitive_render_outputs = [
             intuitive_state,
             intuitive_toolbar,
-            intuitive_selected_boundary,
             intuitive_overview_timeline,
             intuitive_zoom_timeline,
             intuitive_preview,
             intuitive_transcript,
             intuitive_video_info,
+            intuitive_summary,
+            intuitive_exclusion_list,
+            intuitive_selected_time,
         ]
 
         intuitive_load_outputs = [
@@ -3703,9 +4552,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
             intuitive_transcript,
             intuitive_video_info,
             intuitive_toolbar,
-            intuitive_selected_boundary,
             intuitive_overview_timeline,
             intuitive_zoom_timeline,
+            intuitive_summary,
+            intuitive_exclusion_list,
+            intuitive_selected_time,
         ]
         intuitive_load_btn.click(
             load_intuitive_editor,
@@ -3713,11 +4564,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=intuitive_load_outputs,
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
-        )
-        # Selecting a video is itself a safe preview action.  Keep the button as
-        # an explicit retry, while rapid selection changes collapse to the last
-        # queued value and each completed load receives a fresh editor nonce.
-        intuitive_video_select.change(
+        ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
+        # `.input` reacts only to a user's fallback selection.  Gallery output
+        # may update the Dropdown value too, without starting a duplicate load.
+        intuitive_video_select.input(
             load_intuitive_editor,
             inputs=[intuitive_video_select],
             outputs=intuitive_load_outputs,
@@ -3725,13 +4575,58 @@ with gr.Blocks(title="動画シーン検索") as demo:
             show_progress="minimal",
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
+        ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
+        intuitive_video_picker.expand(
+            build_intuitive_video_gallery,
+            inputs=[intuitive_video_filter, intuitive_video_select],
+            outputs=[
+                intuitive_video_gallery, intuitive_video_gallery_ids,
+                intuitive_video_gallery_html,
+            ],
+        )
+        intuitive_video_filter_btn.click(
+            build_intuitive_video_gallery,
+            inputs=[intuitive_video_filter, intuitive_video_select],
+            outputs=[
+                intuitive_video_gallery, intuitive_video_gallery_ids,
+                intuitive_video_gallery_html,
+            ],
+        )
+        intuitive_video_filter.submit(
+            build_intuitive_video_gallery,
+            inputs=[intuitive_video_filter, intuitive_video_select],
+            outputs=[
+                intuitive_video_gallery, intuitive_video_gallery_ids,
+                intuitive_video_gallery_html,
+            ],
         )
         intuitive_reload_btn.click(
-            lambda: (
-                gr.update(choices=list_video_choices_only()),
-                gr.update(choices=list_video_choices()),
-            ),
-            outputs=[intuitive_video_select, intuitive_search_target],
+            refresh_intuitive_video_picker,
+            inputs=[intuitive_video_filter, intuitive_video_select],
+            outputs=[
+                intuitive_video_gallery,
+                intuitive_video_gallery_ids,
+                intuitive_video_gallery_html,
+                intuitive_video_select,
+                intuitive_search_target,
+            ],
+        )
+        intuitive_video_gallery.select(
+            select_intuitive_video_from_gallery,
+            inputs=[intuitive_video_gallery_ids, intuitive_video_filter],
+            outputs=[
+                intuitive_video_gallery,
+                intuitive_video_select,
+                intuitive_video_gallery_html,
+                *intuitive_load_outputs,
+            ],
+            trigger_mode="always_last",
+            show_progress="minimal",
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        ).success(
+            fn=None,
+            js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS,
         )
         intuitive_search_outputs = [
             intuitive_result_table,
@@ -3741,9 +4636,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
             intuitive_transcript,
             intuitive_video_info,
             intuitive_toolbar,
-            intuitive_selected_boundary,
             intuitive_overview_timeline,
             intuitive_zoom_timeline,
+            intuitive_summary,
+            intuitive_exclusion_list,
+            intuitive_selected_time,
         ]
         intuitive_search_btn.click(
             do_intuitive_search,
@@ -3775,9 +4672,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_transcript,
                 intuitive_video_info,
                 intuitive_toolbar,
-                intuitive_selected_boundary,
                 intuitive_overview_timeline,
                 intuitive_zoom_timeline,
+                intuitive_summary,
+                intuitive_exclusion_list,
+                intuitive_selected_time,
             ],
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
@@ -3812,6 +4711,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[intuitive_saved_path],
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
+        )
+        intuitive_folder_btn.click(
+            browse_folder,
+            inputs=[intuitive_out_dir],
+            outputs=[intuitive_out_dir],
         )
         demo.load(fn=None, js=_INTUITIVE_EDITOR_JS)
 

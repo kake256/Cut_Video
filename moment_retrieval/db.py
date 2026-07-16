@@ -133,6 +133,12 @@ def get_segments(conn: sqlite3.Connection, video_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_indexed_video_ids(conn: sqlite3.Connection) -> set[str]:
+    """Video IDs that have at least one search chunk (i.e., embedded and FAISS-indexed)."""
+    rows = conn.execute("SELECT DISTINCT video_id FROM text_chunks").fetchall()
+    return {r["video_id"] for r in rows}
+
+
 def get_chunk_ids(conn: sqlite3.Connection, video_id: str) -> list[int]:
     rows = conn.execute(
         "SELECT chunk_id FROM text_chunks WHERE video_id = ?", (video_id,)

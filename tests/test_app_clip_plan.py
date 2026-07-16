@@ -1,12 +1,18 @@
+import pathlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import gradio as gr
 
+from moment_retrieval import utils
+import app as app_module
 from app import (
     _APP_CSS,
+    _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS,
     _INTUITIVE_EDITOR_JS,
+    _INTUITIVE_INITIAL_VIDEO_IDS,
+    _QUIT_JS,
     _clip_plan_exclusions,
     _clip_plan_ranges,
     _intuitive_preview_path,
@@ -16,6 +22,7 @@ from app import (
     adjust_exclusion_time_with_step,
     always_refresh,
     build_video_gallery,
+    build_intuitive_video_gallery,
     do_search,
     dispatch_intuitive_command,
     handle_intuitive_command,
@@ -28,13 +35,18 @@ from app import (
     preview_intuitive_editor,
     remove_clip_exclusion,
     render_clip_plan_timeline,
+    render_intuitive_exclusion_list,
+    render_intuitive_summary,
     render_intuitive_toolbar,
     render_intuitive_transcript,
+    render_intuitive_video_cards,
     render_intuitive_state_overview,
     render_intuitive_state_zoom,
+    refresh_intuitive_video_picker,
     reset_clip_plan,
     reset_clip_plan_after_range_change,
     select_clip_exclusion,
+    select_intuitive_video_from_gallery,
     select_video_from_gallery,
     sync_exclusion_controls,
     selected_video_info,
@@ -146,6 +158,132 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(image_update["value"], "thumb.jpg")
         self.assertEqual(detail, "video detail")
         self.assertEqual(gallery_update["selected_index"], 1)
+
+    def test_intuitive_video_gallery_excludes_all_and_filters_caption(self):
+        class FakeConnection:
+            def close(self):
+                pass
+
+        videos = [
+            {"video_id": "video-a", "path": r"F:\videos\alpha.mp4", "duration": 60.0},
+            {"video_id": "video-b", "path": r"F:\videos\beta.mp4", "duration": 90.0},
+        ]
+        with (
+            patch("app.db.get_conn", return_value=FakeConnection()),
+            patch("app.db.init_db"),
+            patch("app.db.list_videos", return_value=videos),
+            patch("app.db.get_indexed_video_ids", return_value={"video-b"}),
+            patch("app._make_video_thumbnail", return_value="thumb.jpg") as thumbnail,
+            patch("app._thumbnail_servable_url", return_value="thumb-url"),
+        ):
+            gallery_update, ids, cards_html = build_intuitive_video_gallery(
+                "beta", "video-b"
+            )
+
+        self.assertEqual(ids, ["video-b"])
+        self.assertNotIn("__all_videos__", ids)
+        self.assertEqual(gallery_update["selected_index"], 0)
+        self.assertIn("beta.mp4", gallery_update["value"][0][1])
+        self.assertIn("00:01:30", gallery_update["value"][0][1])
+        thumbnail.assert_called_once_with(videos[1])
+        self.assertIn("beta.mp4", cards_html)
+        self.assertNotIn("alpha.mp4", cards_html)
+        self.assertIn("索引あり", cards_html)
+        self.assertNotIn("文字起こし済み", cards_html)
+
+    def test_render_intuitive_video_cards_shows_badges_only_when_judgable(self):
+        cards = [
+            {
+                "video_id": "dummy-1",
+                "name": "dummy-clip-a.mp4",
+                "duration": 75.0,
+                "thumbnail_url": "/gradio_api/file=/dummy/thumb-a.jpg",
+                "asr_complete": True,
+                "indexed": True,
+            },
+            {
+                "video_id": "dummy-2",
+                "name": "dummy-clip-b.mp4",
+                "duration": 5.0,
+                "thumbnail_url": "/gradio_api/file=/dummy/thumb-b.jpg",
+                "asr_complete": False,
+                "indexed": False,
+            },
+        ]
+
+        rendered = render_intuitive_video_cards(cards)
+
+        self.assertEqual(rendered.count('class="intuitive-video-badge"'), 2)
+        self.assertEqual(rendered.count("文字起こし済み"), 1)
+        self.assertEqual(rendered.count("索引あり"), 1)
+        self.assertIn('data-index="0"', rendered)
+        self.assertIn('data-index="1"', rendered)
+        self.assertIn(utils.format_timestamp(75.0), rendered)
+
+    def test_render_intuitive_video_cards_escapes_name_and_marks_selection(self):
+        cards = [{
+            "video_id": "dummy-<3>",
+            "name": "<script>alert(1)</script>.mp4",
+            "duration": 12.0,
+            "thumbnail_url": "/gradio_api/file=/dummy/thumb.jpg",
+            "asr_complete": False,
+            "indexed": False,
+        }]
+
+        rendered = render_intuitive_video_cards(cards, selected_video_id="dummy-<3>")
+
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", rendered)
+        self.assertIn("is-selected", rendered)
+
+    def test_render_intuitive_video_cards_empty_state(self):
+        self.assertIn(
+            "該当する動画がありません", render_intuitive_video_cards([])
+        )
+
+    def test_intuitive_gallery_selection_loads_video_with_single_output_tuple(self):
+        event = gr.SelectData(None, {"index": 1, "value": None, "selected": True})
+        load_outputs = tuple(f"load-{index}" for index in range(10))
+        with (
+            patch("app.load_intuitive_editor", return_value=load_outputs) as load,
+            patch(
+                "app.build_intuitive_video_gallery",
+                return_value=(gr.update(), ["video-a", "video-b"], "<div>cards</div>"),
+            ) as build_gallery,
+        ):
+            output = select_intuitive_video_from_gallery(
+                ["video-a", "video-b"], "", event
+            )
+
+        self.assertEqual(len(output), 13)
+        self.assertEqual(output[0]["selected_index"], 1)
+        self.assertEqual(output[1], "video-b")
+        self.assertEqual(output[2], "<div>cards</div>")
+        self.assertEqual(output[3:], load_outputs)
+        load.assert_called_once_with("video-b")
+        build_gallery.assert_called_once_with("", "video-b")
+
+        with self.assertRaises(gr.Error):
+            select_intuitive_video_from_gallery(["__all_videos__"], "", gr.SelectData(
+                None, {"index": 0, "value": None, "selected": True}
+            ))
+
+    def test_intuitive_picker_refresh_keeps_all_only_in_search_target(self):
+        gallery = gr.update(
+            value=[("thumb.jpg", "sample.mp4\n00:01:00")], selected_index=0
+        )
+        with patch(
+            "app.build_intuitive_video_gallery",
+            return_value=(gallery, ["video-a"], "<div>cards</div>"),
+        ):
+            output = refresh_intuitive_video_picker("sample", "video-a")
+
+        self.assertEqual(output[2], "<div>cards</div>")
+        fallback_choices = output[3]["choices"]
+        search_choices = output[4]["choices"]
+        self.assertEqual(fallback_choices, [("sample.mp4  —  00:01:00", "video-a")])
+        self.assertEqual(search_choices[0], ("すべての動画", "__all_videos__"))
+        self.assertEqual(search_choices[1:], fallback_choices)
 
     def test_middle_exclusion_splits_selection(self):
         plan, _, _ = reset_clip_plan(0.0, 60.0)
@@ -359,6 +497,34 @@ class ClipPlanTest(unittest.TestCase):
         self.assertNotIn('data-time-granularity="word"', rendered)
         self.assertIn('data-start="20.000" data-end="22.000"', rendered)
 
+    def test_intuitive_transcript_shows_row_start_time_chip(self):
+        segments = [{
+            "start_sec": 65.0,
+            "end_sec": 70.0,
+            "text": "発話ごとの行",
+            "words_json": None,
+        }]
+
+        rendered = render_intuitive_transcript(segments)
+
+        self.assertIn('class="intuitive-segment-row"', rendered)
+        self.assertIn(
+            f'<span class="intuitive-ts-chip">{utils.format_timestamp(65.0)}</span>',
+            rendered,
+        )
+
+    def test_intuitive_transcript_omits_chip_when_start_time_missing(self):
+        segments = [{
+            "end_sec": 70.0,
+            "text": "開始時刻なしの発話",
+            "words_json": None,
+        }]
+
+        rendered = render_intuitive_transcript(segments)
+
+        self.assertIn('class="intuitive-segment-row"', rendered)
+        self.assertNotIn("intuitive-ts-chip", rendered)
+
     def test_intuitive_transcript_and_zoom_render_edit_state_classes(self):
         state = self._intuitive_state()
         state.update({
@@ -492,6 +658,319 @@ class ClipPlanTest(unittest.TestCase):
         with self.assertRaises(gr.Error):
             self._intuitive_command(state, "set_from_timeline", time=20.0)
 
+    def test_intuitive_summary_is_derived_from_canonical_state(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "add_exclusion", start=20.0, end=25.0
+        )
+        state = self._intuitive_command(
+            state, "add_exclusion", start=40.0, end=50.0
+        )
+
+        rendered = render_intuitive_summary(state)
+
+        self.assertIn("00:00:10", rendered)
+        self.assertIn("00:01:40", rendered)
+        self.assertIn("（90.0秒）", rendered)
+        self.assertIn("2箇所 / 15.0秒", rendered)
+        self.assertIn("完成予定</strong> 75.0秒", rendered)
+        self.assertNotIn("summary", state)
+        self.assertNotIn("completed_duration", state)
+
+    def test_intuitive_dirty_tracks_only_canonical_edit_plan_changes(self):
+        state = self._intuitive_state()
+        self.assertFalse(state["edit_dirty"])
+
+        state = self._intuitive_command(state, "set_tool", tool="overall_start")
+        self.assertFalse(state["edit_dirty"])
+        state = self._intuitive_command(
+            state, "set_viewport", start=20.0, end=80.0
+        )
+        self.assertFalse(state["edit_dirty"])
+        state = self._intuitive_command(
+            state, "set_transcript_focus", time=50.0
+        )
+        self.assertFalse(state["edit_dirty"])
+        state = self._intuitive_command(
+            state, "select_boundary", kind="overall_start"
+        )
+        self.assertFalse(state["edit_dirty"])
+
+        state = self._intuitive_command(
+            state, "set_selected_time", time=25.0
+        )
+        self.assertTrue(state["edit_dirty"])
+        state = self._intuitive_command(state, "set_tool", tool="overall_end")
+        self.assertTrue(state["edit_dirty"])
+
+        exclusion_state = self._intuitive_state()
+        exclusion_state = self._intuitive_command(
+            exclusion_state, "add_exclusion", start=20.0, end=25.0
+        )
+        self.assertTrue(exclusion_state["edit_dirty"])
+
+        manually_seeded = self._intuitive_state()
+        manually_seeded["exclusions"] = [
+            {"id": "cut-1", "start": 20.0, "end": 25.0},
+        ]
+        manually_seeded = self._intuitive_command(
+            manually_seeded, "remove_exclusion", id="cut-1"
+        )
+        self.assertTrue(manually_seeded["edit_dirty"])
+
+    def test_timeline_edit_mode_defaults_off_and_toggles_via_fifo(self):
+        state = self._intuitive_state()
+        self.assertFalse(state["timeline_edit_mode"])
+
+        zoom_off = render_intuitive_state_zoom(state)
+        self.assertIn('data-timeline-edit-mode="false"', zoom_off)
+        self.assertIn('data-intuitive-toggle-edit-mode', zoom_off)
+        self.assertIn('編集モード: OFF', zoom_off)
+        self.assertNotIn('is-on', zoom_off)
+        toolbar_off = render_intuitive_toolbar(state)
+        self.assertIn('data-timeline-edit-mode="false"', toolbar_off)
+
+        state = self._intuitive_command(state, "set_timeline_edit_mode", enabled=True)
+        self.assertTrue(state["timeline_edit_mode"])
+        zoom_on = render_intuitive_state_zoom(state)
+        self.assertIn('data-timeline-edit-mode="true"', zoom_on)
+        self.assertIn('編集モード: ON', zoom_on)
+        self.assertIn('intuitive-edit-mode-toggle is-on', zoom_on)
+
+        state = self._intuitive_command(state, "set_timeline_edit_mode", enabled=False)
+        self.assertFalse(state["timeline_edit_mode"])
+
+    def test_timeline_edit_mode_off_clears_armed_tool_and_pending_cut(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(state, "set_tool", tool="exclude_start")
+        state = self._intuitive_command(
+            state, "set_from_word", start=40.0, end=40.5
+        )
+        self.assertEqual(state["active_tool"], "exclude_end")
+        self.assertIsNotNone(state["pending_cut_start"])
+
+        state = self._intuitive_command(
+            state, "set_timeline_edit_mode", enabled=False
+        )
+        self.assertFalse(state["timeline_edit_mode"])
+        self.assertIsNone(state["active_tool"])
+        self.assertIsNone(state["pending_cut_start"])
+
+    def test_set_tool_from_the_timeline_toolbox_auto_enables_edit_mode(self):
+        """Bug 1 regression: pressing a tool button that lives inside the
+        zoom timeline's own toolbox is itself the "I want to edit" gesture,
+        so it must also flip timeline_edit_mode on in the same round trip --
+        otherwise the very next click (to place the boundary) silently falls
+        back to a seek instead of setting it."""
+        state = self._intuitive_state()
+        self.assertFalse(state["timeline_edit_mode"])
+
+        state = self._intuitive_command(
+            state, "set_tool", tool="overall_start",
+            enable_timeline_edit_mode=True,
+        )
+        self.assertTrue(state["timeline_edit_mode"])
+        self.assertEqual(state["active_tool"], "overall_start")
+
+        # A plain set_tool (e.g. from the transcript panel's own toolbox,
+        # which never sends this flag) must not touch edit mode either way.
+        state["timeline_edit_mode"] = False
+        state = self._intuitive_command(state, "set_tool", tool="overall_end")
+        self.assertFalse(state["timeline_edit_mode"])
+
+    def test_timeline_tool_buttons_stay_clickable_and_hint_when_edit_mode_off(self):
+        """Bug 1: unlike handles/cut-drag, the timeline toolbox's tool
+        buttons must never get `pointer-events: none` -- that is what made
+        them look clickable but do nothing when edit mode was off."""
+        state = self._intuitive_state()
+        zoom_off = render_intuitive_state_zoom(state)
+        self.assertIn(
+            "クリックで編集モードをONにして選択します。", zoom_off
+        )
+        # Only the dim opacity rule may apply to tool buttons while off;
+        # pointer-events:none must be reserved for handles/cut-handles.
+        off_rule = (
+            '[data-intuitive-zoom][data-timeline-edit-mode="false"] '
+            '.intuitive-timeline-toolbox .intuitive-tool-button {\n'
+            '  opacity: .65;\n}'
+        )
+        self.assertIn(off_rule, _APP_CSS)
+
+        state["timeline_edit_mode"] = True
+        zoom_on = render_intuitive_state_zoom(state)
+        self.assertNotIn(
+            "クリックで編集モードをONにして選択します。", zoom_on
+        )
+
+    def test_adjust_selected_works_for_every_boundary_kind(self):
+        """Bug 2 regression: 前へ/後ろへ must move overall_start, overall_end,
+        pending_cut_start, and both ends of an existing exclusion -- not just
+        overall_start."""
+        state = self._intuitive_state()
+
+        state = self._intuitive_command(
+            state, "set_tool", tool="overall_start", enable_timeline_edit_mode=True
+        )
+        state = self._intuitive_command(state, "set_from_word", start=20.0, end=20.5)
+        state = self._intuitive_command(state, "adjust_selected", delta=1.0)
+        self.assertEqual(state["overall_start"], 21.0)
+
+        state = self._intuitive_command(state, "set_tool", tool="overall_end")
+        state = self._intuitive_command(state, "set_from_word", start=90.0, end=90.5)
+        state = self._intuitive_command(state, "adjust_selected", delta=-1.0)
+        self.assertEqual(state["overall_end"], 89.5)
+
+        state = self._intuitive_command(state, "set_tool", tool="exclude_start")
+        state = self._intuitive_command(state, "set_from_word", start=40.0, end=40.5)
+        self.assertEqual(state["selected_boundary"], {"kind": "pending_cut_start"})
+        state = self._intuitive_command(state, "adjust_selected", delta=1.0)
+        self.assertEqual(state["pending_cut_start"], 41.0)
+
+        state = self._intuitive_command(state, "set_from_word", start=50.0, end=50.5)
+        cut_id = state["exclusions"][0]["id"]
+        self.assertEqual(state["selected_boundary"], {"kind": "exclusion_end", "id": cut_id})
+        state = self._intuitive_command(state, "adjust_selected", delta=1.0)
+        self.assertEqual(state["exclusions"][0]["end"], 51.5)
+
+        state = self._intuitive_command(
+            state, "select_boundary", kind="exclusion_start", id=cut_id
+        )
+        state = self._intuitive_command(state, "adjust_selected", delta=1.0)
+        self.assertEqual(state["exclusions"][0]["start"], 42.0)
+
+    def test_intuitive_exclusion_list_renders_compact_safe_delete_controls(self):
+        state = self._intuitive_state()
+        state["exclusions"] = [
+            {"id": 'cut-<unsafe>"', "start": 20.0, "end": 25.5},
+        ]
+        state["selected_boundary"] = {
+            "kind": "exclusion_end", "id": 'cut-<unsafe>"',
+        }
+
+        rendered = render_intuitive_exclusion_list(state)
+
+        self.assertIn("途中カット一覧（1箇所）", rendered)
+        self.assertIn("00:00:20", rendered)
+        self.assertIn("5.5秒", rendered)
+        self.assertIn("data-intuitive-remove-exclusion", rendered)
+        self.assertIn("cut-&lt;unsafe&gt;&quot;", rendered)
+        self.assertIn("is-selected", rendered)
+        self.assertIn("data-intuitive-clear-exclusions", rendered)
+
+        state["preview_mode"] = "result"
+        rendered = render_intuitive_exclusion_list(state)
+        self.assertEqual(rendered.count(" disabled"), 2)
+
+    def test_intuitive_remove_and_clear_exclusions_keep_selection_safe(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "add_exclusion", start=20.0, end=25.0
+        )
+        first_id = state["exclusions"][0]["id"]
+        state = self._intuitive_command(
+            state, "add_exclusion", start=40.0, end=45.0
+        )
+        state = self._intuitive_command(state, "set_tool", tool="exclude_start")
+        state = self._intuitive_command(
+            state, "set_from_timeline", time=60.0
+        )
+        self.assertEqual(state["active_tool"], "exclude_end")
+
+        state = self._intuitive_command(
+            state, "remove_exclusion", id=first_id
+        )
+        self.assertEqual(len(state["exclusions"]), 1)
+        self.assertIsNone(state["pending_cut_start"])
+        self.assertIsNone(state["active_tool"])
+        self.assertIsNone(state["selected_boundary"])
+
+        remaining_id = state["exclusions"][0]["id"]
+        state = self._intuitive_command(
+            state, "select_boundary", kind="exclusion_end", id=remaining_id
+        )
+        state = self._intuitive_command(state, "clear_exclusions")
+        self.assertEqual(state["exclusions"], [])
+        self.assertIsNone(state["selected_boundary"])
+
+    def test_intuitive_remove_does_not_regenerate_video_preview(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "add_exclusion", start=20.0, end=25.0
+        )
+        command = {
+            "type": "remove_exclusion", "id": state["exclusions"][0]["id"],
+            "revision": state["revision"], "nonce": state["nonce"],
+        }
+        with (
+            patch("app._render_intuitive_transcript_for_state", return_value="transcript"),
+            patch("app.make_intuitive_preview") as preview,
+        ):
+            output = handle_intuitive_command(command, state)
+
+        preview.assert_not_called()
+        self.assertEqual(output[0]["exclusions"], [])
+        self.assertIn("途中カット</strong> 0箇所 / 0.0秒", output[7])
+        self.assertIn("途中カット一覧（0箇所）", output[8])
+
+    def test_intuitive_current_position_and_direct_time_use_existing_constraints(self):
+        unarmed = self._intuitive_state()
+        with self.assertRaises(gr.Error):
+            self._intuitive_command(
+                unarmed, "set_current_position", time=20.0
+            )
+        unarmed = self._intuitive_command(
+            unarmed, "set_tool", tool="overall_start"
+        )
+        with self.assertRaises(gr.Error):
+            self._intuitive_command(
+                unarmed, "set_current_position", time=150.0
+            )
+
+        state = self._intuitive_state()
+        state = self._intuitive_command(state, "set_tool", tool="overall_start")
+        state = self._intuitive_command(
+            state, "set_current_position", time=22.25
+        )
+        self.assertEqual(state["overall_start"], 22.25)
+        self.assertEqual(state["selected_boundary"], {"kind": "overall_start"})
+
+        state = self._intuitive_command(
+            state, "set_selected_time", time=28.75
+        )
+        self.assertEqual(state["overall_start"], 28.75)
+        self.assertEqual(state["selected_boundary"], {"kind": "overall_start"})
+
+        state = self._intuitive_command(
+            state, "add_exclusion", start=40.0, end=50.0
+        )
+        cut_id = state["exclusions"][0]["id"]
+        state = self._intuitive_command(
+            state, "select_boundary", kind="exclusion_start", id=cut_id
+        )
+        state = self._intuitive_command(
+            state, "set_selected_time", time=45.0
+        )
+        self.assertEqual(
+            [(cut["start"], cut["end"]) for cut in state["exclusions"]],
+            [(45.0, 50.0)],
+        )
+
+    def test_intuitive_new_edit_commands_are_rejected_in_result_mode(self):
+        for action in (
+            {"type": "set_current_position", "time": 20.0},
+            {"type": "set_selected_time", "time": 20.0},
+            {"type": "remove_exclusion", "id": "cut-1"},
+            {"type": "clear_exclusions"},
+        ):
+            state = self._intuitive_state()
+            state["preview_mode"] = "result"
+            with self.assertRaises(gr.Error):
+                self._intuitive_command(
+                    state,
+                    action["type"],
+                    **{key: value for key, value in action.items() if key != "type"},
+                )
+
     def test_intuitive_toolbars_share_active_and_result_state(self):
         state = self._intuitive_state()
         state["active_tool"] = "overall_end"
@@ -500,8 +979,11 @@ class ClipPlanTest(unittest.TestCase):
         zoom = render_intuitive_state_zoom(state)
 
         self.assertIn('data-active-tool="overall_end"', toolbar)
+        self.assertIn('data-edit-dirty="false"', toolbar)
+        self.assertIn("境界ツール（文字・タイムライン共通）", toolbar)
         self.assertNotIn('data-intuitive-preview-action', toolbar)
         self.assertIn("intuitive-timeline-toolbox", zoom)
+        self.assertIn("共通境界ツール", zoom)
         self.assertIn(
             'class="intuitive-tool-button is-selected" data-intuitive-tool="overall_end"',
             zoom,
@@ -514,6 +996,22 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("編集ツールを選ぶと元動画へ戻り", toolbar)
         self.assertEqual(toolbar.count(" disabled"), 0)
         self.assertEqual(zoom.count(" disabled"), 0)
+
+    def test_toolbar_status_line_absorbs_the_removed_selected_boundary_box(self):
+        """C-1: the standalone "選択中の境界" box was removed; its info now
+        lives in the toolbox status line (.intuitive-tool-status)."""
+        state = self._intuitive_state()
+        toolbar = render_intuitive_toolbar(state)
+        self.assertIn('intuitive-selected-boundary-chip is-empty">未選択', toolbar)
+
+        state = self._intuitive_command(state, "set_tool", tool="overall_start")
+        state = self._intuitive_command(
+            state, "set_from_word", start=20.0, end=21.0
+        )
+        toolbar = render_intuitive_toolbar(state)
+        self.assertIn("intuitive-selected-boundary-chip\">選択中: 全体開始", toolbar)
+        self.assertIn("00:00:20", toolbar)
+        self.assertNotIn("is-empty", toolbar)
 
     def test_intuitive_tools_can_be_repeated_without_stale_selection(self):
         state = self._intuitive_state()
@@ -745,6 +1243,62 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("data-viewport-summary", overview)
         self.assertIn("（600.0秒）", overview)
 
+    def test_overview_and_zoom_timelines_always_render_the_same_viewport(self):
+        """A-2 regression: both timelines must derive from the same
+        viewport_start/viewport_end so an overview extend is always visible in
+        the zoom timeline immediately after the command that produced it.
+        """
+        state = _new_intuitive_state(
+            {
+                "video_id": "video-long",
+                "path": r"F:\videos\long.mp4",
+                "duration": 1000.0,
+            },
+            10.0,
+            100.0,
+        )
+
+        def assert_overview_matches_zoom(current_state):
+            overview = render_intuitive_state_overview(current_state)
+            zoom = render_intuitive_state_zoom(current_state)
+            self.assertIn(
+                f'data-viewport-start="{current_state["viewport_start"]:.3f}"',
+                overview,
+            )
+            self.assertIn(
+                f'data-viewport-end="{current_state["viewport_end"]:.3f}"',
+                overview,
+            )
+            self.assertIn(
+                f'data-view-start="{current_state["viewport_start"]:.3f}"', zoom
+            )
+            self.assertIn(
+                f'data-view-end="{current_state["viewport_end"]:.3f}"', zoom
+            )
+
+        # A moderate "end handle" extend (well inside min/max span bounds).
+        state = self._intuitive_command(state, "set_viewport", start=0.0, end=250.0)
+        assert_overview_matches_zoom(state)
+
+        # A moderate "start handle" extend (widen backwards).
+        state = self._intuitive_command(state, "set_viewport", start=-40.0, end=250.0)
+        assert_overview_matches_zoom(state)
+
+        # An extend that hits the max-span clamp (600s).
+        state = self._intuitive_command(state, "set_viewport", start=0.0, end=1000.0)
+        assert_overview_matches_zoom(state)
+        self.assertAlmostEqual(state["viewport_end"] - state["viewport_start"], 600.0)
+
+        # A shrink that hits the min-span clamp (5s).
+        state = self._intuitive_command(state, "set_viewport", start=300.0, end=300.1)
+        assert_overview_matches_zoom(state)
+        self.assertAlmostEqual(state["viewport_end"] - state["viewport_start"], 5.0)
+
+        # A move near the right edge of the video (clamped against duration).
+        state = self._intuitive_command(state, "set_viewport", start=950.0, end=1200.0)
+        assert_overview_matches_zoom(state)
+        self.assertEqual(state["viewport_end"], 1000.0)
+
     def test_transcript_focus_is_short_and_clamped_to_zoom_viewport(self):
         state = _new_intuitive_state(
             {
@@ -837,7 +1391,7 @@ class ClipPlanTest(unittest.TestCase):
 
         preview.assert_not_called()
         self.assertEqual(calls, [("video-1", 435.0, 525.0)])
-        self.assertIn("focused", output[6])
+        self.assertIn("focused", output[5])
         self.assertEqual(output[0]["preview_start"], 0.0)
         self.assertEqual(output[0]["preview_end"], 90.0)
 
@@ -901,9 +1455,9 @@ class ClipPlanTest(unittest.TestCase):
             output = handle_intuitive_command(command, state)
 
         self.assertEqual((output[0]["preview_start"], output[0]["preview_end"]), (120.0, 180.0))
-        self.assertEqual(output[5]["value"], "viewport.mp4")
-        self.assertIn("refreshed", output[6])
-        self.assertIn("00:02:00", output[7])
+        self.assertEqual(output[4]["value"], "viewport.mp4")
+        self.assertIn("refreshed", output[5])
+        self.assertIn("00:02:00", output[6])
         preview.assert_called_once()
 
     def test_intuitive_search_result_sets_overall_and_padded_viewport(self):
@@ -1006,8 +1560,8 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertIsNone(output[0]["active_tool"])
         self.assertEqual(output[0]["preview_mode"], "result")
-        self.assertIn("編集結果プレビュー", output[7])
-        self.assertIn('data-preview-mode="result"', output[4])
+        self.assertIn("編集結果プレビュー", output[6])
+        self.assertIn('data-preview-mode="result"', output[3])
 
         with patch("app.on_save", return_value="saved.mp4") as save:
             saved = save_intuitive_editor(state, True, "clips", "sample.mp4")
@@ -1068,8 +1622,8 @@ class ClipPlanTest(unittest.TestCase):
 
         self.assertEqual(output[0]["preview_mode"], "source")
         self.assertIsNone(output[0]["active_tool"])
-        self.assertEqual(output[5]["value"], "source.mp4")
-        self.assertIn("元動画プレビュー", output[7])
+        self.assertEqual(output[4]["value"], "source.mp4")
+        self.assertIn("元動画プレビュー", output[6])
         self.assertIn('data-preview-mode="source"', render_intuitive_state_zoom(output[0]))
 
     def test_result_preview_tool_click_returns_to_source_and_arms_tool(self):
@@ -1117,7 +1671,7 @@ class ClipPlanTest(unittest.TestCase):
         state = output[0]
         self.assertEqual(state["preview_mode"], "source")
         self.assertEqual(state["active_tool"], "overall_end")
-        self.assertEqual(output[5]["value"], "source.mp4")
+        self.assertEqual(output[4]["value"], "source.mp4")
         state = self._intuitive_command(
             state, "set_from_word", start=79.0, end=80.0
         )
@@ -1297,6 +1851,55 @@ class ClipPlanTest(unittest.TestCase):
             first_input = components_by_id[dependency["inputs"][0]]
             self.assertEqual(first_input["type"], "slider")
 
+    def test_js_string_constants_have_no_stray_backslash_comment_lines(self):
+        """Regression: a `//` JS comment that gets mangled into a lone `\`
+        compiles fine as a Python raw string (Python doesn't care), but is
+        invalid as the very first token of a JS statement -- it breaks the
+        whole IIFE at browser parse time and silently disables every click
+        handler in the editor. Plain `unittest`/`import app` cannot catch
+        this because they never execute the string as JavaScript; this test
+        performs a lightweight static check instead of pulling in a JS parser
+        that isn't available in this venv.
+        """
+        js_constants = {
+            "_QUIT_JS": _QUIT_JS,
+            "_INTUITIVE_EDITOR_JS": _INTUITIVE_EDITOR_JS,
+            "_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS": _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS,
+        }
+        for name, source in js_constants.items():
+            for lineno, line in enumerate(source.splitlines(), start=1):
+                stripped = line.strip()
+                self.assertFalse(
+                    stripped.startswith("\\") and not stripped.startswith("\\n"),
+                    f"{name} line {lineno} starts with a stray backslash "
+                    f"(likely a mangled `//` comment): {line!r}",
+                )
+            # Minimal structural sanity: balanced braces/parens/brackets and
+            # an even number of backticks (template literals).
+            self.assertEqual(
+                source.count("{"), source.count("}"), f"{name}: unbalanced {{}}"
+            )
+            self.assertEqual(
+                source.count("("), source.count(")"), f"{name}: unbalanced ()"
+            )
+            self.assertEqual(
+                source.count("["), source.count("]"), f"{name}: unbalanced []"
+            )
+            self.assertEqual(source.count("`") % 2, 0, f"{name}: odd backtick count")
+
+        # Whole-file sweep so JS constants that aren't module-level exports
+        # (e.g. one built inline inside the `with gr.Blocks()` body) are
+        # covered too, without needing to import them individually.
+        source_path = pathlib.Path(app_module.__file__)
+        for lineno, line in enumerate(
+            source_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            stripped = line.strip()
+            self.assertFalse(
+                stripped.startswith("\\") and not stripped.startswith("\\n"),
+                f"app.py line {lineno} starts with a stray backslash: {line!r}",
+            )
+
     def test_intuitive_editor_is_a_connected_top_level_prototype(self):
         config = demo.get_config_file()
         components = config["components"]
@@ -1342,7 +1945,6 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-video-info",
             "intuitive-transcript-panel",
             "intuitive-transcript-words",
-            "intuitive-selected-boundary",
             "intuitive-adjust-step",
             "intuitive-overview-timeline",
             "intuitive-zoom-timeline",
@@ -1386,7 +1988,30 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             components_by_elem_id["intuitive-preview-video"]["props"]["height"],
-            420,
+            310,
+        )
+        self.assertEqual(
+            components_by_elem_id["intuitive-transcript-panel"]["props"].get("min_width"),
+            400,
+        )
+        self.assertEqual(
+            components_by_elem_id["intuitive-adjust-step"]["props"]["min_width"],
+            360,
+        )
+        self.assertFalse(
+            components_by_elem_id["intuitive-adjust-step"]["props"]["container"]
+        )
+        self.assertIn(
+            "intuitive-control-group-start",
+            components_by_elem_id["intuitive-selected-time"]["props"].get(
+                "elem_classes", []
+            ),
+        )
+        self.assertIn(
+            "intuitive-control-group-start",
+            components_by_elem_id["intuitive-apply-current"]["props"].get(
+                "elem_classes", []
+            ),
         )
         parent_by_id = {}
         def collect_parents(node):
@@ -1422,6 +2047,40 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn(".intuitive-cut-zone", _APP_CSS)
         self.assertIn(".intuitive-playhead", _APP_CSS)
         self.assertIn(".intuitive-tool-buttons", _APP_CSS)
+        # A-1 regression: 前へ/後ろへ must look disabled (not just fail
+        # server-side) once no boundary is selected, matching apply-time's
+        # existing visual-disable convention -- otherwise the button looks
+        # clickable but silently does nothing but pop a toast.
+        self.assertIn(
+            'body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) '
+            'button#intuitive-adjust-before',
+            _APP_CSS,
+        )
+        self.assertIn(
+            'body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) '
+            'button#intuitive-adjust-after',
+            _APP_CSS,
+        )
+        # B: zoom timeline edit-mode toggle -- FIFO command + gated handlers.
+        self.assertIn("data-intuitive-toggle-edit-mode", _INTUITIVE_EDITOR_JS)
+        self.assertIn("type: 'set_timeline_edit_mode'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("meta.timelineEditMode", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "root.dataset.timelineEditMode !== 'true'", _INTUITIVE_EDITOR_JS
+        )
+        self.assertIn(
+            "zoom.dataset.timelineEditMode !== 'true'", _INTUITIVE_EDITOR_JS
+        )
+        self.assertIn(
+            '[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-handle',
+            _APP_CSS,
+        )
+        # C-2: visual polish -- tabular numerals for timestamps, unified card
+        # look, and the timeline handle color folded into the 3-color palette
+        # (primary/grey-hatch/red) instead of a 4th orange hue.
+        self.assertIn("font-variant-numeric: tabular-nums", _APP_CSS)
+        self.assertIn("text-transform: uppercase", _APP_CSS)
+        self.assertNotIn("#ff8a00", _APP_CSS)
         self.assertIn("document.addEventListener('click'", _INTUITIVE_EDITOR_JS)
         self.assertIn("document.addEventListener('pointerup'", _INTUITIVE_EDITOR_JS)
         self.assertIn("type: 'add_exclusion'", _INTUITIVE_EDITOR_JS)
@@ -1443,11 +2102,30 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("data-viewport-summary", _INTUITIVE_EDITOR_JS)
         self.assertIn("type: 'set_transcript_focus'", _INTUITIVE_EDITOR_JS)
         self.assertIn("requestTranscriptFocus(absolute)", _INTUITIVE_EDITOR_JS)
+        self.assertIn("meta.previewStart + Number(video.currentTime)", _INTUITIVE_EDITOR_JS)
+        self.assertIn("meta.previewMode === 'result' || !meta.activeTool", _INTUITIVE_EDITOR_JS)
+        self.assertIn("type: 'set_current_position'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("type: 'set_selected_time'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("type: 'remove_exclusion'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("type: 'clear_exclusions'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("data-intuitive-remove-exclusion", _INTUITIVE_EDITOR_JS)
+        self.assertIn("fallbackSwitchArmed = false", _INTUITIVE_EDITOR_JS)
+        self.assertIn("root.dataset.editDirty === 'true'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("現在の編集内容はこの画面から失われます", _INTUITIVE_EDITOR_JS)
+        self.assertIn("event.stopImmediatePropagation()", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-video-gallery", _INTUITIVE_EDITOR_JS)
+        self.assertIn("openIntuitivePicker()", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-video-select", _INTUITIVE_EDITOR_JS)
+        self.assertIn("intuitive-video-picker", _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
+        self.assertIn("button.click()", _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
+        self.assertIn("scrollIntoView", _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
         self.assertIn(".intuitive-transcript-window", _APP_CSS)
         self.assertIn("width: max(100%, 32px)", _APP_CSS)
         self.assertIn("flex: 1 1 0 !important", _APP_CSS)
         self.assertIn("overflow-y: scroll", _APP_CSS)
         self.assertIn(".intuitive-timeline-toolbox", _APP_CSS)
+        self.assertIn(".intuitive-control-group-start", _APP_CSS)
+        self.assertIn(".intuitive-control-group-start::before", _APP_CSS)
         self.assertIn("height: 1rem; overflow: visible", _APP_CSS)
         intuitive_fns = {
             "load_intuitive_editor", "do_intuitive_search",
@@ -1461,10 +2139,67 @@ class ClipPlanTest(unittest.TestCase):
         video_select_id = components_by_elem_id["intuitive-video-select"]["id"]
         auto_preview = [
             dependency for dependency in config["dependencies"]
-            if (video_select_id, "change") in dependency.get("targets", [])
+            if (video_select_id, "input") in dependency.get("targets", [])
         ]
         self.assertEqual(len(auto_preview), 1)
         self.assertEqual(auto_preview[0].get("trigger_mode"), "always_last")
+        for elem_id in (
+            "intuitive-edit-summary",
+            "intuitive-exclusion-list",
+            "intuitive-selected-time",
+            "intuitive-apply-time",
+            "intuitive-apply-current",
+            "intuitive-folder-browse",
+            "intuitive-video-picker",
+            "intuitive-video-gallery",
+            "intuitive-video-filter",
+            "intuitive-video-filter-button",
+            "intuitive-reload-videos",
+            "intuitive-reselect-video",
+        ):
+            self.assertIn(elem_id, components_by_elem_id)
+        gallery_id = components_by_elem_id["intuitive-video-gallery"]["id"]
+        gallery_select = [
+            dependency for dependency in config["dependencies"]
+            if (gallery_id, "select") in dependency.get("targets", [])
+        ]
+        self.assertEqual(len(gallery_select), 1)
+        self.assertEqual(gallery_select[0].get("trigger_mode"), "always_last")
+        self.assertEqual(len(gallery_select[0].get("outputs", [])), 13)
+        initial_cards = components_by_elem_id["intuitive-video-gallery"]["props"].get(
+            "value"
+        ) or []
+        gallery_ids_state = next(
+            component for component in components
+            if component["id"] == gallery_select[0]["inputs"][0]
+        )
+        self.assertGreater(len(initial_cards), 0)
+        self.assertEqual(gallery_ids_state["type"], "state")
+        self.assertEqual(len(initial_cards), len(_INTUITIVE_INITIAL_VIDEO_IDS))
+        self.assertNotIn("__all_videos__", _INTUITIVE_INITIAL_VIDEO_IDS)
+        self.assertTrue({
+            "build_intuitive_video_gallery",
+            "refresh_intuitive_video_picker",
+            "select_intuitive_video_from_gallery",
+        }.issubset(api_names))
+        collapse_dependencies = [
+            dependency for dependency in config["dependencies"]
+            if "intuitive-video-picker" in str(dependency.get("js") or "")
+            and dependency.get("trigger_only_on_success")
+        ]
+        self.assertEqual(len(collapse_dependencies), 3)
+        folder_id = components_by_elem_id["intuitive-folder-browse"]["id"]
+        out_dir_components = [
+            component for component in components
+            if component.get("type") == "textbox"
+            and component.get("props", {}).get("label") == "保存先"
+        ]
+        self.assertTrue(any(
+            (folder_id, "click") in dependency.get("targets", [])
+            and any(component["id"] in dependency.get("outputs", [])
+                    for component in out_dir_components)
+            for dependency in config["dependencies"]
+        ))
 
     def test_search_selection_and_none_refresh_are_safe(self):
         class FakeConnection:

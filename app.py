@@ -1125,16 +1125,18 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
     }
     action = command.get("type")
     transcript_focus = None
+    if command.get("enable_timeline_edit_mode"):
+        # A button pressed from the zoom timeline's own toolbox (tool arm,
+        # "fit overall to viewport", ...) is itself the "I want to edit"
+        # gesture required by B, so it both performs its action and turns
+        # editing on in one round trip -- consistent across every button
+        # that lives in that toolbox, not just the 4 tool buttons.
+        next_state["timeline_edit_mode"] = True
     try:
         if action == "set_tool":
             tool = command.get("tool")
             if tool not in _INTUITIVE_TOOLS:
                 raise ValueError("不明な編集ツールです。")
-            if command.get("enable_timeline_edit_mode"):
-                # A tool button pressed from the zoom timeline's own toolbox
-                # is itself the "I want to edit" gesture required by B, so it
-                # both arms the tool and turns editing on in one round trip.
-                next_state["timeline_edit_mode"] = True
             if next_state.get("preview_mode") == "result":
                 # 連結済みプレビューの再生時刻を元動画の絶対時刻として扱わない。
                 # 元動画への復帰はhandle_intuitive_command側で完了してから、
@@ -1310,6 +1312,15 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
                 # armed or a half-made cut waiting for its end boundary.
                 next_state["active_tool"] = None
                 next_state["pending_cut_start"] = None
+        elif action == "fit_overall_to_viewport":
+            # viewport is display-only by design and never changes the save
+            # range on its own; this is the explicit, one-shot "apply what
+            # I'm looking at" action the user asks for instead. The usual
+            # post-processing below (duration clamp, exclusion clipping,
+            # selected_boundary remap) applies exactly as it does for any
+            # other overall_start/overall_end change.
+            next_state["overall_start"] = float(next_state["viewport_start"])
+            next_state["overall_end"] = float(next_state["viewport_end"])
         else:
             raise ValueError("不明な編集コマンドです。")
     except ValueError as exc:
@@ -1552,7 +1563,7 @@ def render_intuitive_state_overview(state: dict) -> str:
         </div>
       </div>
       <div class="intuitive-viewport-summary">
-        <span>拡大表示: <strong data-viewport-summary>{utils.format_timestamp(state['viewport_start'])} ～ {utils.format_timestamp(state['viewport_end'])}（{viewport_span:.1f}秒）</strong></span>
+        <span>表示範囲（保存範囲は変わりません）: <strong data-viewport-summary>{utils.format_timestamp(state['viewport_start'])} ～ {utils.format_timestamp(state['viewport_end'])}（{viewport_span:.1f}秒）</strong></span>
         <span>両端をドラッグして{min_span:.0f}～{max_span:.0f}秒に変更 / 中央をドラッグして移動</span>
       </div>
     </div>
@@ -1628,6 +1639,11 @@ def render_intuitive_state_zoom(state: dict) -> str:
       <div class="intuitive-timeline-toolbox" aria-label="拡大タイムライン編集ツール">
         <button type="button" class="intuitive-edit-mode-toggle{' is-on' if edit_mode else ''}"
                 data-intuitive-toggle-edit-mode title="{edit_mode_hint}">{edit_mode_label}</button>
+        <button type="button" class="intuitive-fit-overall-button"
+                data-intuitive-fit-overall
+                title="保存範囲（オレンジ）を、今表示している範囲に合わせます。">
+          保存範囲を表示範囲に合わせる
+        </button>
         <span>共通境界ツール → 位置をクリック</span><div class="intuitive-tool-buttons">{timeline_tools}</div>
       </div>
       <div class="intuitive-timeline-scale"><span>{utils.format_timestamp(view_start)}</span><span>{utils.format_timestamp(midpoint)}</span><span>{utils.format_timestamp(view_end)}</span></div>
@@ -1728,11 +1744,19 @@ def handle_intuitive_command(command_json: str, state: dict):
     )
     try:
         next_state = dispatch_intuitive_command(command_json, state)
-    except gr.Error as exc:
+    except Exception as exc:
         # HTML→Gradio bridgeはrevisionの更新を完了通知として直列実行する。
-        # 無効操作でcallback自体を失敗させると後続操作が待ち続けるため、
-        # 編集内容を変えずrevisionだけ進めて最新表示へ安全に復帰させる。
-        gr.Warning(str(exc))
+        # ここでcallback自体を例外で失敗させると、JS側のawaitRevisionは
+        # 「revisionが進むまで」待ち続けたまま二度と満たされず、以降の
+        # 全コマンドがcommandQueueに溜まったまま送信されなくなる
+        # (revisionが進まない = FIFOが完全に停止するデッドロック)。
+        # dispatch_intuitive_command内のバリデーション失敗(ValueError→
+        # gr.Errorに変換済み)はもちろん、想定外の例外(gr.Errorでないもの)も
+        # ここで必ず捕まえ、編集内容を変えずrevisionだけ進めて安全に復帰する。
+        gr.Warning(
+            str(exc) if isinstance(exc, gr.Error) else
+            f"予期しないエラーが発生しました。操作を取り消します。({type(exc).__name__})"
+        )
         if not isinstance(state, dict):
             raise
         next_state = {
@@ -1745,6 +1769,12 @@ def handle_intuitive_command(command_json: str, state: dict):
             "revision": int(state.get("revision", 0)) + 1,
         }
         return _intuitive_render_outputs(next_state)
+    if command.get("type") == "fit_overall_to_viewport":
+        gr.Info(
+            "保存範囲を "
+            f"{utils.format_timestamp(next_state['overall_start'])}〜"
+            f"{utils.format_timestamp(next_state['overall_end'])} に設定しました。"
+        )
     if command.get("type") == "set_viewport" or resume_for_tool:
         try:
             next_state, preview, transcript, info = _refresh_intuitive_source(next_state)
@@ -3056,6 +3086,15 @@ button#intuitive-preview-result, #intuitive-preview-result button {
 .intuitive-edit-mode-toggle.is-on {
   background: var(--primary-500); color: #fff; border-color: var(--primary-500);
 }
+.intuitive-fit-overall-button {
+  flex: 0 0 auto; padding: .18rem .55rem; border-radius: .35rem;
+  border: 1px solid var(--border-color-primary);
+  background: var(--button-secondary-background-fill); color: var(--body-text-color);
+  font-size: .78rem; cursor: pointer; white-space: nowrap;
+}
+.intuitive-fit-overall-button:hover {
+  border-color: var(--primary-500); color: var(--primary-500);
+}
 /* B: with editing OFF (default), handles look inert so it's clear a plain
    click on the track only seeks. The timeline toolbox's tool buttons stay
    dimmed for the same "off" affordance, but MUST remain clickable: pressing
@@ -3315,9 +3354,24 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     }));
     requestAnimationFrame(() => button.click());
     const started = performance.now();
+    const AWAIT_REVISION_TIMEOUT_MS = 15000;
     const awaitRevision = () => {
       const current = editorMeta();
-      if ((current && current.revision !== previousRevision) || performance.now() - started > 60000) {
+      const elapsed = performance.now() - started;
+      if (current && current.revision !== previousRevision) {
+        commandBusy = false;
+        flushCommandQueue();
+      } else if (elapsed > AWAIT_REVISION_TIMEOUT_MS) {
+        // Self-recovery safety net: if the server-side revision never
+        // advances (dropped network response, unexpected server exception
+        // that somehow still slips past handle_intuitive_command's own
+        // catch-all), don't let commandBusy stay stuck forever -- that would
+        // silently freeze every subsequent command (including viewport
+        // drags) until the page is reloaded.
+        console.warn(
+          '[intuitive-editor] revision did not advance within',
+          AWAIT_REVISION_TIMEOUT_MS, 'ms; releasing the command queue.'
+        );
         commandBusy = false;
         flushCommandQueue();
       } else {
@@ -3491,6 +3545,15 @@ _INTUITIVE_EDITOR_JS = r"""() => {
       event.preventDefault();
       if (!meta || meta.previewMode === 'result') return;
       send({type: 'set_timeline_edit_mode', enabled: !meta.timelineEditMode});
+      return;
+    }
+    const fitOverallButton = event.target.closest('[data-intuitive-fit-overall]');
+    if (fitOverallButton) {
+      event.preventDefault();
+      if (!meta || meta.previewMode === 'result') return;
+      // Same "pressing this button in the timeline toolbox is itself an
+      // edit gesture" rule as the 4 tool buttons.
+      send({type: 'fit_overall_to_viewport', enable_timeline_edit_mode: true});
       return;
     }
     const tool = event.target.closest('[data-intuitive-tool]');

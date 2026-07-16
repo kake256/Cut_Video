@@ -802,6 +802,89 @@ class ClipPlanTest(unittest.TestCase):
             "クリックで編集モードをONにして選択します。", zoom_on
         )
 
+    def test_overview_label_clarifies_viewport_does_not_change_save_range(self):
+        state = self._intuitive_state()
+        overview = render_intuitive_state_overview(state)
+        self.assertIn("表示範囲（保存範囲は変わりません）", overview)
+
+        zoom = render_intuitive_state_zoom(state)
+        self.assertIn("data-intuitive-fit-overall", zoom)
+        self.assertIn("保存範囲を表示範囲に合わせる", zoom)
+
+    def test_fit_overall_to_viewport_sets_save_range_to_current_display_range(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_viewport", start=30.0, end=70.0
+        )
+        self.assertEqual((state["overall_start"], state["overall_end"]), (10.0, 100.0))
+
+        state = self._intuitive_command(
+            state, "fit_overall_to_viewport", enable_timeline_edit_mode=True,
+        )
+
+        self.assertEqual((state["overall_start"], state["overall_end"]), (30.0, 70.0))
+        self.assertTrue(state["timeline_edit_mode"])
+
+    def test_fit_overall_to_viewport_clamps_to_duration_bounds(self):
+        state = self._intuitive_state()  # duration=200.0
+        state = self._intuitive_command(
+            state, "set_viewport", start=-50.0, end=300.0
+        )
+        self.assertEqual(
+            (state["viewport_start"], state["viewport_end"]), (0.0, 200.0)
+        )
+
+        state = self._intuitive_command(state, "fit_overall_to_viewport")
+
+        self.assertEqual((state["overall_start"], state["overall_end"]), (0.0, 200.0))
+
+    def test_fit_overall_to_viewport_clips_exclusions_and_remaps_selection(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "add_exclusion", start=15.0, end=18.0
+        )
+        state = self._intuitive_command(
+            state, "add_exclusion", start=60.0, end=65.0
+        )
+        cut_id_outside = state["exclusions"][0]["id"]
+        cut_id_inside = state["exclusions"][1]["id"]
+        state = self._intuitive_command(
+            state, "select_boundary", kind="exclusion_start", id=cut_id_outside
+        )
+
+        # Shrink the viewport so it no longer covers the first cut (15-18)
+        # but still covers the second (60-65).
+        state = self._intuitive_command(
+            state, "set_viewport", start=30.0, end=90.0
+        )
+        state = self._intuitive_command(state, "fit_overall_to_viewport")
+
+        self.assertEqual((state["overall_start"], state["overall_end"]), (30.0, 90.0))
+        remaining_ids = {cut["id"] for cut in state["exclusions"]}
+        self.assertNotIn(cut_id_outside, remaining_ids)
+        self.assertIn(cut_id_inside, remaining_ids)
+        # The boundary selection pointed at the now-clipped-away cut, so it
+        # must be safely dropped (existing _remap_intuitive_boundary rule),
+        # not left dangling on a nonexistent id.
+        self.assertIsNone(state["selected_boundary"])
+
+    def test_fit_overall_to_viewport_notifies_the_user(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_viewport", start=20.0, end=80.0
+        )
+        command = {
+            "type": "fit_overall_to_viewport",
+            "revision": state["revision"], "nonce": state["nonce"],
+        }
+        with patch("app.gr.Info") as info:
+            outputs = handle_intuitive_command(command, state)
+        recovered = outputs[0]
+        self.assertEqual((recovered["overall_start"], recovered["overall_end"]), (20.0, 80.0))
+        info.assert_called_once()
+        self.assertIn("00:00:20", info.call_args.args[0])
+        self.assertIn("00:01:20", info.call_args.args[0])
+
     def test_adjust_selected_works_for_every_boundary_kind(self):
         """Bug 2 regression: 前へ/後ろへ must move overall_start, overall_end,
         pending_cut_start, and both ends of an existing exclusion -- not just
@@ -1160,6 +1243,36 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(recovered["overall_start"], state["overall_start"])
         self.assertEqual(recovered["overall_end"], state["overall_end"])
         warning.assert_called_once()
+
+    def test_intuitive_bridge_recovers_from_unexpected_non_gr_error_exception(self):
+        """FIFO deadlock regression: any exception escaping
+        dispatch_intuitive_command -- not just gr.Error -- must still
+        advance revision and complete the Gradio callback normally.
+        Letting it propagate would fail the callback without ever updating
+        the toolbox's data-revision, so the JS awaitRevision loop that
+        gates the next queued command never sees a change and every
+        subsequent command (including viewport drags) stops being sent
+        until the page is reloaded."""
+        state = self._intuitive_state()
+        command = {
+            "type": "set_tool", "tool": "overall_start",
+            "revision": state["revision"], "nonce": state["nonce"],
+        }
+
+        with (
+            patch(
+                "app.dispatch_intuitive_command",
+                side_effect=TypeError("boom: not a gr.Error"),
+            ),
+            patch("app.gr.Warning") as warning,
+        ):
+            outputs = handle_intuitive_command(command, state)
+
+        recovered = outputs[0]
+        self.assertEqual(recovered["revision"], state["revision"] + 1)
+        warning.assert_called_once()
+        self.assertIn("TypeError", warning.call_args.args[0])
+        self.assertNotIn("boom", warning.call_args.args[0])
 
     def test_intuitive_bridge_rejects_invalid_json_shapes_and_recovers_refresh(self):
         state = self._intuitive_state()
@@ -2081,6 +2194,17 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("font-variant-numeric: tabular-nums", _APP_CSS)
         self.assertIn("text-transform: uppercase", _APP_CSS)
         self.assertNotIn("#ff8a00", _APP_CSS)
+        # FIFO deadlock regression: awaitRevision must self-recover (and warn)
+        # if the server-side revision never advances, instead of leaving
+        # commandBusy stuck forever.
+        self.assertIn("AWAIT_REVISION_TIMEOUT_MS", _INTUITIVE_EDITOR_JS)
+        self.assertIn("console.warn(", _INTUITIVE_EDITOR_JS)
+        self.assertIn("commandBusy = false", _INTUITIVE_EDITOR_JS)
+        # "fit overall to viewport" button -- FIFO wiring in the timeline
+        # toolbox, mirroring the tool buttons' auto-enable-edit-mode rule.
+        self.assertIn("data-intuitive-fit-overall", _INTUITIVE_EDITOR_JS)
+        self.assertIn("type: 'fit_overall_to_viewport'", _INTUITIVE_EDITOR_JS)
+        self.assertIn(".intuitive-fit-overall-button", _APP_CSS)
         self.assertIn("document.addEventListener('click'", _INTUITIVE_EDITOR_JS)
         self.assertIn("document.addEventListener('pointerup'", _INTUITIVE_EDITOR_JS)
         self.assertIn("type: 'add_exclusion'", _INTUITIVE_EDITOR_JS)

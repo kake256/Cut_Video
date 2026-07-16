@@ -4,11 +4,22 @@ import argparse
 import math
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
 
 
 ClipRange = Tuple[float, float]
+
+
+def _remaining_timeout(deadline: Optional[float]) -> Optional[float]:
+    """Return the remaining shared ffmpeg budget or raise consistently."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(["ffmpeg"], 0)
+    return remaining
 
 
 def validate_clip_ranges(
@@ -82,6 +93,7 @@ def cut_clip(
     pad: float = 1.5,
     precise: bool = False,
     duration: Optional[float] = None,
+    timeout_sec: Optional[float] = None,
 ) -> Path:
     s = max(0.0, start - pad)
     e = end + pad
@@ -115,7 +127,7 @@ def cut_clip(
             str(output_path),
         ]
 
-    subprocess.run(cmd, check=True, capture_output=True)
+    subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_sec)
     return output_path
 
 
@@ -126,6 +138,7 @@ def cut_clips(
     precise: bool = False,
     duration: Optional[float] = None,
     pad: float = 0.0,
+    timeout_sec: Optional[float] = None,
 ) -> Path:
     """複数の保持区間を切り出し、時系列順に1本の動画へ連結する。
 
@@ -133,6 +146,10 @@ def cut_clips(
     ``pad`` は削除した中間部分へ食い込まないよう、全体の先頭と末尾に
     だけ適用する。
     """
+    deadline = (
+        None if timeout_sec is None
+        else time.monotonic() + float(timeout_sec)
+    )
     normalized_duration = float(duration) if duration is not None else None
     checked_ranges = validate_clip_ranges(ranges, duration=normalized_duration)
     checked_ranges = _apply_outer_padding(checked_ranges, pad, normalized_duration)
@@ -149,6 +166,7 @@ def cut_clips(
             pad=0.0,
             precise=precise,
             duration=normalized_duration,
+            timeout_sec=_remaining_timeout(deadline),
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,6 +185,7 @@ def cut_clips(
                 pad=0.0,
                 precise=precise,
                 duration=normalized_duration,
+                timeout_sec=_remaining_timeout(deadline),
             )
             segment_paths.append(segment_path)
 
@@ -184,7 +203,10 @@ def cut_clips(
             "-c", "copy",
             str(staged_output),
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(
+            cmd, check=True, capture_output=True,
+            timeout=_remaining_timeout(deadline),
+        )
         staged_output.replace(output_path)
 
     return output_path

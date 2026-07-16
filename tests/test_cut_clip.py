@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cut_clip import cut_clips, validate_clip_ranges
+from cut_clip import cut_clip, cut_clips, validate_clip_ranges
 
 
 class ValidateClipRangesTests(unittest.TestCase):
@@ -36,13 +36,30 @@ class ValidateClipRangesTests(unittest.TestCase):
 
 
 class CutClipsTests(unittest.TestCase):
+    @patch("cut_clip.subprocess.run")
+    def test_cut_clip_passes_optional_timeout_to_ffmpeg(self, mock_run):
+        output = Path("out.mp4")
+
+        cut_clip(
+            Path("input.mp4"), 1, 2, output, pad=0,
+            timeout_sec=12.5,
+        )
+
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], 12.5)
+
+        mock_run.reset_mock()
+        cut_clip(Path("input.mp4"), 1, 2, output, pad=0)
+        self.assertIsNone(mock_run.call_args.kwargs["timeout"])
+
+    @patch("cut_clip.time.monotonic", side_effect=[100.0, 102.0])
     @patch("cut_clip.cut_clip")
-    def test_single_range_uses_existing_cut_clip(self, mock_cut_clip):
+    def test_single_range_uses_existing_cut_clip(self, mock_cut_clip, _monotonic):
         output = Path("out.mp4")
         mock_cut_clip.return_value = output
 
         result = cut_clips(
-            Path("input.mp4"), [(10, 20)], output, precise=True, duration=100, pad=1.5
+            Path("input.mp4"), [(10, 20)], output, precise=True, duration=100,
+            pad=1.5, timeout_sec=30,
         )
 
         self.assertEqual(result, output)
@@ -54,11 +71,15 @@ class CutClipsTests(unittest.TestCase):
             pad=0.0,
             precise=True,
             duration=100,
+            timeout_sec=28.0,
         )
 
+    @patch("cut_clip.time.monotonic", side_effect=[100.0, 101.0, 110.0, 120.0])
     @patch("cut_clip.subprocess.run")
     @patch("cut_clip.cut_clip")
-    def test_multiple_ranges_cut_and_concat(self, mock_cut_clip, mock_run):
+    def test_multiple_ranges_cut_and_concat(
+        self, mock_cut_clip, mock_run, _monotonic
+    ):
         def create_segment(*args, **kwargs):
             output_path = args[3]
             output_path.touch()
@@ -80,6 +101,7 @@ class CutClipsTests(unittest.TestCase):
                 output,
                 precise=False,
                 duration=60,
+                timeout_sec=45,
             )
 
             self.assertEqual(result, output)
@@ -88,14 +110,36 @@ class CutClipsTests(unittest.TestCase):
             first_call, second_call = mock_cut_clip.call_args_list
             self.assertEqual(first_call.args[1:3], (0.0, 25.0))
             self.assertEqual(second_call.args[1:3], (35.0, 60.0))
+            self.assertEqual(first_call.kwargs["timeout_sec"], 44.0)
+            self.assertEqual(second_call.kwargs["timeout_sec"], 35.0)
             concat_cmd = mock_run.call_args.args[0]
             self.assertEqual(concat_cmd[1:7], ["-y", "-f", "concat", "-safe", "0", "-i"])
             self.assertEqual(concat_cmd[-3:-1], ["-c", "copy"])
+            self.assertEqual(mock_run.call_args.kwargs["timeout"], 25.0)
             self.assertFalse(any(Path(temp_dir).glob("cut_video_*")))
 
+    @patch("cut_clip.time.monotonic", side_effect=[100.0, 106.0])
+    @patch("cut_clip.cut_clip")
+    def test_total_timeout_can_expire_before_the_next_ffmpeg(
+        self, mock_cut_clip, _monotonic
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "result.mp4"
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                cut_clips(
+                    Path("input.mp4"), [(0, 5)], output, timeout_sec=5
+                )
+
+        mock_cut_clip.assert_not_called()
+        self.assertEqual(raised.exception.cmd, ["ffmpeg"])
+        self.assertEqual(raised.exception.timeout, 0)
+
+    @patch("cut_clip.time.monotonic")
     @patch("cut_clip.subprocess.run")
     @patch("cut_clip.cut_clip")
-    def test_temporary_files_are_removed_when_concat_fails(self, mock_cut_clip, mock_run):
+    def test_temporary_files_are_removed_when_concat_fails(
+        self, mock_cut_clip, mock_run, monotonic
+    ):
         def create_segment(*args, **kwargs):
             args[3].touch()
             return args[3]
@@ -109,6 +153,12 @@ class CutClipsTests(unittest.TestCase):
                 cut_clips(Path("input.mp4"), [(0, 5), (10, 15)], output)
             self.assertFalse(output.exists())
             self.assertFalse(any(Path(temp_dir).glob("cut_video_*")))
+        monotonic.assert_not_called()
+        self.assertTrue(all(
+            call.kwargs["timeout_sec"] is None
+            for call in mock_cut_clip.call_args_list
+        ))
+        self.assertIsNone(mock_run.call_args.kwargs["timeout"])
 
 
 if __name__ == "__main__":

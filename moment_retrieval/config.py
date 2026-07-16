@@ -1,6 +1,7 @@
+import os
 from pathlib import Path
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(os.environ.get("CUT_VIDEO_DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "index.db"
 TEXT_INDEX_PATH = DATA_DIR / "text.index"
 

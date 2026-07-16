@@ -105,7 +105,7 @@ python cut_clip.py --video input.mp4 --start 123.4 --end 156.7 --output clip.mp4
 |---|---|
 | `data/index.db` | メタデータ・文字起こし (SQLite) |
 | `data/text.index` | 埋め込みベクトル (FAISS) |
-| `data/previews/` | プレビュー用の一時クリップ |
+| `data/previews/` | プレビューキャッシュ（最大8 GiB・200ファイルをLRUで自動管理） |
 | `data/thumbnails/` | 動画選択メニュー用のローカルサムネイルキャッシュ |
 | `clips/` | 保存したクリップ (既定) |
 
@@ -118,6 +118,16 @@ python cut_clip.py --video input.mp4 --start 123.4 --end 156.7 --output clip.mp4
 - プレビューは高速コピー切り出しのため、開始位置がキーフレーム単位で1〜2秒ずれて見えることがある
   (保存時のフレーム精度モードではずれない)
 - pyarrowはWindowsでのクラッシュ回避のため16.1.0に固定している
+
+## ブラウザE2E（開発者向け）
+
+合成動画と隔離DBだけを使用し、実際の `data/` や動画には触れません。Microsoft Edgeと
+ffmpegを用意してから次を実行してください（未導入時は理由付きでskipされます）。
+
+```powershell
+.\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\venv\Scripts\python.exe -m unittest tests.test_intuitive_editor_browser -v
+```
 
 ## ライセンス
 

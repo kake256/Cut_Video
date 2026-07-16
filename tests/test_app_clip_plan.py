@@ -1,7 +1,20 @@
+import copy
+import os
 import pathlib
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+# app builds its Gradio choices at import time.  Always isolate those reads and
+# any DB initialization from the user's real data directory.
+_TEST_DATA_DIR = tempfile.TemporaryDirectory(prefix="cut_video_unit_data_")
+unittest.addModuleCleanup(_TEST_DATA_DIR.cleanup)
+os.environ["CUT_VIDEO_DATA_DIR"] = _TEST_DATA_DIR.name
 
 import gradio as gr
 
@@ -16,6 +29,8 @@ from app import (
     _clip_plan_exclusions,
     _clip_plan_ranges,
     _intuitive_preview_path,
+    _multi_preview_path,
+    _preview_path,
     _load_intuitive_search_result,
     _new_intuitive_state,
     adjust_exclusion_time,
@@ -29,10 +44,12 @@ from app import (
     exclude_clip_range,
     list_video_choices,
     load_intuitive_video,
+    make_preview,
     intuitive_state_to_clip_plan,
     on_intuitive_search_select,
     parse_video_choice,
     preview_intuitive_editor,
+    preview_clip_plan,
     remove_clip_exclusion,
     render_clip_plan_timeline,
     render_intuitive_exclusion_list,
@@ -68,6 +85,38 @@ class ClipPlanTest(unittest.TestCase):
             10.0,
             100.0,
         )
+
+    def test_app_runtime_files_use_the_isolated_config_data_directory(self):
+        expected = pathlib.Path(_TEST_DATA_DIR.name)
+        self.assertEqual(app_module.config.DATA_DIR, expected)
+        self.assertEqual(app_module.PREVIEW_DIR, expected / "previews")
+        self.assertEqual(app_module.THUMBNAIL_DIR, expected / "thumbnails")
+        self.assertEqual(app_module.INDEX_JOB_PIDFILE, expected / "index_job.pid")
+        self.assertIsNone(app_module._crash_log)
+
+    def test_data_directory_environment_override_and_default(self):
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        command = [
+            sys.executable,
+            "-c",
+            "from moment_retrieval import config; print(config.DATA_DIR)",
+        ]
+        default_env = os.environ.copy()
+        default_env.pop("CUT_VIDEO_DATA_DIR", None)
+        default = subprocess.run(
+            command, cwd=repo_root, env=default_env,
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(default.stdout.strip(), "data")
+
+        isolated = pathlib.Path(_TEST_DATA_DIR.name) / "override-check"
+        override_env = {**default_env, "CUT_VIDEO_DATA_DIR": str(isolated)}
+        overridden = subprocess.run(
+            command, cwd=repo_root, env=override_env,
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(pathlib.Path(overridden.stdout.strip()), isolated)
+        self.assertFalse(isolated.exists())
 
     @staticmethod
     def _intuitive_command(state, command_type, **values):
@@ -255,11 +304,12 @@ class ClipPlanTest(unittest.TestCase):
                 ["video-a", "video-b"], "", event
             )
 
-        self.assertEqual(len(output), 13)
+        self.assertEqual(len(output), 14)
         self.assertEqual(output[0]["selected_index"], 1)
         self.assertEqual(output[1], "video-b")
         self.assertEqual(output[2], "<div>cards</div>")
-        self.assertEqual(output[3:], load_outputs)
+        self.assertEqual(output[3:13], load_outputs)
+        self.assertEqual(output[13]["value"], "video-b")
         load.assert_called_once_with("video-b")
         build_gallery.assert_called_once_with("", "video-b")
 
@@ -267,6 +317,17 @@ class ClipPlanTest(unittest.TestCase):
             select_intuitive_video_from_gallery(["__all_videos__"], "", gr.SelectData(
                 None, {"index": 0, "value": None, "selected": True}
             ))
+
+    def test_intuitive_load_wrapper_synchronizes_search_target_after_success(self):
+        load_outputs = tuple(f"load-{index}" for index in range(10))
+        with patch(
+            "app.load_intuitive_editor", return_value=load_outputs
+        ) as load:
+            output = app_module.load_intuitive_editor_with_search_target("video-a")
+
+        self.assertEqual(output[:-1], load_outputs)
+        self.assertEqual(output[-1]["value"], "video-a")
+        load.assert_called_once_with("video-a")
 
     def test_intuitive_picker_refresh_keeps_all_only_in_search_target(self):
         gallery = gr.update(
@@ -284,6 +345,32 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(fallback_choices, [("sample.mp4  —  00:01:00", "video-a")])
         self.assertEqual(search_choices[0], ("すべての動画", "__all_videos__"))
         self.assertEqual(search_choices[1:], fallback_choices)
+
+    def test_intuitive_picker_refresh_preserves_explicit_search_target(self):
+        gallery = gr.update(value=[], selected_index=None)
+        with (
+            patch(
+                "app.build_intuitive_video_gallery",
+                return_value=(gallery, [], "<div>empty filter</div>"),
+            ),
+            patch(
+                "app.list_video_choices",
+                return_value=[
+                    ("すべての動画", "__all_videos__"),
+                    ("kept.mp4  —  00:01:00", "video-kept"),
+                ],
+            ),
+        ):
+            output = refresh_intuitive_video_picker(
+                "no-match", "video-a", "video-kept"
+            )
+
+        search_update = output[4]
+        self.assertEqual(search_update["value"], "video-kept")
+        self.assertIn(
+            ("kept.mp4  —  00:01:00", "video-kept"),
+            search_update["choices"],
+        )
 
     def test_middle_exclusion_splits_selection(self):
         plan, _, _ = reset_clip_plan(0.0, 60.0)
@@ -455,6 +542,10 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn('data-time-granularity="segment"', rendered)
         self.assertIn("時刻指定: 単語単位＋発話区間単位", rendered)
         self.assertIn("intuitive-segment", rendered)
+        self.assertEqual(rendered.count('role="button"'), 2)
+        self.assertEqual(rendered.count('tabindex="0"'), 1)
+        self.assertEqual(rendered.count('tabindex="-1"'), 1)
+        self.assertIn('aria-label="単語時刻:', rendered)
 
     def test_intuitive_transcript_never_invents_missing_word_timestamps(self):
         segments = [
@@ -716,7 +807,127 @@ class ClipPlanTest(unittest.TestCase):
         manually_seeded = self._intuitive_command(
             manually_seeded, "remove_exclusion", id="cut-1"
         )
-        self.assertTrue(manually_seeded["edit_dirty"])
+        self.assertFalse(manually_seeded["edit_dirty"])
+
+    def test_intuitive_history_tracks_only_semantic_plan_edits(self):
+        state = self._intuitive_state()
+        for command, values in (
+            ("set_tool", {"tool": "overall_start"}),
+            ("set_viewport", {"start": 20.0, "end": 80.0}),
+            ("set_transcript_focus", {"time": 50.0}),
+            ("select_boundary", {"kind": "overall_start"}),
+        ):
+            state = self._intuitive_command(state, command, **values)
+        self.assertEqual(state["undo_stack"], [])
+        self.assertEqual(state["redo_stack"], [])
+
+        state = self._intuitive_command(
+            state, "set_boundary", kind="overall_start", time=25.0
+        )
+        self.assertEqual(len(state["undo_stack"]), 1)
+        self.assertEqual(state["undo_stack"][0]["overall_start"], 10.0)
+        self.assertEqual(state["redo_stack"], [])
+
+    def test_intuitive_undo_redo_and_branch_clear(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_boundary", kind="overall_start", time=25.0
+        )
+        state["active_tool"] = "exclude_end"
+        state["pending_cut_start"] = 30.0
+        state["selected_boundary"] = {"kind": "overall_start"}
+        state["selected_word"] = {"start": 20.0, "end": 21.0}
+
+        undone = self._intuitive_command(state, "undo")
+        self.assertEqual(undone["overall_start"], 10.0)
+        self.assertFalse(undone["edit_dirty"])
+        self.assertEqual(len(undone["redo_stack"]), 1)
+        for key in (
+            "active_tool", "pending_cut_start", "selected_boundary", "selected_word"
+        ):
+            self.assertIsNone(undone[key])
+
+        redone = self._intuitive_command(undone, "redo")
+        self.assertEqual(redone["overall_start"], 25.0)
+        self.assertTrue(redone["edit_dirty"])
+
+        undone = self._intuitive_command(redone, "undo")
+        branched = self._intuitive_command(
+            undone, "set_boundary", kind="overall_end", time=90.0
+        )
+        self.assertEqual(branched["redo_stack"], [])
+        self.assertEqual(branched["overall_start"], 10.0)
+        self.assertEqual(branched["overall_end"], 90.0)
+
+    def test_intuitive_history_is_capped_and_failed_edit_is_non_destructive(self):
+        state = self._intuitive_state()
+        for index in range(app_module._INTUITIVE_HISTORY_LIMIT + 5):
+            state = self._intuitive_command(
+                state, "set_boundary", kind="overall_start", time=11.0 + index
+            )
+        self.assertEqual(
+            len(state["undo_stack"]), app_module._INTUITIVE_HISTORY_LIMIT
+        )
+        before = copy.deepcopy(state)
+        with self.assertRaises(gr.Error):
+            self._intuitive_command(
+                state, "add_exclusion",
+                start=state["overall_start"], end=state["overall_end"],
+            )
+        self.assertEqual(state, before)
+
+    def test_intuitive_semantic_dirty_signature_ignores_exclusion_ids(self):
+        state = self._intuitive_state()
+        state["exclusions"] = [{"id": "current-id", "start": 20.0, "end": 30.0}]
+        state["baseline_plan"] = {
+            "overall_start": 10.0,
+            "overall_end": 100.0,
+            "exclusions": [{"id": "saved-id", "start": 20.0, "end": 30.0}],
+        }
+        state = self._intuitive_command(state, "set_tool", tool="overall_start")
+        self.assertFalse(state["edit_dirty"])
+        self.assertEqual(state["undo_stack"], [])
+
+    def test_intuitive_save_baseline_makes_undo_dirty_and_redo_clean(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_boundary", kind="overall_start", time=25.0
+        )
+        revision = state["revision"]
+        undo_stack = copy.deepcopy(state["undo_stack"])
+        with patch("app.on_save", return_value="saved.mp4"):
+            saved_path, saved_state, toolbar = save_intuitive_editor(
+                state, True, "clips", "history.mp4"
+            )
+        self.assertEqual(saved_path, "saved.mp4")
+        self.assertFalse(saved_state["edit_dirty"])
+        self.assertEqual(saved_state["revision"], revision)
+        self.assertEqual(saved_state["undo_stack"], undo_stack)
+        self.assertIn('data-edit-dirty="false"', toolbar)
+
+        undone = self._intuitive_command(saved_state, "undo")
+        self.assertTrue(undone["edit_dirty"])
+        self.assertEqual(undone["overall_start"], 10.0)
+        redone = self._intuitive_command(undone, "redo")
+        self.assertFalse(redone["edit_dirty"])
+        self.assertEqual(redone["overall_start"], 25.0)
+
+        original = copy.deepcopy(state)
+        with patch("app.on_save", side_effect=OSError("synthetic failure")):
+            with self.assertRaises(OSError):
+                save_intuitive_editor(state, True, "clips", "failure.mp4")
+        self.assertEqual(state, original)
+
+    def test_intuitive_result_preview_rejects_undo_without_history_change(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_boundary", kind="overall_start", time=25.0
+        )
+        state["preview_mode"] = "result"
+        before = copy.deepcopy(state)
+        with self.assertRaises(gr.Error):
+            self._intuitive_command(state, "undo")
+        self.assertEqual(state, before)
 
     def test_timeline_edit_mode_defaults_off_and_toggles_via_fifo(self):
         state = self._intuitive_state()
@@ -811,6 +1022,32 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("data-intuitive-fit-overall", zoom)
         self.assertIn("保存範囲を表示範囲に合わせる", zoom)
 
+    def test_intuitive_timeline_sliders_expose_keyboard_accessibility_state(self):
+        state = self._intuitive_state()
+        overview = render_intuitive_state_overview(state)
+        self.assertEqual(overview.count('data-viewport-drag='), 3)
+        self.assertEqual(overview.count('role="slider"'), 3)
+        self.assertIn('role="group"', overview)
+        self.assertEqual(overview.count('tabindex="0"'), 3)
+        for attribute in (
+            "aria-valuemin", "aria-valuemax", "aria-valuenow", "aria-valuetext"
+        ):
+            self.assertIn(attribute, overview)
+
+        zoom_off = render_intuitive_state_zoom(state)
+        self.assertEqual(zoom_off.count('role="slider"'), 2)
+        self.assertIn('aria-disabled="true"', zoom_off)
+        self.assertIn('tabindex="-1"', zoom_off)
+        state["timeline_edit_mode"] = True
+        state["exclusions"] = [{"id": "cut-a", "start": 20.0, "end": 30.0}]
+        zoom_on = render_intuitive_state_zoom(state)
+        self.assertIn('role="group"', zoom_on)
+        self.assertEqual(zoom_on.count('role="slider"'), 4)
+        self.assertEqual(zoom_on.count('aria-disabled="false"'), 4)
+        self.assertEqual(zoom_on.count('data-boundary-time='), 4)
+        self.assertIn('aria-label="全体開始"', zoom_on)
+        self.assertIn('aria-label="途中カットの終了"', zoom_on)
+
     def test_fit_overall_to_viewport_sets_save_range_to_current_display_range(self):
         state = self._intuitive_state()
         state = self._intuitive_command(
@@ -867,6 +1104,96 @@ class ClipPlanTest(unittest.TestCase):
         # must be safely dropped (existing _remap_intuitive_boundary rule),
         # not left dangling on a nonexistent id.
         self.assertIsNone(state["selected_boundary"])
+
+    def test_fit_overall_rejects_viewport_fully_covered_by_existing_exclusion(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "add_exclusion", start=20.0, end=80.0
+        )
+        state = self._intuitive_command(
+            state, "set_viewport", start=30.0, end=50.0
+        )
+        cut_id = state["exclusions"][0]["id"]
+        state = self._intuitive_command(
+            state, "select_boundary", kind="exclusion_start", id=cut_id
+        )
+        original = copy.deepcopy(state)
+        command = {
+            "type": "fit_overall_to_viewport",
+            "enable_timeline_edit_mode": True,
+            "revision": state["revision"],
+            "nonce": state["nonce"],
+        }
+
+        with self.assertRaisesRegex(
+            gr.Error, "全体範囲のすべてを除外することはできません"
+        ):
+            dispatch_intuitive_command(command, state)
+
+        self.assertEqual(state, original)
+
+        with (
+            patch("app.gr.Warning") as warning,
+            patch("app.gr.Info") as info,
+        ):
+            outputs = handle_intuitive_command(command, state)
+
+        recovered = outputs[0]
+        self.assertEqual(recovered["revision"], original["revision"] + 1)
+        for key in (
+            "overall_start", "overall_end", "viewport_start", "viewport_end",
+            "exclusions", "selected_boundary", "edit_dirty",
+            "timeline_edit_mode",
+        ):
+            self.assertEqual(recovered[key], original[key])
+        warning.assert_called_once()
+        self.assertIn(
+            "全体範囲のすべてを除外することはできません。",
+            warning.call_args.args[0],
+        )
+        info.assert_not_called()
+
+    def test_entire_exclusion_invariant_covers_boundary_shrink_and_adjustment(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "add_exclusion", start=20.0, end=80.0
+        )
+        state = self._intuitive_command(
+            state, "set_boundary", kind="overall_start", time=20.0
+        )
+        before_shrink = copy.deepcopy(state)
+        with self.assertRaisesRegex(gr.Error, "すべてを除外"):
+            self._intuitive_command(
+                state, "set_boundary", kind="overall_end", time=80.0
+            )
+        self.assertEqual(state, before_shrink)
+
+        state = self._intuitive_command(
+            state, "select_boundary", kind="overall_end"
+        )
+        before_adjust = copy.deepcopy(state)
+        with self.assertRaisesRegex(gr.Error, "すべてを除外"):
+            self._intuitive_command(state, "adjust_selected", delta=-20.0)
+        self.assertEqual(state, before_adjust)
+
+        exclusion_state = self._intuitive_state()
+        exclusion_state = self._intuitive_command(
+            exclusion_state, "add_exclusion", start=20.0, end=80.0
+        )
+        cut_id = exclusion_state["exclusions"][0]["id"]
+        exclusion_state = self._intuitive_command(
+            exclusion_state, "set_boundary", kind="exclusion_start",
+            id=cut_id, time=10.0,
+        )
+        exclusion_state = self._intuitive_command(
+            exclusion_state, "select_boundary", kind="exclusion_end", id=cut_id
+        )
+        before_exclusion_adjust = copy.deepcopy(exclusion_state)
+        with self.assertRaisesRegex(gr.Error, "すべてを除外"):
+            self._intuitive_command(
+                exclusion_state, "adjust_selected", delta=20.0
+            )
+        self.assertEqual(exclusion_state, before_exclusion_adjust)
 
     def test_fit_overall_to_viewport_notifies_the_user(self):
         state = self._intuitive_state()
@@ -1015,6 +1342,7 @@ class ClipPlanTest(unittest.TestCase):
             state, "set_current_position", time=22.25
         )
         self.assertEqual(state["overall_start"], 22.25)
+        self.assertEqual(state["playhead_sec"], 22.25)
         self.assertEqual(state["selected_boundary"], {"kind": "overall_start"})
 
         state = self._intuitive_command(
@@ -1037,6 +1365,31 @@ class ClipPlanTest(unittest.TestCase):
             [(cut["start"], cut["end"]) for cut in state["exclusions"]],
             [(45.0, 50.0)],
         )
+
+    def test_intuitive_commands_sync_source_playhead_but_ignore_result_time(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_tool", tool="overall_start", playhead_sec=42.5
+        )
+        self.assertEqual(state["playhead_sec"], 42.5)
+
+        state = self._intuitive_command(
+            state, "set_tool", tool="overall_end", playhead_sec=500.0
+        )
+        self.assertEqual(state["playhead_sec"], state["preview_end"])
+        with self.assertRaises(gr.Error):
+            self._intuitive_command(
+                state, "set_tool", tool="overall_start",
+                playhead_sec=float("nan"),
+            )
+
+        result_state = self._intuitive_state()
+        result_state["preview_mode"] = "result"
+        result_state["playhead_sec"] = 17.0
+        result_state = self._intuitive_command(
+            result_state, "set_tool", tool="overall_start", playhead_sec=88.0
+        )
+        self.assertEqual(result_state["playhead_sec"], 17.0)
 
     def test_intuitive_new_edit_commands_are_rejected_in_result_mode(self):
         for action in (
@@ -1077,8 +1430,9 @@ class ClipPlanTest(unittest.TestCase):
         toolbar = render_intuitive_toolbar(state)
         zoom = render_intuitive_state_zoom(state)
         self.assertIn("編集ツールを選ぶと元動画へ戻り", toolbar)
-        self.assertEqual(toolbar.count(" disabled"), 0)
+        self.assertEqual(toolbar.count(" disabled"), 2)
         self.assertEqual(zoom.count(" disabled"), 0)
+        self.assertIn('aria-disabled="true"', zoom)
 
     def test_toolbar_status_line_absorbs_the_removed_selected_boundary_box(self):
         """C-1: the standalone "選択中の境界" box was removed; its info now
@@ -1233,6 +1587,7 @@ class ClipPlanTest(unittest.TestCase):
             "end": 21.0,
             "revision": state["revision"],
             "nonce": state["nonce"],
+            "command_id": "invalid-operation",
         }
 
         with patch("app.gr.Warning") as warning:
@@ -1242,7 +1597,34 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(recovered["revision"], state["revision"] + 1)
         self.assertEqual(recovered["overall_start"], state["overall_start"])
         self.assertEqual(recovered["overall_end"], state["overall_end"])
+        self.assertEqual(recovered["last_command_id"], "invalid-operation")
+        self.assertEqual(recovered["last_command_status"], "validation_error")
         warning.assert_called_once()
+
+    def test_intuitive_dispatch_records_successful_command_ack(self):
+        state = self._intuitive_state()
+        next_state = dispatch_intuitive_command({
+            "type": "set_tool",
+            "tool": "overall_start",
+            "revision": state["revision"],
+            "nonce": state["nonce"],
+            "command_id": "successful-operation",
+        }, state)
+
+        self.assertEqual(next_state["last_command_id"], "successful-operation")
+        self.assertEqual(next_state["last_command_status"], "success")
+
+    def test_intuitive_sync_is_read_only_and_echoes_safe_token(self):
+        state = self._intuitive_state()
+        original = copy.deepcopy(state)
+
+        outputs = app_module.sync_intuitive_editor('sync-<unsafe>"', state)
+
+        self.assertEqual(outputs[0], original)
+        self.assertEqual(state, original)
+        self.assertIn(
+            'data-intuitive-sync-token="sync-&lt;unsafe&gt;&quot;"', outputs[-1]
+        )
 
     def test_intuitive_bridge_recovers_from_unexpected_non_gr_error_exception(self):
         """FIFO deadlock regression: any exception escaping
@@ -1257,6 +1639,7 @@ class ClipPlanTest(unittest.TestCase):
         command = {
             "type": "set_tool", "tool": "overall_start",
             "revision": state["revision"], "nonce": state["nonce"],
+            "command_id": "unexpected-operation",
         }
 
         with (
@@ -1270,6 +1653,8 @@ class ClipPlanTest(unittest.TestCase):
 
         recovered = outputs[0]
         self.assertEqual(recovered["revision"], state["revision"] + 1)
+        self.assertEqual(recovered["last_command_id"], "unexpected-operation")
+        self.assertEqual(recovered["last_command_status"], "unexpected_error")
         warning.assert_called_once()
         self.assertIn("TypeError", warning.call_args.args[0])
         self.assertNotIn("boom", warning.call_args.args[0])
@@ -1286,6 +1671,7 @@ class ClipPlanTest(unittest.TestCase):
             "end": 180.0,
             "revision": state["revision"],
             "nonce": state["nonce"],
+            "command_id": "preview-refresh-operation",
         }
         with (
             patch("app._refresh_intuitive_source", side_effect=OSError("failed")),
@@ -1299,6 +1685,34 @@ class ClipPlanTest(unittest.TestCase):
             (state["viewport_start"], state["viewport_end"]),
         )
         self.assertEqual(recovered["revision"], state["revision"] + 1)
+        self.assertEqual(recovered["last_command_id"], "preview-refresh-operation")
+        self.assertEqual(recovered["last_command_status"], "unexpected_error")
+        warning.assert_called_once()
+
+    def test_intuitive_bridge_recovers_after_preview_render_timeout(self):
+        state = self._intuitive_state()
+        command = {
+            "type": "set_viewport",
+            "start": 120.0,
+            "end": 180.0,
+            "revision": state["revision"],
+            "nonce": state["nonce"],
+        }
+        timeout = subprocess.TimeoutExpired(
+            ["ffmpeg"], app_module.PREVIEW_RENDER_TIMEOUT_SEC
+        )
+        with (
+            patch("app._refresh_intuitive_source", side_effect=timeout),
+            patch("app.gr.Warning") as warning,
+        ):
+            outputs = handle_intuitive_command(command, state)
+
+        recovered = outputs[0]
+        self.assertEqual(recovered["revision"], state["revision"] + 1)
+        self.assertEqual(
+            (recovered["viewport_start"], recovered["viewport_end"]),
+            (state["viewport_start"], state["viewport_end"]),
+        )
         warning.assert_called_once()
 
     def test_intuitive_viewport_can_move_outside_initial_preview(self):
@@ -1678,7 +2092,9 @@ class ClipPlanTest(unittest.TestCase):
 
         with patch("app.on_save", return_value="saved.mp4") as save:
             saved = save_intuitive_editor(state, True, "clips", "sample.mp4")
-        self.assertEqual(saved, "saved.mp4")
+        self.assertEqual(saved[0], "saved.mp4")
+        self.assertFalse(saved[1]["edit_dirty"])
+        self.assertEqual(saved[1]["baseline_plan"]["exclusions"][0]["id"], "cut-1")
 
         for unsafe_name in (r"..\outside.mp4", "folder/outside.mp4"):
             with self.assertRaises(gr.Error):
@@ -1824,6 +2240,488 @@ class ClipPlanTest(unittest.TestCase):
         self.assertTrue(first.name.endswith(".mp4"))
         self.assertNotIn("unsafe", first.name)
         self.assertNotEqual(first.name, second.name)
+
+    def test_standard_preview_cache_key_separates_source_version_and_range(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            first_source = root / "one" / "same-name.mp4"
+            second_source = root / "two" / "same-name.mp4"
+            first_source.parent.mkdir()
+            second_source.parent.mkdir()
+            first_source.touch()
+            second_source.touch()
+
+            with patch("app.PREVIEW_DIR", root / "previews"):
+                first = _preview_path("video-a", str(first_source), 10.0, 20.0)
+                reused = _preview_path("video-a", str(first_source), 10.0, 20.0)
+                other_video = _preview_path("video-b", str(second_source), 10.0, 20.0)
+                other_range = _preview_path("video-a", str(first_source), 10.0, 20.1)
+
+                stamp = first_source.stat().st_mtime_ns
+                first_source.write_bytes(b"source grew")
+                os.utime(first_source, ns=(stamp, stamp))
+                resized_source = _preview_path(
+                    "video-a", str(first_source), 10.0, 20.0
+                )
+                os.utime(first_source, ns=(stamp + 1_000_000, stamp + 1_000_000))
+                updated_source = _preview_path(
+                    "video-a", str(first_source), 10.0, 20.0
+                )
+
+            self.assertEqual(first, reused)
+            self.assertEqual(
+                len({first, other_video, other_range, resized_source, updated_source}),
+                5,
+            )
+            self.assertTrue(first.name.startswith("preview_"))
+            self.assertTrue(first.name.endswith(".mp4"))
+            self.assertNotIn("same-name", first.name)
+
+    def test_preview_cache_key_detects_same_size_same_mtime_content_change(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            source = root / "source.mp4"
+            source.write_bytes(b"A" * (64 * 1024 + 17))
+            fixed_stamp = 1_700_000_000_000_000_000
+            os.utime(source, ns=(fixed_stamp, fixed_stamp))
+            with patch("app.PREVIEW_DIR", root / "previews"):
+                before = _preview_path("video-a", str(source), 1.0, 2.0)
+                source.write_bytes(b"B" * (64 * 1024 + 17))
+                os.utime(source, ns=(fixed_stamp, fixed_stamp))
+                after = _preview_path("video-a", str(source), 1.0, 2.0)
+
+            self.assertNotEqual(before, after)
+
+    def test_preview_fingerprint_read_error_falls_back_to_stat_only(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            source = pathlib.Path(temporary_dir) / "source.mp4"
+            source.write_bytes(b"synthetic video bytes")
+            expected = source.stat()
+            with patch.object(pathlib.Path, "open", side_effect=OSError("denied")):
+                stamp, size, fingerprint = app_module._preview_source_version(source)
+
+            self.assertEqual(stamp, expected.st_mtime_ns)
+            self.assertEqual(size, expected.st_size)
+            self.assertIsNone(fingerprint)
+
+    def test_standard_preview_uses_atomic_temp_and_reuses_completed_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            source = root / "source.mp4"
+            source.touch()
+            preview_dir = root / "previews"
+
+            def fake_cut(_source, _start, _end, output, **_kwargs):
+                pathlib.Path(output).write_bytes(b"preview")
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.cut_clip", side_effect=fake_cut) as cut,
+            ):
+                first = make_preview(
+                    str(source), 10.0, 20.0, 60.0, video_id="video-a"
+                )
+                second = make_preview(
+                    str(source), 10.0, 20.0, 60.0, video_id="video-a"
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(cut.call_count, 1)
+            temporary_output = pathlib.Path(cut.call_args.args[3])
+            self.assertNotEqual(temporary_output, pathlib.Path(first))
+            self.assertFalse(temporary_output.exists())
+            self.assertEqual(pathlib.Path(first).read_bytes(), b"preview")
+            self.assertEqual(
+                cut.call_args.kwargs["timeout_sec"],
+                app_module.PREVIEW_RENDER_TIMEOUT_SEC,
+            )
+
+    def test_preview_cache_prunes_by_lru_count_and_total_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            preview_dir = pathlib.Path(temporary_dir)
+            files = [
+                preview_dir / "preview_legacy.mp4",
+                preview_dir / "preview_multi_middle.mp4",
+                preview_dir / "intuitive_newest.mp4",
+            ]
+            for index, path in enumerate(files):
+                path.write_bytes(b"x" * 6)
+                os.utime(path, (100 + index, 100 + index))
+            ignored = preview_dir / "unmanaged.mp4"
+            ignored.write_bytes(b"leave me")
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.PREVIEW_CACHE_MAX_FILES", 2),
+                patch("app.PREVIEW_CACHE_MAX_BYTES", 100),
+            ):
+                app_module._prune_preview_cache()
+
+            self.assertFalse(files[0].exists())
+            self.assertTrue(files[1].exists())
+            self.assertTrue(files[2].exists())
+            self.assertTrue(ignored.exists())
+
+            files[0].write_bytes(b"x" * 6)
+            os.utime(files[0], (100, 100))
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.PREVIEW_CACHE_MAX_FILES", 20),
+                patch("app.PREVIEW_CACHE_MAX_BYTES", 10),
+            ):
+                app_module._prune_preview_cache()
+
+            self.assertFalse(files[0].exists())
+            self.assertFalse(files[1].exists())
+            self.assertTrue(files[2].exists())
+
+    def test_preview_cache_keeps_protected_oversized_output(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            preview_dir = pathlib.Path(temporary_dir)
+            old = preview_dir / "preview_old.mp4"
+            protected = preview_dir / "intuitive_current.mp4"
+            old.write_bytes(b"o")
+            protected.write_bytes(b"x" * 20)
+            os.utime(old, (100, 100))
+            os.utime(protected, (200, 200))
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.PREVIEW_CACHE_MAX_FILES", 1),
+                patch("app.PREVIEW_CACHE_MAX_BYTES", 5),
+            ):
+                app_module._prune_preview_cache(protected=protected)
+
+            self.assertFalse(old.exists())
+            self.assertTrue(protected.exists())
+            self.assertEqual(protected.stat().st_size, 20)
+
+    def test_new_preview_prunes_old_cache_but_never_its_own_output(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            preview_dir = pathlib.Path(temporary_dir)
+            old = preview_dir / "preview_old.mp4"
+            current = preview_dir / "preview_current.mp4"
+            old.write_bytes(b"old")
+            os.utime(old, (100, 100))
+
+            def render(output):
+                pathlib.Path(output).write_bytes(b"oversized current")
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.PREVIEW_CACHE_MAX_FILES", 1),
+                patch("app.PREVIEW_CACHE_MAX_BYTES", 2),
+            ):
+                result = app_module._create_cached_preview(current, render)
+
+            self.assertEqual(result, str(current))
+            self.assertFalse(old.exists())
+            self.assertTrue(current.exists())
+
+    def test_preview_cache_hit_touches_mtime_and_does_not_render(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            preview_dir = pathlib.Path(temporary_dir)
+            cached = preview_dir / "preview_hit.mp4"
+            cached.write_bytes(b"cached")
+            os.utime(cached, (100, 100))
+            before = cached.stat().st_mtime_ns
+
+            def must_not_render(_output):
+                self.fail("cache hit rendered ffmpeg output again")
+
+            with patch("app.PREVIEW_DIR", preview_dir):
+                result = app_module._create_cached_preview(
+                    cached, must_not_render
+                )
+
+            self.assertEqual(result, str(cached))
+            self.assertGreater(cached.stat().st_mtime_ns, before)
+
+    def test_preview_startup_cleanup_removes_only_stale_temp_files(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            preview_dir = pathlib.Path(temporary_dir)
+            stale = preview_dir / "preview_stale.abc.tmp.mp4"
+            recent = preview_dir / "intuitive_recent.xyz.tmp.mp4"
+            stale.write_bytes(b"partial")
+            recent.write_bytes(b"partial")
+            now = 1_000_000.0
+            os.utime(
+                stale,
+                (now - app_module.PREVIEW_TEMP_MAX_AGE_SEC - 1,) * 2,
+            )
+            os.utime(recent, (now - 60,) * 2)
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.PREVIEW_CACHE_MAX_FILES", 0),
+                patch("app.PREVIEW_CACHE_MAX_BYTES", 0),
+            ):
+                app_module._prune_preview_cache(
+                    cleanup_stale_temps=True, now=now
+                )
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(recent.exists())
+
+        with patch("app._prune_preview_cache") as prune:
+            app_module._initialize_preview_cache()
+        prune.assert_called_once_with(cleanup_stale_temps=True)
+
+    def test_preview_prune_skips_stat_and_delete_os_errors(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            preview_dir = pathlib.Path(temporary_dir)
+            stat_error = preview_dir / "preview_stat_error.mp4"
+            delete_error = preview_dir / "preview_delete_error.mp4"
+            removable = preview_dir / "intuitive_removable.mp4"
+            for index, path in enumerate((stat_error, delete_error, removable)):
+                path.write_bytes(b"x")
+                os.utime(path, (100 + index, 100 + index))
+
+            original_stat = pathlib.Path.stat
+            original_unlink = pathlib.Path.unlink
+
+            def flaky_stat(path, *args, **kwargs):
+                if path.name == stat_error.name:
+                    raise OSError("stat failed")
+                return original_stat(path, *args, **kwargs)
+
+            def flaky_unlink(path, *args, **kwargs):
+                if path.name == delete_error.name:
+                    raise OSError("delete failed")
+                return original_unlink(path, *args, **kwargs)
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.PREVIEW_CACHE_MAX_FILES", 0),
+                patch("app.PREVIEW_CACHE_MAX_BYTES", 0),
+                patch.object(pathlib.Path, "stat", new=flaky_stat),
+                patch.object(pathlib.Path, "unlink", new=flaky_unlink),
+            ):
+                app_module._prune_preview_cache()
+
+            self.assertTrue(stat_error.exists())
+            self.assertTrue(delete_error.exists())
+            self.assertFalse(removable.exists())
+
+    def test_preview_timeout_cleans_partial_cache_file(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            source = root / "source.mp4"
+            source.touch()
+            preview_dir = root / "previews"
+
+            def time_out(_source, _start, _end, output, **kwargs):
+                pathlib.Path(output).write_bytes(b"partial")
+                self.assertEqual(
+                    kwargs["timeout_sec"], app_module.PREVIEW_RENDER_TIMEOUT_SEC
+                )
+                raise subprocess.TimeoutExpired(["ffmpeg"], kwargs["timeout_sec"])
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.cut_clip", side_effect=time_out),
+            ):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    make_preview(
+                        str(source), 10.0, 20.0, 60.0, video_id="video-a"
+                    )
+
+            self.assertEqual(list(preview_dir.glob("*.tmp.mp4")), [])
+            self.assertEqual(list(preview_dir.glob("preview_*.mp4")), [])
+            self.assertEqual(app_module._preview_protected_outputs, set())
+
+    def test_preview_striped_locks_serialize_same_output_and_allow_parallel_outputs(self):
+        self.assertEqual(len(app_module._preview_locks), 32)
+        self.assertIsInstance(app_module._preview_locks, tuple)
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            first = root / "preview-a.mp4"
+            second = next(
+                candidate
+                for index in range(100)
+                if (
+                    candidate := root / f"preview-{index}.mp4"
+                ) and app_module._preview_lock_for(candidate)
+                is not app_module._preview_lock_for(first)
+            )
+            parallel_barrier = threading.Barrier(2, timeout=2)
+            errors = []
+
+            def parallel_renderer(output):
+                try:
+                    parallel_barrier.wait()
+                    pathlib.Path(output).write_bytes(b"ok")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(
+                    target=app_module._create_cached_preview,
+                    args=(output, parallel_renderer),
+                )
+                for output in (first, second)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertFalse(errors)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+            same = root / "same.mp4"
+            renderer_entered = threading.Event()
+            release_renderer = threading.Event()
+            render_count = 0
+            render_count_lock = threading.Lock()
+
+            def serialized_renderer(output):
+                nonlocal render_count
+                with render_count_lock:
+                    render_count += 1
+                renderer_entered.set()
+                release_renderer.wait(timeout=2)
+                pathlib.Path(output).write_bytes(b"ok")
+
+            same_threads = [
+                threading.Thread(
+                    target=app_module._create_cached_preview,
+                    args=(same, serialized_renderer),
+                )
+                for _ in range(2)
+            ]
+            same_threads[0].start()
+            self.assertTrue(renderer_entered.wait(timeout=1))
+            same_threads[1].start()
+            time.sleep(0.05)
+            self.assertEqual(render_count, 1)
+            release_renderer.set()
+            for thread in same_threads:
+                thread.join(timeout=3)
+            self.assertEqual(render_count, 1)
+            self.assertTrue(all(not thread.is_alive() for thread in same_threads))
+
+    def test_single_range_clip_plan_passes_video_id_to_preview_cache(self):
+        class FakeConnection:
+            def close(self):
+                pass
+
+        ctx = {
+            "video_id": "video-a",
+            "video_path": r"F:\videos\sample.mp4",
+            "duration": 60.0,
+        }
+        with (
+            patch("app.make_preview", return_value="preview.mp4") as preview,
+            patch("app.db.get_conn", return_value=FakeConnection()),
+            patch("app.region_transcript", return_value="transcript"),
+        ):
+            output = preview_clip_plan(10.0, 20.0, ctx, None)
+
+        preview.assert_called_once_with(
+            ctx["video_path"], 10.0, 20.0, 60.0, video_id="video-a"
+        )
+        self.assertEqual(output[0]["value"], "preview.mp4")
+
+    def test_multi_preview_cache_key_separates_source_version_and_ranges(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            first_source = root / "one" / "same-name.mp4"
+            second_source = root / "two" / "same-name.mp4"
+            first_source.parent.mkdir()
+            second_source.parent.mkdir()
+            first_source.touch()
+            second_source.touch()
+            ranges = [[0.0, 10.0], [20.0, 30.0]]
+
+            with patch("app.PREVIEW_DIR", root / "previews"):
+                first = _multi_preview_path(
+                    "video/../unsafe", str(first_source), ranges
+                )
+                reused = _multi_preview_path(
+                    "video/../unsafe", str(first_source), ranges
+                )
+                other_video = _multi_preview_path(
+                    "video-b", str(second_source), ranges
+                )
+                other_ranges = _multi_preview_path(
+                    "video/../unsafe", str(first_source),
+                    [[0.0, 10.0], [20.0, 30.1]],
+                )
+                stamp = first_source.stat().st_mtime_ns
+                os.utime(first_source, ns=(stamp + 1_000_000, stamp + 1_000_000))
+                updated_source = _multi_preview_path(
+                    "video/../unsafe", str(first_source), ranges
+                )
+
+            self.assertEqual(first, reused)
+            self.assertEqual(
+                len({first, other_video, other_ranges, updated_source}), 4
+            )
+            self.assertTrue(first.name.startswith("preview_multi_"))
+            self.assertNotIn("unsafe", first.name)
+            self.assertNotIn("same-name", first.name)
+
+    def test_multi_preview_is_atomic_reused_and_cleans_failed_temp(self):
+        class FakeConnection:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = pathlib.Path(temporary_dir)
+            source = root / "source.mp4"
+            source.touch()
+            preview_dir = root / "previews"
+            ctx = {
+                "video_id": "video-a",
+                "video_path": str(source),
+                "duration": 60.0,
+            }
+            plan = {
+                "base_start": 0.0,
+                "base_end": 30.0,
+                "ranges": [[0.0, 10.0], [20.0, 30.0]],
+            }
+
+            def fake_cut(_source, _ranges, output, **_kwargs):
+                pathlib.Path(output).write_bytes(b"joined")
+
+            with (
+                patch("app.PREVIEW_DIR", preview_dir),
+                patch("app.cut_clips", side_effect=fake_cut) as cut,
+                patch("app.db.get_conn", return_value=FakeConnection()),
+                patch("app.region_transcript", return_value="transcript"),
+            ):
+                first = preview_clip_plan(0.0, 30.0, ctx, plan)
+                second = preview_clip_plan(0.0, 30.0, ctx, plan)
+
+            self.assertEqual(first[0]["value"], second[0]["value"])
+            self.assertEqual(cut.call_count, 1)
+            self.assertEqual(
+                cut.call_args.kwargs["timeout_sec"],
+                app_module.PREVIEW_RENDER_TIMEOUT_SEC,
+            )
+            temporary_output = pathlib.Path(cut.call_args.args[2])
+            self.assertNotEqual(temporary_output, pathlib.Path(first[0]["value"]))
+            self.assertFalse(temporary_output.exists())
+            self.assertEqual(
+                pathlib.Path(first[0]["value"]).read_bytes(), b"joined"
+            )
+
+            failed_dir = root / "failed-previews"
+
+            def failing_cut(_source, _ranges, output, **_kwargs):
+                pathlib.Path(output).write_bytes(b"partial")
+                raise RuntimeError("concat failed")
+
+            with (
+                patch("app.PREVIEW_DIR", failed_dir),
+                patch("app.cut_clips", side_effect=failing_cut),
+            ):
+                with self.assertRaises(RuntimeError):
+                    preview_clip_plan(0.0, 30.0, ctx, plan)
+
+            self.assertEqual(list(failed_dir.glob("*.tmp.mp4")), [])
+            self.assertEqual(list(failed_dir.glob("preview_multi_*.mp4")), [])
 
     def test_intuitive_loader_uses_first_speech_and_real_transcript(self):
         class FakeCursor:
@@ -2064,6 +2962,9 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-toolbox",
             "intuitive-command-json",
             "intuitive-command-submit",
+            "intuitive-sync-token",
+            "intuitive-sync-submit",
+            "intuitive-sync-ack",
             "intuitive-search-query",
             "intuitive-search-target",
             "intuitive-search-button",
@@ -2071,6 +2972,28 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-preview-result",
             "intuitive-return-source",
         }.issubset(elem_ids))
+        app_source = pathlib.Path(app_module.__file__).read_text(encoding="utf-8")
+        command_binding = app_source.split(
+            "intuitive_command_submit.click(", 1
+        )[1].split("intuitive_sync_submit.click(", 1)[0]
+        sync_binding = app_source.split(
+            "intuitive_sync_submit.click(", 1
+        )[1].split("intuitive_preview_result_btn.click(", 1)[0]
+        for binding in (command_binding, sync_binding):
+            self.assertIn('concurrency_id="intuitive-editor-state"', binding)
+            self.assertIn("concurrency_limit=1", binding)
+        save_dependency = next(
+            dependency for dependency in config["dependencies"]
+            if dependency.get("api_name") == "save_intuitive_editor"
+        )
+        self.assertEqual(len(save_dependency["outputs"]), 3)
+        self.assertEqual(
+            save_dependency["outputs"][-1],
+            next(
+                component["id"] for component in components
+                if component.get("props", {}).get("elem_id") == "intuitive-toolbox"
+            ),
+        )
 
         html_values = "\n".join(
             str(component.get("props", {}).get("value") or "")
@@ -2194,12 +3117,61 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("font-variant-numeric: tabular-nums", _APP_CSS)
         self.assertIn("text-transform: uppercase", _APP_CSS)
         self.assertNotIn("#ff8a00", _APP_CSS)
-        # FIFO deadlock regression: awaitRevision must self-recover (and warn)
-        # if the server-side revision never advances, instead of leaving
-        # commandBusy stuck forever.
-        self.assertIn("AWAIT_REVISION_TIMEOUT_MS", _INTUITIVE_EDITOR_JS)
-        self.assertIn("console.warn(", _INTUITIVE_EDITOR_JS)
-        self.assertIn("commandBusy = false", _INTUITIVE_EDITOR_JS)
+        # FIFO ordering regression: completion is tied to the command's own
+        # acknowledgement, not merely to any unrelated revision change.
+        self.assertNotIn("AWAIT_REVISION_TIMEOUT_MS", _INTUITIVE_EDITOR_JS)
+        self.assertIn("AWAIT_REVISION_SLOW_MS", _INTUITIVE_EDITOR_JS)
+        self.assertIn("revisionWaitToken", _INTUITIVE_EDITOR_JS)
+        self.assertIn("revisionWaitTimer", _INTUITIVE_EDITOR_JS)
+        self.assertIn("current.nonce !== awaitedNonce", _INTUITIVE_EDITOR_JS)
+        self.assertIn("finishAcknowledgedCommand", _INTUITIVE_EDITOR_JS)
+        self.assertNotIn("current.revision !== previousRevision", _INTUITIVE_EDITOR_JS)
+        self.assertIn("finishRevisionWait(waitToken)", _INTUITIVE_EDITOR_JS)
+        slow_branch = _INTUITIVE_EDITOR_JS.split(
+            "if (elapsed >= AWAIT_REVISION_SLOW_MS && !slowNoticeShown)", 1
+        )[1].split("const pollInterval =", 1)[0]
+        self.assertNotIn("commandBusy = false", slow_branch)
+        self.assertNotIn("flushCommandQueue()", slow_branch)
+        nonce_branch = _INTUITIVE_EDITOR_JS.split(
+            "if (current && current.nonce !== awaitedNonce)", 1
+        )[1].split("if (finishAcknowledgedCommand(current, commandId, waitToken))", 1)[0]
+        self.assertIn("finishRevisionWait(waitToken)", nonce_branch)
+        finish_branch = _INTUITIVE_EDITOR_JS.split(
+            "const finishRevisionWait = (waitToken, warning = '') =>", 1
+        )[1].split("const finishAcknowledgedCommand =", 1)[0]
+        self.assertIn("clearCommandWaitNotice()", finish_branch)
+        self.assertIn("commandBusy = false", finish_branch)
+        self.assertIn("flushCommandQueue()", finish_branch)
+        self.assertIn("処理中です。続けて行った操作は順番に反映されます。", _INTUITIVE_EDITOR_JS)
+        self.assertIn("showCommandWaitNotice()", slow_branch)
+        self.assertIn("状態を再確認", _INTUITIVE_EDITOR_JS)
+        self.assertIn("crypto.randomUUID", _INTUITIVE_EDITOR_JS)
+        self.assertIn("queuedPayload.command_id = newBridgeId('command')", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-sync-token", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-sync-submit", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-sync-ack", _INTUITIVE_EDITOR_JS)
+        self.assertIn("commandQueue.length = 0", _INTUITIVE_EDITOR_JS)
+        self.assertIn("後続の操作は破棄しました", _INTUITIVE_EDITOR_JS)
+        ack_branch = _INTUITIVE_EDITOR_JS.split(
+            "const finishAcknowledgedCommand =", 1
+        )[1].split("const newBridgeId =", 1)[0]
+        self.assertIn("current.lastCommandId !== commandId", ack_branch)
+        self.assertIn("current.lastCommandStatus === 'success'", ack_branch)
+        self.assertIn("commandQueue.length = 0", ack_branch)
+        self.assertIn("finishRevisionWait(", ack_branch)
+        notice_branch = _INTUITIVE_EDITOR_JS.split(
+            "const showCommandWaitNotice =", 1
+        )[1].split("const finishRevisionWait =", 1)[0]
+        self.assertIn("notice.replaceChildren()", notice_branch)
+        self.assertIn("const existing = document.getElementById", notice_branch)
+        self.assertIn(".intuitive-command-wait-notice", _APP_CSS)
+        self.assertIn("const AWAIT_REVISION_POLL_MS = 50", _INTUITIVE_EDITOR_JS)
+        self.assertIn("const AWAIT_REVISION_SLOW_POLL_MS = 750", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "elapsed >= AWAIT_REVISION_SLOW_MS\n"
+            "        ? AWAIT_REVISION_SLOW_POLL_MS : AWAIT_REVISION_POLL_MS",
+            _INTUITIVE_EDITOR_JS,
+        )
         # "fit overall to viewport" button -- FIFO wiring in the timeline
         # toolbox, mirroring the tool buttons' auto-enable-edit-mode rule.
         self.assertIn("data-intuitive-fit-overall", _INTUITIVE_EDITOR_JS)
@@ -2215,6 +3187,47 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("drag.distance = Math.abs(event.clientX - drag.startX)", _INTUITIVE_EDITOR_JS)
         self.assertIn("drag.overallStart", _INTUITIVE_EDITOR_JS)
         self.assertIn("seekZoom(drag.root, event)", _INTUITIVE_EDITOR_JS)
+        playhead_helper = _INTUITIVE_EDITOR_JS.split(
+            "const updateZoomPlayhead = (zoom, absolute) =>", 1
+        )[1].split("const scheduleZoomPlayhead =", 1)[0]
+        self.assertIn("zoom.dataset.previewMode === 'result'", playhead_helper)
+        self.assertIn(
+            "const clamped = Math.max(lo, Math.min(hi, absolute))",
+            playhead_helper,
+        )
+        self.assertIn(
+            "const percent = (clamped - lo) / (hi - lo) * 100",
+            playhead_helper,
+        )
+        seek_helper = _INTUITIVE_EDITOR_JS.split(
+            "const seekZoom = (zoom, event) =>", 1
+        )[1].split("const syncPlayheadFromVideo =", 1)[0]
+        self.assertIn("updateZoomPlayhead(zoom, absolute)", seek_helper)
+        sync_helper = _INTUITIVE_EDITOR_JS.split(
+            "const syncPlayheadFromVideo = (event) =>", 1
+        )[1].split("document.addEventListener('timeupdate'", 1)[0]
+        self.assertIn("video.closest('#intuitive-preview-video')", sync_helper)
+        self.assertIn("zoom.dataset.previewMode === 'result'", sync_helper)
+        self.assertIn("const absolute = previewStart + currentTime", sync_helper)
+        self.assertIn("scheduleZoomPlayhead(absolute)", sync_helper)
+        self.assertIn(
+            "if (event.type === 'timeupdate') requestTranscriptFocus(absolute)",
+            sync_helper,
+        )
+        self.assertEqual(sync_helper.count("requestTranscriptFocus(absolute)"), 1)
+        self.assertIn(
+            "document.addEventListener('timeupdate', syncPlayheadFromVideo, true)",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn(
+            "document.addEventListener('seeking', syncPlayheadFromVideo, true)",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn("playheadFrame = requestAnimationFrame", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "document.querySelector('[data-intuitive-zoom]')",
+            _INTUITIVE_EDITOR_JS,
+        )
         self.assertIn("type: 'set_from_timeline'", _INTUITIVE_EDITOR_JS)
         self.assertNotIn("data-intuitive-preview-action", _INTUITIVE_EDITOR_JS)
         self.assertIn("activeTool: root.dataset.activeTool", _INTUITIVE_EDITOR_JS)
@@ -2236,7 +3249,96 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("fallbackSwitchArmed = false", _INTUITIVE_EDITOR_JS)
         self.assertIn("root.dataset.editDirty === 'true'", _INTUITIVE_EDITOR_JS)
         self.assertIn("現在の編集内容はこの画面から失われます", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "処理中の操作が完了した後に動画を切り替えます。よろしいですか？",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn(
+            "hasDirtyEdit\n      ? DIRTY_EDIT_SWITCH_WARNING "
+            ": PENDING_OPERATION_SWITCH_WARNING",
+            _INTUITIVE_EDITOR_JS,
+        )
         self.assertIn("event.stopImmediatePropagation()", _INTUITIVE_EDITOR_JS)
+        self.assertIn("confirmDirtySessionReplacement", _INTUITIVE_EDITOR_JS)
+        self.assertIn("isReplacementClick", _INTUITIVE_EDITOR_JS)
+        self.assertIn("isSearchResultSelection", _INTUITIVE_EDITOR_JS)
+        self.assertEqual(_INTUITIVE_EDITOR_JS.count("window.confirm("), 1)
+        self.assertEqual(
+            _INTUITIVE_EDITOR_JS.count("stopDirtySessionReplacement(event)"), 4
+        )
+        for replacement_selector in (
+            "#intuitive-video-gallery",
+            "#intuitive-load-video",
+            "#intuitive-search-button",
+            "#intuitive-search-query",
+            "#intuitive-search-results .body-cell",
+            "#intuitive-search-results td",
+            '#intuitive-search-results [role="gridcell"]',
+        ):
+            self.assertIn(replacement_selector, _INTUITIVE_EDITOR_JS)
+        self.assertIn("commandBusy || commandQueue.length > 0", _INTUITIVE_EDITOR_JS)
+        self.assertIn("commandQueue.length = 0", _INTUITIVE_EDITOR_JS)
+        missing_bridge_branch = _INTUITIVE_EDITOR_JS.split(
+            "if (!field || !button)", 1
+        )[1].split("commandBusy = true", 1)[0]
+        self.assertIn("commandQueue.unshift(queued)", missing_bridge_branch)
+        self.assertIn("setTimeout(flushCommandQueue, 100)", missing_bridge_branch)
+        self.assertIn("const currentSourcePlayhead = (meta) =>", _INTUITIVE_EDITOR_JS)
+        source_playhead_helper = _INTUITIVE_EDITOR_JS.split(
+            "const currentSourcePlayhead = (meta) =>", 1
+        )[1].split("const send = (payload) =>", 1)[0]
+        self.assertIn("meta.previewMode === 'result'", source_playhead_helper)
+        self.assertIn("meta.previewStart + currentTime", source_playhead_helper)
+        self.assertIn("queuedPayload.playhead_sec = playhead", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "resultCell.closest('.virtual-row, tr, [role=\"row\"]')",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn("document.addEventListener('mousedown'", _INTUITIVE_EDITOR_JS)
+        mousedown_guard = _INTUITIVE_EDITOR_JS.split(
+            "document.addEventListener('mousedown'", 1
+        )[1].split("}, true);", 1)[0]
+        self.assertIn("isSearchResultSelection(event)", mousedown_guard)
+        click_guard = _INTUITIVE_EDITOR_JS.split(
+            "document.addEventListener('click'", 1
+        )[1].split("}, true);", 1)[0]
+        self.assertNotIn("isSearchResultSelection(event)", click_guard)
+        self.assertEqual(
+            _INTUITIVE_EDITOR_JS.count("document.addEventListener('keydown'"), 1
+        )
+        self.assertIn(
+            "if (event.isComposing || event.keyCode === 229) return;",
+            _INTUITIVE_EDITOR_JS,
+        )
+        keyboard_branch = _INTUITIVE_EDITOR_JS.split(
+            "const handleIntuitiveKeydown =", 1
+        )[1].split("const timeAtPointer =", 1)[0]
+        for guard in (
+            "event.defaultPrevented", "event.repeat", "event.isComposing",
+            "input, textarea, select", "[contenteditable]",
+        ):
+            self.assertIn(guard, keyboard_branch)
+        self.assertIn("lowerKey === 'z'", keyboard_branch)
+        self.assertIn("lowerKey === 'y'", keyboard_branch)
+        self.assertIn("event.shiftKey", keyboard_branch)
+        self.assertIn("meta.previewMode === 'result'", keyboard_branch)
+        self.assertIn("word.click()", keyboard_branch)
+        self.assertIn("words.forEach((item) => item.tabIndex = -1)", keyboard_branch)
+        self.assertEqual(keyboard_branch.count("type: 'set_boundary'"), 1)
+        self.assertEqual(keyboard_branch.count("type: 'set_viewport'"), 1)
+        self.assertIn("currentAdjustmentStep()", keyboard_branch)
+        self.assertIn(
+            "new Set(['Enter', ' ', 'ArrowDown', 'ArrowUp'])",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn(
+            "if (FALLBACK_SWITCH_KEYS.has(event.key)) armFallbackSwitch(event);",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn(
+            "event.key === 'Enter'\n      && event.target.closest('#intuitive-search-query')",
+            _INTUITIVE_EDITOR_JS,
+        )
         self.assertIn("#intuitive-video-gallery", _INTUITIVE_EDITOR_JS)
         self.assertIn("openIntuitivePicker()", _INTUITIVE_EDITOR_JS)
         self.assertIn("#intuitive-video-select", _INTUITIVE_EDITOR_JS)
@@ -2289,7 +3391,20 @@ class ClipPlanTest(unittest.TestCase):
         ]
         self.assertEqual(len(gallery_select), 1)
         self.assertEqual(gallery_select[0].get("trigger_mode"), "always_last")
-        self.assertEqual(len(gallery_select[0].get("outputs", [])), 13)
+        self.assertEqual(len(gallery_select[0].get("outputs", [])), 14)
+        search_target_id = components_by_elem_id["intuitive-search-target"]["id"]
+        self.assertEqual(gallery_select[0]["outputs"][-1], search_target_id)
+        for elem_id, event_name in (
+            ("intuitive-load-video", "click"),
+            ("intuitive-video-select", "input"),
+        ):
+            component_id = components_by_elem_id[elem_id]["id"]
+            dependencies = [
+                dependency for dependency in config["dependencies"]
+                if (component_id, event_name) in dependency.get("targets", [])
+            ]
+            self.assertEqual(len(dependencies), 1)
+            self.assertEqual(dependencies[0]["outputs"][-1], search_target_id)
         initial_cards = components_by_elem_id["intuitive-video-gallery"]["props"].get(
             "value"
         ) or []
@@ -2297,7 +3412,6 @@ class ClipPlanTest(unittest.TestCase):
             component for component in components
             if component["id"] == gallery_select[0]["inputs"][0]
         )
-        self.assertGreater(len(initial_cards), 0)
         self.assertEqual(gallery_ids_state["type"], "state")
         self.assertEqual(len(initial_cards), len(_INTUITIVE_INITIAL_VIDEO_IDS))
         self.assertNotIn("__all_videos__", _INTUITIVE_INITIAL_VIDEO_IDS)

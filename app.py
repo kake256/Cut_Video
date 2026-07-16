@@ -6,6 +6,7 @@
 「検索・切り抜き」タブ: 検索 → 結果選択 → プレビュー → 手動調整 → 保存。
 「動画の追加」タブ: 新規動画の文字起こし〜インデックス化をWebUIから実行。
 """
+import copy
 import faulthandler
 import hashlib
 import html
@@ -18,39 +19,75 @@ from pathlib import Path
 
 import gradio as gr
 
-# ネイティブ層のクラッシュ(access violation等)の原因追跡用
-_crash_log = open("data/crash_trace.log", "a", encoding="utf-8", errors="replace")
-faulthandler.enable(file=_crash_log)
-
-from cut_clip import cut_clip, cut_clips
 from moment_retrieval import config, db, utils
+from cut_clip import cut_clip, cut_clips
 from moment_retrieval.downloader import DownloadError, download_video
 from moment_retrieval.embedder import TextEmbedder
+from moment_retrieval.preview_cache import (
+    DEFAULT_LOCK_STRIPES,
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_FILES,
+    DEFAULT_TEMP_MAX_AGE_SEC,
+    PreviewCache,
+)
 from moment_retrieval.refine import expand_to_speech_boundary
 from moment_retrieval.search import search_chunks
 from moment_retrieval.share import ShareError, export_index, import_index
 from moment_retrieval.vector_index import VectorIndex
 
-PREVIEW_DIR = Path("data/previews")
-THUMBNAIL_DIR = Path("data/thumbnails")
+PREVIEW_DIR = config.DATA_DIR / "previews"
+THUMBNAIL_DIR = config.DATA_DIR / "thumbnails"
 ALL_VIDEOS_IMAGE = Path("assets/all_videos.svg")
 VIDEO_UNAVAILABLE_IMAGE = Path("assets/video_unavailable.svg")
 DEFAULT_CLIPS_DIR = "clips"
 APP_PORT = 7860
+PREVIEW_RENDER_TIMEOUT_SEC = 600
+PREVIEW_CACHE_MAX_BYTES = DEFAULT_MAX_BYTES
+PREVIEW_CACHE_MAX_FILES = DEFAULT_MAX_FILES
+PREVIEW_TEMP_MAX_AGE_SEC = DEFAULT_TEMP_MAX_AGE_SEC
 # 直感編集のカードグリッドは生HTMLでサムネイルを埋め込むため、Gradioのファイル配信
 # キャッシュへ手動でコピーする必要がある。Blocksコンテキスト外でも動作する
 # (`Block.__init__`がGRADIO_CACHEを設定するだけで、UIには一切表示しない)。
 _THUMB_CACHE_BLOCK = gr.HTML()
-INDEX_JOB_PIDFILE = Path("data/index_job.pid")
+INDEX_JOB_PIDFILE = config.DATA_DIR / "index_job.pid"
 ALL_VIDEOS_VALUE = "__all_videos__"
 
 ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
 
 _embedder = None
 _index_lock = threading.Lock()
-_intuitive_preview_lock = threading.Lock()
+_preview_cache_manager = PreviewCache(
+    PREVIEW_DIR,
+    max_bytes=PREVIEW_CACHE_MAX_BYTES,
+    max_files=PREVIEW_CACHE_MAX_FILES,
+    temp_max_age_sec=PREVIEW_TEMP_MAX_AGE_SEC,
+    lock_stripes=DEFAULT_LOCK_STRIPES,
+)
+# Compatibility aliases for existing diagnostics/tests. Ownership lives in
+# PreviewCache; app.py no longer manages these collections itself.
+_preview_locks = _preview_cache_manager.locks
+_preview_protected_outputs = _preview_cache_manager.protected_outputs
+_crash_log = None
 # 実行中のインデックス処理サブプロセス (停止ボタン用)
 _index_state = {"proc": None, "stopped": False}
+
+
+def _enable_crash_log() -> None:
+    """Enable native crash diagnostics only for an actual app process."""
+    global _crash_log
+    if _crash_log is not None:
+        return
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _crash_log = open(
+            config.DATA_DIR / "crash_trace.log",
+            "a",
+            encoding="utf-8",
+            errors="replace",
+        )
+        faulthandler.enable(file=_crash_log)
+    except OSError:
+        _crash_log = None
 
 
 def get_embedder() -> TextEmbedder:
@@ -510,50 +547,136 @@ def do_search(
     return (table, results, *_select_result(0, results))
 
 
-def make_preview(video_path: str, start: float, end: float, duration: float) -> str:
-    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    out = PREVIEW_DIR / f"preview_{int(start * 10)}_{int(end * 10)}.mp4"
-    if not out.exists():
-        cut_clip(Path(video_path), start, end, out, pad=0.0, precise=False, duration=duration)
-    return str(out)
+def _preview_source_fingerprint(source: Path, source_size: int) -> str:
+    """Compatibility wrapper for the pure cache implementation."""
+    return PreviewCache.source_fingerprint(source, source_size)
+
+
+def _preview_source_version(source: Path) -> tuple[int, int, str | None]:
+    """Compatibility wrapper for stable stat plus sampled identity."""
+    return PreviewCache.source_version(source)
+
+
+def _configured_preview_cache() -> PreviewCache:
+    """Apply app-level overrides while retaining the manager's lock state."""
+    _preview_cache_manager.configure(
+        directory=PREVIEW_DIR,
+        max_bytes=PREVIEW_CACHE_MAX_BYTES,
+        max_files=PREVIEW_CACHE_MAX_FILES,
+        temp_max_age_sec=PREVIEW_TEMP_MAX_AGE_SEC,
+    )
+    return _preview_cache_manager
+
+
+def _preview_cache_path(
+    prefix: str,
+    video_id: str | None,
+    video_path: str,
+    ranges: list[tuple[float, float]],
+) -> Path:
+    """Return a safe cache path unique to a source version and exact ranges."""
+    return _configured_preview_cache().cache_path(
+        prefix, video_id, video_path, ranges
+    )
+
+
+def _preview_path(
+    video_id: str | None, video_path: str, start: float, end: float
+) -> Path:
+    """Return a source/version/range-specific cache path for one legacy range."""
+    return _preview_cache_path(
+        "preview", video_id, video_path, [(start, end)]
+    )
+
+
+def _multi_preview_path(
+    video_id: str | None,
+    video_path: str,
+    ranges: list[list[float]] | list[tuple[float, float]],
+) -> Path:
+    """Return a source/version/ranges-specific cache path for a joined preview."""
+    return _preview_cache_path(
+        "preview_multi", video_id, video_path,
+        [(start, end) for start, end in ranges],
+    )
+
+
+def _preview_lock_for(out: Path) -> threading.Lock:
+    """Return one fixed stripe; the lock set cannot grow with cache entries."""
+    return _configured_preview_cache().lock_for(out)
+
+
+def _is_completed_preview_file(path: Path) -> bool:
+    return PreviewCache.is_completed_file(path)
+
+
+def _prune_preview_cache(
+    protected: Path | None = None,
+    *,
+    cleanup_stale_temps: bool = False,
+    now: float | None = None,
+) -> None:
+    _configured_preview_cache().prune(
+        protected,
+        cleanup_stale_temps=cleanup_stale_temps,
+        now=now,
+    )
+
+
+def _touch_preview_cache_file(path: Path) -> None:
+    PreviewCache.touch(path)
+
+
+def _initialize_preview_cache() -> None:
+    """Run cache maintenance only during real application startup."""
+    _prune_preview_cache(cleanup_stale_temps=True)
+
+
+def _create_cached_preview(out: Path, renderer) -> str:
+    """Render once through a unique temporary file, then atomically publish it."""
+    return _configured_preview_cache().create(out, renderer)
+
+
+def make_preview(
+    video_path: str,
+    start: float,
+    end: float,
+    duration: float,
+    video_id: str | None = None,
+) -> str:
+    out = _preview_path(video_id, video_path, start, end)
+    return _create_cached_preview(
+        out,
+        lambda temporary: cut_clip(
+            Path(video_path), start, end, temporary,
+            pad=0.0, precise=False, duration=duration,
+            timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+        ),
+    )
 
 
 def _intuitive_preview_path(
     video_id: str, video_path: str, start: float, end: float
 ) -> Path:
     """動画をまたいで衝突しない、ファイル名として安全な試作プレビュー保存先。"""
-    source = Path(video_path)
-    try:
-        stamp = source.stat().st_mtime_ns
-    except OSError:
-        stamp = 0
-    cache_key = hashlib.sha256(
-        f"{video_id}|{source.resolve()}|{stamp}|{start:.3f}|{end:.3f}".encode("utf-8")
-    ).hexdigest()[:24]
-    return PREVIEW_DIR / f"intuitive_{cache_key}.mp4"
+    return _preview_cache_path(
+        "intuitive", video_id, video_path, [(start, end)]
+    )
 
 
 def make_intuitive_preview(
     video_id: str, video_path: str, start: float, end: float, duration: float
 ) -> str:
     """直感編集試作用の動画ID別プレビューをローカルに生成する。"""
-    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     out = _intuitive_preview_path(video_id, video_path, start, end)
-    with _intuitive_preview_lock:
-        if out.exists():
-            return str(out)
-        temporary = out.with_name(
-            f"{out.stem}.{secrets.token_hex(6)}.tmp.mp4"
-        )
-        try:
-            cut_clip(
-                Path(video_path), start, end, temporary,
-                pad=0.0, precise=False, duration=duration,
-            )
-            temporary.replace(out)
-        finally:
-            temporary.unlink(missing_ok=True)
-    return str(out)
+    return _create_cached_preview(
+        out,
+        lambda temporary: cut_clip(
+            Path(video_path), start, end, temporary,
+            pad=0.0, precise=False, duration=duration,
+            timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+        ),
+    )
 
 
 def render_intuitive_transcript(segments: list[dict], state: dict | None = None) -> str:
@@ -653,6 +776,7 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
 
     rendered_segments = []
     granularities = set()
+    first_focusable = True
     for raw_segment in segments:
         segment = dict(raw_segment)
         words = timed_words_for(segment)
@@ -662,10 +786,15 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
         for word in words or []:
             text, start, end = word
             label = f"単語時刻: {utils.format_timestamp(start)} - {utils.format_timestamp(end)}"
+            accessible_label = f"{label}: {text}"
+            tab_index = 0 if first_focusable else -1
+            first_focusable = False
             word_spans.append(
                 f'<span class="{classes_for(start, end)}" '
+                f'role="button" tabindex="{tab_index}" '
                 f'data-time-granularity="word" '
                 f'data-start="{start:.3f}" data-end="{end:.3f}" '
+                f'aria-label="{html.escape(accessible_label, quote=True)}" '
                 f'title="{html.escape(label, quote=True)}">'
                 f'{html.escape(text)}</span>'
             )
@@ -686,10 +815,15 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
             "発話区間（単語時刻なし）: "
             f"{utils.format_timestamp(start)} - {utils.format_timestamp(end)}"
         )
+        accessible_label = f'{label}: {str(segment.get("text") or "")}'
+        tab_index = 0 if first_focusable else -1
+        first_focusable = False
         segment_span = (
             f'<span class="{classes_for(start, end, segment=True)}" '
+            f'role="button" tabindex="{tab_index}" '
             f'data-time-granularity="segment" '
             f'data-start="{start:.3f}" data-end="{end:.3f}" '
+            f'aria-label="{html.escape(accessible_label, quote=True)}" '
             f'title="{html.escape(label, quote=True)}">'
             f'{html.escape(str(segment.get("text") or ""))}</span>'
         )
@@ -832,6 +966,7 @@ _INTUITIVE_VIEWPORT_MIN_SECONDS = 5.0
 # scene.  Ten minutes is a practical upper bound for the generated source
 # preview while still making the resize operation useful and predictable.
 _INTUITIVE_VIEWPORT_MAX_SECONDS = 600.0
+_INTUITIVE_HISTORY_LIMIT = 50
 _INTUITIVE_TRANSCRIPT_WINDOW_SECONDS = 90.0
 
 
@@ -897,21 +1032,25 @@ def _new_intuitive_state(video: dict, start: float, end: float) -> dict:
         "viewport_start": float(start),
         "viewport_end": float(end),
         "playhead_sec": float(start),
+        "last_command_id": None,
+        "last_command_status": "",
         "edit_dirty": False,
+        "undo_stack": [],
+        "redo_stack": [],
         # OFF by default: the zoom timeline only seeks until the user
         # explicitly turns editing on (handle drag / cut-add drag / click-to-
         # set-boundary are otherwise disabled -- see set_timeline_edit_mode).
         "timeline_edit_mode": False,
     }
+    state["baseline_plan"] = _intuitive_plan_snapshot(state)
     _set_intuitive_transcript_focus(state, start)
     return state
 
 
 def _intuitive_edit_signature(state: dict) -> tuple:
-    """Canonical saved-plan signature; viewport/tool/selection state is excluded."""
+    """Semantic saved-plan signature; IDs and display-only state are excluded."""
     exclusions = tuple(
         (
-            str(cut.get("id") or ""),
             float(cut["start"]),
             float(cut["end"]),
         )
@@ -922,6 +1061,47 @@ def _intuitive_edit_signature(state: dict) -> tuple:
         float(state["overall_end"]),
         exclusions,
     )
+
+
+def _intuitive_plan_snapshot(state: dict) -> dict:
+    """Deep canonical edit plan used by history and the saved baseline."""
+    return {
+        "overall_start": float(state["overall_start"]),
+        "overall_end": float(state["overall_end"]),
+        "exclusions": [
+            {
+                "id": str(cut.get("id") or ""),
+                "start": float(cut["start"]),
+                "end": float(cut["end"]),
+            }
+            for cut in _clip_intuitive_exclusions(state)
+        ],
+    }
+
+
+def _restore_intuitive_plan(state: dict, snapshot: dict) -> None:
+    """Restore only canonical plan fields, preserving the current session."""
+    state["overall_start"] = float(snapshot["overall_start"])
+    state["overall_end"] = float(snapshot["overall_end"])
+    state["exclusions"] = [
+        {
+            "id": str(cut.get("id") or ""),
+            "start": float(cut["start"]),
+            "end": float(cut["end"]),
+        }
+        for cut in snapshot.get("exclusions") or []
+    ]
+
+
+def _clear_intuitive_gesture_state(state: dict) -> None:
+    state["pending_cut_start"] = None
+    state["active_tool"] = None
+    state["selected_boundary"] = None
+    state["selected_word"] = None
+
+
+def _bounded_intuitive_history(stack: list[dict]) -> list[dict]:
+    return copy.deepcopy(list(stack)[-_INTUITIVE_HISTORY_LIMIT:])
 
 
 def _finite_time(value, name: str) -> float:
@@ -956,6 +1136,19 @@ def _clip_intuitive_exclusions(state: dict) -> list[dict]:
         else:
             merged.append(dict(cut))
     return merged
+
+
+def _validate_intuitive_exclusion_invariant(state: dict) -> None:
+    """Reject a canonical edit plan whose exclusions cover its whole range."""
+    exclusions = state.get("exclusions") or []
+    if not exclusions:
+        return
+    overall_span = float(state["overall_end"]) - float(state["overall_start"])
+    excluded_span = sum(
+        float(cut["end"]) - float(cut["start"]) for cut in exclusions
+    )
+    if excluded_span >= overall_span - 0.001:
+        raise ValueError("全体範囲のすべてを除外することはできません。")
 
 
 def _set_intuitive_boundary(state: dict, boundary: dict, value: float) -> None:
@@ -1108,21 +1301,18 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
     ):
         raise gr.Error("編集結果のプレビュー中です。動画を再読み込みして編集を再開してください。")
 
-    initial_edit_signature = _intuitive_edit_signature(state)
-    was_edit_dirty = bool(state.get("edit_dirty", False))
-
-    next_state = {
-        **state,
-        "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
-        "selected_boundary": (
-            dict(state["selected_boundary"])
-            if isinstance(state.get("selected_boundary"), dict) else None
-        ),
-        "selected_word": (
-            dict(state["selected_word"])
-            if isinstance(state.get("selected_word"), dict) else None
-        ),
-    }
+    initial_plan = _intuitive_plan_snapshot(state)
+    initial_edit_signature = _intuitive_edit_signature(initial_plan)
+    next_state = copy.deepcopy(state)
+    next_state["undo_stack"] = _bounded_intuitive_history(
+        state.get("undo_stack") or []
+    )
+    next_state["redo_stack"] = _bounded_intuitive_history(
+        state.get("redo_stack") or []
+    )
+    next_state["baseline_plan"] = copy.deepcopy(
+        state.get("baseline_plan") or initial_plan
+    )
     action = command.get("type")
     transcript_focus = None
     if command.get("enable_timeline_edit_mode"):
@@ -1133,7 +1323,41 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
         # that lives in that toolbox, not just the 4 tool buttons.
         next_state["timeline_edit_mode"] = True
     try:
-        if action == "set_tool":
+        if (
+            state.get("preview_mode", "source") != "result"
+            and command.get("playhead_sec") is not None
+        ):
+            source_playhead = _finite_time(
+                command.get("playhead_sec"), "プレビュー再生位置"
+            )
+            preview_start = max(0.0, float(next_state["preview_start"]))
+            preview_end = min(
+                float(next_state["duration"]), float(next_state["preview_end"])
+            )
+            next_state["playhead_sec"] = min(
+                max(source_playhead, preview_start), max(preview_start, preview_end)
+            )
+        if action == "undo":
+            if not next_state["undo_stack"]:
+                raise ValueError("元に戻せる編集はありません。")
+            target = next_state["undo_stack"].pop()
+            next_state["redo_stack"].append(initial_plan)
+            next_state["redo_stack"] = _bounded_intuitive_history(
+                next_state["redo_stack"]
+            )
+            _restore_intuitive_plan(next_state, target)
+            _clear_intuitive_gesture_state(next_state)
+        elif action == "redo":
+            if not next_state["redo_stack"]:
+                raise ValueError("やり直せる編集はありません。")
+            target = next_state["redo_stack"].pop()
+            next_state["undo_stack"].append(initial_plan)
+            next_state["undo_stack"] = _bounded_intuitive_history(
+                next_state["undo_stack"]
+            )
+            _restore_intuitive_plan(next_state, target)
+            _clear_intuitive_gesture_state(next_state)
+        elif action == "set_tool":
             tool = command.get("tool")
             if tool not in _INTUITIVE_TOOLS:
                 raise ValueError("不明な編集ツールです。")
@@ -1181,6 +1405,7 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
             ):
                 raise ValueError("現在の再生位置がプレビュー範囲外です。")
             transcript_focus = current_time
+            next_state["playhead_sec"] = current_time
             _apply_intuitive_word_tool(
                 next_state, {"start": current_time, "end": current_time}
             )
@@ -1332,6 +1557,14 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
         min(next_state["overall_end"], next_state["duration"]),
     )
     next_state["exclusions"] = _clip_intuitive_exclusions(next_state)
+    try:
+        # This is the final canonical-plan invariant and intentionally runs
+        # after overall clamping plus exclusion clipping/merging.  Every edit
+        # path (including fit_overall_to_viewport) must pass it before state is
+        # committed and revision is advanced.
+        _validate_intuitive_exclusion_invariant(next_state)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
     next_state["selected_boundary"] = _remap_intuitive_boundary(
         next_state, next_state.get("selected_boundary")
     )
@@ -1341,10 +1574,21 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
         next_state["viewport_end"],
     )
     _set_intuitive_transcript_focus(next_state, transcript_focus)
+    final_edit_signature = _intuitive_edit_signature(next_state)
+    if action not in {"undo", "redo"} and final_edit_signature != initial_edit_signature:
+        next_state["undo_stack"].append(initial_plan)
+        next_state["undo_stack"] = _bounded_intuitive_history(
+            next_state["undo_stack"]
+        )
+        next_state["redo_stack"] = []
     next_state["edit_dirty"] = (
-        was_edit_dirty
-        or _intuitive_edit_signature(next_state) != initial_edit_signature
+        final_edit_signature
+        != _intuitive_edit_signature(next_state["baseline_plan"])
     )
+    command_id = str(command.get("command_id") or "")[:128]
+    if command_id:
+        next_state["last_command_id"] = command_id
+        next_state["last_command_status"] = "success"
     next_state["revision"] = int(next_state["revision"]) + 1
     return next_state
 
@@ -1492,8 +1736,16 @@ def _intuitive_selected_boundary_label(state: dict) -> str | None:
 def render_intuitive_toolbar(state: dict) -> str:
     revision = int(state.get("revision", 0))
     nonce = html.escape(str(state.get("nonce", "")), quote=True)
+    last_command_id = html.escape(
+        str(state.get("last_command_id") or ""), quote=True
+    )
+    last_command_status = html.escape(
+        str(state.get("last_command_status") or ""), quote=True
+    )
     active = state.get("active_tool")
     result_mode = state.get("preview_mode", "source") == "result"
+    can_undo = bool(state.get("undo_stack")) and not result_mode
+    can_redo = bool(state.get("redo_stack")) and not result_mode
     has_selected_boundary = bool(state.get("selected_boundary"))
     transcript_start, transcript_end = _intuitive_transcript_bounds(state)
     buttons = "".join(
@@ -1521,8 +1773,12 @@ def render_intuitive_toolbar(state: dict) -> str:
     return (
         f'<div class="intuitive-toolbox" data-intuitive-root data-revision="{revision}" '
         f'data-nonce="{nonce}" data-preview-mode="{state.get("preview_mode", "source")}" '
+        f'data-last-command-id="{last_command_id}" '
+        f'data-last-command-status="{last_command_status}" '
         f'data-active-tool="{html.escape(str(active or ""), quote=True)}" '
         f'data-edit-dirty="{str(bool(state.get("edit_dirty", False))).lower()}" '
+        f'data-can-undo="{str(can_undo).lower()}" '
+        f'data-can-redo="{str(can_redo).lower()}" '
         f'data-has-selected-boundary="{str(has_selected_boundary).lower()}" '
         f'data-timeline-edit-mode="{str(bool(state.get("timeline_edit_mode", False))).lower()}" '
         f'data-transcript-start="{transcript_start:.3f}" '
@@ -1531,7 +1787,13 @@ def render_intuitive_toolbar(state: dict) -> str:
         f'data-viewport-end="{float(state["viewport_end"]):.3f}" '
         f'data-preview-start="{float(state["preview_start"]):.3f}" '
         f'data-preview-end="{float(state["preview_end"]):.3f}">'
-        f'<div class="intuitive-tool-heading"><strong>境界ツール（文字・タイムライン共通）</strong></div>'
+        f'<div class="intuitive-tool-heading"><strong>境界ツール（文字・タイムライン共通）</strong>'
+        f'<span class="intuitive-history-actions">'
+        f'<button type="button" data-intuitive-history="undo"'
+        f'{"" if can_undo else " disabled"} aria-label="元に戻す (Ctrl+Z)">↶ 元に戻す</button>'
+        f'<button type="button" data-intuitive-history="redo"'
+        f'{"" if can_redo else " disabled"} aria-label="やり直す (Ctrl+Y)">↷ やり直す</button>'
+        f'</span></div>'
         f'<div class="intuitive-tool-buttons">{buttons}</div>'
         f'<div class="intuitive-tool-status">{selected_html}{status}</div></div>'
     )
@@ -1552,13 +1814,25 @@ def render_intuitive_state_overview(state: dict) -> str:
          data-viewport-start="{state['viewport_start']:.3f}" data-viewport-end="{state['viewport_end']:.3f}"
          data-viewport-min-span="{min_span:.3f}" data-viewport-max-span="{max_span:.3f}">
       <div class="intuitive-timeline-scale"><span>00:00:00</span><span>元動画全体</span><span>{utils.format_timestamp(duration)}</span></div>
-      <div class="intuitive-overview-track" role="img" aria-label="全体編集範囲と拡大表示範囲">
+      <div class="intuitive-overview-track" role="group" aria-label="全体編集範囲と拡大表示範囲">
         <div class="intuitive-overall-window" style="left:{overall_left:.4f}%;width:{overall_right - overall_left:.4f}%" title="全体編集範囲"></div>
         <div class="intuitive-overview-window" style="left:{viewport_left:.4f}%;width:{viewport_right - viewport_left:.4f}%" title="拡大表示範囲">
           <span class="intuitive-viewport-interaction">
-            <span class="intuitive-viewport-grip start" data-viewport-drag="start"></span>
-            <span class="intuitive-viewport-move" data-viewport-drag="move"></span>
-            <span class="intuitive-viewport-grip end" data-viewport-drag="end"></span>
+            <span class="intuitive-viewport-grip start" data-viewport-drag="start"
+                  role="slider" tabindex="0" aria-label="表示範囲の開始"
+                  aria-valuemin="0" aria-valuemax="{max(0.0, state['viewport_end'] - min_span):.3f}"
+                  aria-valuenow="{state['viewport_start']:.3f}"
+                  aria-valuetext="{utils.format_timestamp(state['viewport_start'])}"></span>
+            <span class="intuitive-viewport-move" data-viewport-drag="move"
+                  role="slider" tabindex="0" aria-label="表示範囲を移動"
+                  aria-valuemin="0" aria-valuemax="{max(0.0, duration - viewport_span):.3f}"
+                  aria-valuenow="{state['viewport_start']:.3f}"
+                  aria-valuetext="{utils.format_timestamp(state['viewport_start'])} ～ {utils.format_timestamp(state['viewport_end'])}"></span>
+            <span class="intuitive-viewport-grip end" data-viewport-drag="end"
+                  role="slider" tabindex="0" aria-label="表示範囲の終了"
+                  aria-valuemin="{min(duration, state['viewport_start'] + min_span):.3f}"
+                  aria-valuemax="{duration:.3f}" aria-valuenow="{state['viewport_end']:.3f}"
+                  aria-valuetext="{utils.format_timestamp(state['viewport_end'])}"></span>
           </span>
         </div>
       </div>
@@ -1574,6 +1848,27 @@ def render_intuitive_state_zoom(state: dict) -> str:
     view_start, view_end = float(state["viewport_start"]), float(state["viewport_end"])
     span = max(view_end - view_start, 0.1)
     midpoint = view_start + span / 2.0
+    result_mode = state.get("preview_mode", "source") == "result"
+    edit_mode = bool(state.get("timeline_edit_mode", False))
+    slider_disabled = result_mode or not edit_mode
+
+    def slider_attributes(kind: str, value: float, label: str) -> str:
+        if kind == "overall_start":
+            minimum, maximum = 0.0, max(0.0, float(state["overall_end"]) - 0.1)
+        elif kind == "overall_end":
+            minimum = min(float(state["duration"]), float(state["overall_start"]) + 0.1)
+            maximum = float(state["duration"])
+        else:
+            minimum, maximum = float(state["overall_start"]), float(state["overall_end"])
+        return (
+            f'role="slider" tabindex="{-1 if slider_disabled else 0}" '
+            f'aria-disabled="{str(slider_disabled).lower()}" '
+            f'aria-label="{html.escape(label, quote=True)}" '
+            f'aria-valuemin="{minimum:.3f}" aria-valuemax="{maximum:.3f}" '
+            f'aria-valuenow="{float(value):.3f}" '
+            f'aria-valuetext="{utils.format_timestamp(float(value))}" '
+            f'data-boundary-time="{float(value):.3f}"'
+        )
 
     def percent(value):
         return max(0.0, min(100.0, (float(value) - view_start) / span * 100.0))
@@ -1594,8 +1889,10 @@ def render_intuitive_state_zoom(state: dict) -> str:
         overlays.append(
             f'<div class="intuitive-cut-zone{selected_class}" style="left:{left:.4f}%;width:{right-left:.4f}%" '
             f'data-cut-id="{cut_id}" title="途中カット">'
-            f'<span class="intuitive-cut-handle start" data-boundary-kind="exclusion_start" data-cut-id="{cut_id}"></span>'
-            f'<span class="intuitive-cut-handle end" data-boundary-kind="exclusion_end" data-cut-id="{cut_id}"></span></div>'
+            f'<span class="intuitive-cut-handle start" data-boundary-kind="exclusion_start" data-cut-id="{cut_id}" '
+            f'{slider_attributes("exclusion_start", cut["start"], "途中カットの開始")}></span>'
+            f'<span class="intuitive-cut-handle end" data-boundary-kind="exclusion_end" data-cut-id="{cut_id}" '
+            f'{slider_attributes("exclusion_end", cut["end"], "途中カットの終了")}></span></div>'
         )
     handles = []
     for kind, value, css_class in (
@@ -1606,14 +1903,13 @@ def render_intuitive_state_zoom(state: dict) -> str:
         if 0 <= position <= 100:
             handles.append(
                 f'<div class="intuitive-handle {css_class}" style="left:{position:.4f}%" '
-                f'data-boundary-kind="{kind}" title="{kind}"></div>'
+                f'data-boundary-kind="{kind}" {slider_attributes(kind, value, dict(_INTUITIVE_BOUNDARY_LABELS).get(kind, kind))} '
+                f'title="{kind}"></div>'
             )
-    result_mode = state.get("preview_mode", "source") == "result"
     transcript_start, transcript_end = _intuitive_transcript_bounds(state)
     transcript_left = percent(transcript_start)
     transcript_right = percent(transcript_end)
     playhead_position = percent(state.get("playhead_sec", view_start))
-    edit_mode = bool(state.get("timeline_edit_mode", False))
     timeline_tool_title = (
         "" if edit_mode else "クリックで編集モードをONにして選択します。"
     )
@@ -1647,7 +1943,7 @@ def render_intuitive_state_zoom(state: dict) -> str:
         <span>共通境界ツール → 位置をクリック</span><div class="intuitive-tool-buttons">{timeline_tools}</div>
       </div>
       <div class="intuitive-timeline-scale"><span>{utils.format_timestamp(view_start)}</span><span>{utils.format_timestamp(midpoint)}</span><span>{utils.format_timestamp(view_end)}</span></div>
-      <div class="intuitive-zoom-track" role="img" aria-label="保存範囲、除外範囲、再生位置">
+      <div class="intuitive-zoom-track" role="group" aria-label="保存範囲、除外範囲、再生位置">
         <div class="intuitive-transcript-window" style="left:{transcript_left:.4f}%;width:{max(0.0, transcript_right - transcript_left):.4f}%"
              title="文字起こし表示: {utils.format_timestamp(transcript_start)} ～ {utils.format_timestamp(transcript_end)}"></div>
         <div class="intuitive-zoom-overall" style="left:{percent(state['overall_start']):.4f}%;width:{max(0.0, percent(state['overall_end']) - percent(state['overall_start'])):.4f}%"></div>
@@ -1737,6 +2033,7 @@ def handle_intuitive_command(command_json: str, state: dict):
         command = json.loads(command_json) if isinstance(command_json, str) else dict(command_json)
     except (TypeError, ValueError, json.JSONDecodeError):
         command = {}
+    command_id = str(command.get("command_id") or "")[:128]
     resume_for_tool = bool(
         isinstance(state, dict)
         and state.get("preview_mode", "source") == "result"
@@ -1759,15 +2056,14 @@ def handle_intuitive_command(command_json: str, state: dict):
         )
         if not isinstance(state, dict):
             raise
-        next_state = {
-            **state,
-            "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
-            "selected_boundary": (
-                dict(state["selected_boundary"])
-                if isinstance(state.get("selected_boundary"), dict) else None
-            ),
-            "revision": int(state.get("revision", 0)) + 1,
-        }
+        next_state = copy.deepcopy(state)
+        next_state["revision"] = int(state.get("revision", 0)) + 1
+        if command_id:
+            next_state["last_command_id"] = command_id
+            next_state["last_command_status"] = (
+                "validation_error" if isinstance(exc, gr.Error)
+                else "unexpected_error"
+            )
         return _intuitive_render_outputs(next_state)
     if command.get("type") == "fit_overall_to_viewport":
         gr.Info(
@@ -1783,21 +2079,28 @@ def handle_intuitive_command(command_json: str, state: dict):
                 "表示区間のプレビュー更新に失敗しました。元の表示区間へ戻します。"
                 f" ({type(exc).__name__})"
             )
-            recovered = {
-                **state,
-                "exclusions": [dict(cut) for cut in state.get("exclusions") or []],
-                "selected_boundary": (
-                    dict(state["selected_boundary"])
-                    if isinstance(state.get("selected_boundary"), dict) else None
-                ),
-                "revision": int(state.get("revision", 0)) + 1,
-            }
+            recovered = copy.deepcopy(state)
+            recovered["revision"] = int(state.get("revision", 0)) + 1
+            if command_id:
+                recovered["last_command_id"] = command_id
+                recovered["last_command_status"] = "unexpected_error"
             return _intuitive_render_outputs(recovered)
         return _intuitive_render_outputs(next_state, (preview, transcript, info))
     transcript = _render_intuitive_transcript_for_state(next_state)
     return _intuitive_render_outputs(
         next_state, (gr.update(), transcript, gr.update())
     )
+
+
+def sync_intuitive_editor(sync_token: str, state: dict):
+    """Read-only canonical redraw queued behind any in-flight editor command."""
+    if not isinstance(state, dict) or not state.get("nonce"):
+        raise gr.Error("先に動画を読み込んでください。")
+    safe_token = html.escape(str(sync_token or "")[:128], quote=True)
+    sync_ack = (
+        f'<span data-intuitive-sync-token="{safe_token}" aria-hidden="true"></span>'
+    )
+    return (*_intuitive_render_outputs(state), sync_ack)
 
 
 def adjust_intuitive_boundary(step: float, direction: float, state: dict):
@@ -1852,6 +2155,13 @@ def load_intuitive_editor(video_choice: str):
     )
 
 
+def load_intuitive_editor_with_search_target(video_choice: str):
+    """Load an edit session and synchronize search to that individual video."""
+    loaded = load_intuitive_editor(video_choice)
+    video_id = parse_video_choice(video_choice)
+    return (*loaded, gr.update(value=video_id or ALL_VIDEOS_VALUE))
+
+
 def select_intuitive_video_from_gallery(
     video_ids: list[str], filter_text: str, evt: gr.SelectData
 ):
@@ -1865,11 +2175,15 @@ def select_intuitive_video_from_gallery(
     _, _, cards_html = build_intuitive_video_gallery(filter_text, video_id)
     return (
         gr.update(selected_index=index), video_id, cards_html,
-        *load_intuitive_editor(video_id),
+        *load_intuitive_editor_with_search_target(video_id),
     )
 
 
-def refresh_intuitive_video_picker(filter_text: str, selected_video_id: str):
+def refresh_intuitive_video_picker(
+    filter_text: str,
+    selected_video_id: str,
+    current_search_target: str | None = None,
+):
     """Refresh cards and both fallback/search dropdowns without rebuilding thumbnails."""
     gallery_update, video_ids, cards_html = build_intuitive_video_gallery(
         filter_text, selected_video_id
@@ -1878,12 +2192,27 @@ def refresh_intuitive_video_picker(filter_text: str, selected_video_id: str):
         (str(caption).replace("\n", "  —  "), video_id)
         for (_, caption), video_id in zip(gallery_update["value"], video_ids)
     ]
+    search_choices = [("すべての動画", ALL_VIDEOS_VALUE), *choices]
+    search_update = {"choices": search_choices}
+    if current_search_target is not None:
+        preserved_target = current_search_target or ALL_VIDEOS_VALUE
+        if preserved_target not in {value for _label, value in search_choices}:
+            all_choices = list_video_choices()
+            preserved_choice = next(
+                (choice for choice in all_choices if choice[1] == preserved_target),
+                None,
+            )
+            if preserved_choice is not None:
+                search_choices.append(preserved_choice)
+            else:
+                preserved_target = ALL_VIDEOS_VALUE
+        search_update["value"] = preserved_target
     return (
         gallery_update,
         video_ids,
         cards_html,
         gr.update(choices=choices),
-        gr.update(choices=[("すべての動画", ALL_VIDEOS_VALUE), *choices]),
+        gr.update(**search_update),
     )
 
 
@@ -2037,10 +2366,14 @@ def save_intuitive_editor(state: dict, precise: bool, out_dir: str, filename: st
         "video_path": state["video_path"],
         "duration": state["duration"],
     }
-    return on_save(
+    saved_path = on_save(
         state["overall_start"], state["overall_end"], ctx,
         intuitive_state_to_clip_plan(state), precise, out_dir, filename,
     )
+    saved_state = copy.deepcopy(state)
+    saved_state["baseline_plan"] = _intuitive_plan_snapshot(saved_state)
+    saved_state["edit_dirty"] = False
+    return saved_path, saved_state, render_intuitive_toolbar(saved_state)
 
 
 def get_region_sentences(conn, video_id: str, lo: float, hi: float) -> list:
@@ -2093,7 +2426,9 @@ def _select_result(idx, results: list):
     conn.close()
 
     duration = video["duration"]
-    preview = make_preview(video["path"], start, end, duration)
+    preview = make_preview(
+        video["path"], start, end, duration, video_id=r["video_id"]
+    )
     info = (
         "プレビュー中: 元の全体範囲\n"
         f"動画: {video['path']}\n"
@@ -2147,7 +2482,9 @@ def manual_load(video_choice: str):
     sents = get_region_sentences(conn, video_id, 0.0, end + 90.0)
     conn.close()
 
-    preview = make_preview(video["path"], start, end, duration)
+    preview = make_preview(
+        video["path"], start, end, duration, video_id=video_id
+    )
     info = (
         "プレビュー中: 元の全体範囲\n"
         f"動画: {video['path']}\n"
@@ -2198,7 +2535,10 @@ def refresh_preview(start: float, end: float, ctx: dict):
     start, end = time_range
     if end <= start:
         raise gr.Error("終了は開始より後にしてください。")
-    preview = make_preview(ctx["video_path"], start, end, ctx["duration"])
+    preview = make_preview(
+        ctx["video_path"], start, end, ctx["duration"],
+        video_id=ctx.get("video_id"),
+    )
     conn = db.get_conn()
     transcript = region_transcript(conn, ctx["video_id"], start, end)
     conn.close()
@@ -2496,18 +2836,22 @@ def preview_clip_plan(start: float, end: float, ctx: dict, plan: dict | None):
     if not ranges:
         raise gr.Error("終了は開始より後にしてください。")
     if len(ranges) == 1:
-        preview = make_preview(ctx["video_path"], ranges[0][0], ranges[0][1], ctx["duration"])
+        preview = make_preview(
+            ctx["video_path"], ranges[0][0], ranges[0][1], ctx["duration"],
+            video_id=ctx.get("video_id"),
+        )
     else:
-        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-        range_key = repr([(round(s, 3), round(e, 3)) for s, e in ranges])
-        key = hashlib.sha1(range_key.encode("utf-8")).hexdigest()[:16]
-        out = PREVIEW_DIR / f"preview_multi_{ctx['video_id']}_{key}.mp4"
-        if not out.exists():
-            cut_clips(
-                Path(ctx["video_path"]), ranges, out,
+        out = _multi_preview_path(
+            ctx.get("video_id"), ctx["video_path"], ranges
+        )
+        preview = _create_cached_preview(
+            out,
+            lambda temporary: cut_clips(
+                Path(ctx["video_path"]), ranges, temporary,
                 precise=False, duration=ctx["duration"],
-            )
-        preview = str(out)
+                timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+            ),
+        )
     conn = db.get_conn()
     try:
         transcripts = [
@@ -2919,6 +3263,13 @@ button#intuitive-preview-result, #intuitive-preview-result button {
   display: flex; align-items: center; justify-content: space-between; gap: .4rem;
 }
 .intuitive-tool-heading strong { white-space: nowrap; font-size: .92rem; }
+.intuitive-history-actions { display: inline-flex; gap: .25rem; }
+.intuitive-history-actions button {
+  border: 1px solid var(--border-color-primary); border-radius: .3rem;
+  padding: .14rem .4rem; font-size: .75rem;
+  background: var(--button-secondary-background-fill); color: var(--body-text-color);
+}
+.intuitive-history-actions button:disabled { opacity: .45; cursor: not-allowed; }
 .intuitive-tool-buttons { display: flex; gap: .25rem; margin: .18rem 0; }
 .intuitive-tool-button {
   flex: 1; min-width: 4.2rem; border: 1px solid var(--border-color-primary);
@@ -2933,6 +3284,18 @@ button#intuitive-preview-result, #intuitive-preview-result button {
 .intuitive-tool-status {
   font-size: .74rem; line-height: 1.25; color: var(--body-text-color-subdued);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.intuitive-command-wait-notice {
+  display: flex; align-items: center; gap: .55rem;
+  margin: .3rem .35rem 0; padding: .35rem .55rem;
+  border: 1px solid var(--border-color-primary); border-radius: .35rem;
+  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
+  font-size: .78rem; line-height: 1.35;
+}
+.intuitive-command-wait-notice button {
+  flex: 0 0 auto; margin-left: auto; padding: .2rem .55rem;
+  border: 1px solid var(--border-color-primary); border-radius: .3rem;
+  background: var(--button-secondary-background-fill);
 }
 #intuitive-transcript-words {
   flex: 1 1 0 !important; min-height: 0 !important; height: auto !important;
@@ -3198,7 +3561,10 @@ button#intuitive-preview-result, #intuitive-preview-result button {
 .intuitive-legend-cut { color: var(--body-text-color-subdued); }
 .intuitive-legend-position { color: #e53935; }
 .intuitive-legend-transcript { color: #7e57c2; }
-#intuitive-command-json, #intuitive-command-submit { display: none !important; }
+#intuitive-command-json, #intuitive-command-submit,
+#intuitive-sync-token, #intuitive-sync-submit, #intuitive-sync-ack {
+  display: none !important;
+}
 body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-before,
 body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-before button,
 body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-after,
@@ -3224,19 +3590,36 @@ _INTUITIVE_EDITOR_JS = r"""() => {
   document.__intuitiveEditorInstalled = true;
   let drag = null;
   let commandBusy = false;
+  let revisionWaitTimer = null;
+  let revisionWaitToken = 0;
+  let syncPollTimer = null;
+  let commandSequence = 0;
+  let activeRevisionWait = null;
+  let playheadFrame = null;
+  let pendingPlayheadAbsolute = null;
   let transcriptFocusPending = null;
   let fallbackSwitchArmed = false;
   const commandQueue = [];
-  const VIDEO_SWITCH_WARNING = '現在の編集内容はこの画面から失われます。動画を切り替えますか？';
+  const DIRTY_EDIT_SWITCH_WARNING = '現在の編集内容はこの画面から失われます。動画を切り替えますか？';
+  const PENDING_OPERATION_SWITCH_WARNING = '処理中の操作が完了した後に動画を切り替えます。よろしいですか？';
+  const FALLBACK_SWITCH_KEYS = new Set(['Enter', ' ', 'ArrowDown', 'ArrowUp']);
+  const AWAIT_REVISION_SLOW_MS = 15000;
+  const AWAIT_REVISION_POLL_MS = 50;
+  const AWAIT_REVISION_SLOW_POLL_MS = 750;
+  const COMMAND_WAIT_NOTICE_ID = 'intuitive-command-wait-notice';
 
   const editorMeta = () => {
     const root = document.querySelector('#intuitive-toolbox [data-intuitive-root]');
     if (!root) return null;
     const meta = {
       revision: Number(root.dataset.revision), nonce: root.dataset.nonce,
+      lastCommandId: root.dataset.lastCommandId || '',
+      lastCommandStatus: root.dataset.lastCommandStatus || '',
       previewMode: root.dataset.previewMode || 'source',
       activeTool: root.dataset.activeTool || '',
       editDirty: root.dataset.editDirty === 'true',
+      canUndo: root.dataset.canUndo === 'true',
+      canRedo: root.dataset.canRedo === 'true',
       transcriptStart: Number(root.dataset.transcriptStart),
       transcriptEnd: Number(root.dataset.transcriptEnd),
       viewportStart: Number(root.dataset.viewportStart),
@@ -3268,20 +3651,61 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     if (content && button && getComputedStyle(content).display === 'none') button.click();
     if (accordion) accordion.scrollIntoView({block: 'start', behavior: 'smooth'});
   };
-  const confirmDirtyVideoSwitch = () => {
+  const confirmDirtySessionReplacement = () => {
     const meta = editorMeta();
-    return !meta || !meta.editDirty || window.confirm(VIDEO_SWITCH_WARNING);
+    const hasDirtyEdit = Boolean(meta && meta.editDirty);
+    const hasPendingOperation = commandBusy || commandQueue.length > 0;
+    if (!hasDirtyEdit && !hasPendingOperation) return true;
+    const warning = hasDirtyEdit
+      ? DIRTY_EDIT_SWITCH_WARNING : PENDING_OPERATION_SWITCH_WARNING;
+    const confirmed = window.confirm(warning);
+    if (confirmed) {
+      // Commands that have not started belong to the session being replaced.
+      // Drop them now; an in-flight command is serialized by Gradio's shared
+      // concurrency_id and its eventual response precedes the replacement.
+      commandQueue.length = 0;
+    }
+    return confirmed;
   };
-
-  // Gradio's Gallery select listener runs in the bubble phase.  Reject a
-  // dirty-session switch in capture phase so its callback and fresh nonce are
-  // never started after cancellation.
-  document.addEventListener('click', (event) => {
-    const gallery = event.target.closest('#intuitive-video-gallery');
-    const card = event.target.closest('button, [role="button"], .gallery-item');
-    if (!gallery || !card || confirmDirtyVideoSwitch()) return;
+  const stopDirtySessionReplacement = (event) => {
+    if (confirmDirtySessionReplacement()) return false;
     event.preventDefault();
     event.stopImmediatePropagation();
+    return true;
+  };
+  const isReplacementClick = (event) => {
+    const target = event.target;
+    const gallery = target.closest('#intuitive-video-gallery');
+    const galleryCard = target.closest('button, [role="button"], .gallery-item');
+    if (gallery && galleryCard) return true;
+    return Boolean(target.closest(
+      'button#intuitive-load-video, #intuitive-load-video button, ' +
+      'button#intuitive-search-button, #intuitive-search-button button'
+    ));
+  };
+  const isSearchResultSelection = (event) => {
+    const resultCell = event.target.closest(
+      '#intuitive-search-results .body-cell, ' +
+      '#intuitive-search-results td, ' +
+      '#intuitive-search-results [role="gridcell"]'
+    );
+    if (!resultCell) return false;
+    return Boolean(resultCell.closest('.virtual-row, tr, [role="row"]'));
+  };
+
+  // All click-driven session replacements share one capture-phase guard.
+  // Result-table blank space, headers and scrollbars do not match a data cell.
+  document.addEventListener('click', (event) => {
+    if (isReplacementClick(event)) stopDirtySessionReplacement(event);
+  }, true);
+
+  // Gradio 6.19 Dataframe dispatches selection from mousedown on a
+  // .body-cell inside .virtual-row. Guard that exact phase so cancellation
+  // stops the select callback; headers, blank space and scrollbars do not
+  // match a data cell. Search results are excluded from the click guard above,
+  // so one gesture can never prompt twice.
+  document.addEventListener('mousedown', (event) => {
+    if (isSearchResultSelection(event)) stopDirtySessionReplacement(event);
   }, true);
 
   // The visible card grid is a display-only layer. Forward its clicks (by
@@ -3305,16 +3729,21 @@ _INTUITIVE_EDITOR_JS = r"""() => {
   // confirmation remains at the actual choice, avoiding a double prompt.
   const armFallbackSwitch = (event) => {
     if (!event.target.closest('#intuitive-video-select') || fallbackSwitchArmed) return;
-    if (!confirmDirtyVideoSwitch()) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      return;
-    }
+    if (stopDirtySessionReplacement(event)) return;
     fallbackSwitchArmed = true;
   };
   document.addEventListener('pointerdown', armFallbackSwitch, true);
   document.addEventListener('keydown', (event) => {
-    if (['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(event.key)) armFallbackSwitch(event);
+    if (event.isComposing || event.keyCode === 229) return;
+    // Keep fallback keyboard selection and search submit in this same capture
+    // listener. Their DOM targets are mutually exclusive, so Enter can never
+    // produce two confirmations for one user gesture.
+    if (FALLBACK_SWITCH_KEYS.has(event.key)) armFallbackSwitch(event);
+    if (
+      event.key === 'Enter'
+      && event.target.closest('#intuitive-search-query')
+    ) stopDirtySessionReplacement(event);
+    handleIntuitiveKeydown(event);
   }, true);
   document.addEventListener('focusout', (event) => {
     if (event.target.closest('#intuitive-video-select')) {
@@ -3324,6 +3753,116 @@ _INTUITIVE_EDITOR_JS = r"""() => {
   document.addEventListener('input', (event) => {
     if (event.target.closest('#intuitive-video-select')) fallbackSwitchArmed = false;
   }, true);
+  const clearCommandWaitNotice = () => {
+    document.getElementById(COMMAND_WAIT_NOTICE_ID)?.remove();
+  };
+  const showCommandWaitNotice = (message = '') => {
+    const root = document.querySelector('#intuitive-toolbox [data-intuitive-root]');
+    if (!root) return false;
+    const existing = document.getElementById(COMMAND_WAIT_NOTICE_ID);
+    const notice = existing || document.createElement('div');
+    notice.id = COMMAND_WAIT_NOTICE_ID;
+    notice.className = 'intuitive-command-wait-notice';
+    notice.setAttribute('role', 'status');
+    notice.setAttribute('aria-live', 'polite');
+    notice.replaceChildren();
+    const text = document.createElement('span');
+    text.textContent = message || '処理中です。続けて行った操作は順番に反映されます。';
+    notice.appendChild(text);
+    if (!message) {
+      const syncButton = document.createElement('button');
+      syncButton.type = 'button';
+      syncButton.textContent = '状態を再確認';
+      syncButton.setAttribute('data-intuitive-sync-state', '');
+      notice.appendChild(syncButton);
+    }
+    if (!existing) root.insertAdjacentElement('afterend', notice);
+    return true;
+  };
+  const finishRevisionWait = (waitToken, warning = '') => {
+    if (waitToken !== revisionWaitToken) return;
+    if (revisionWaitTimer !== null) clearTimeout(revisionWaitTimer);
+    if (syncPollTimer !== null) clearTimeout(syncPollTimer);
+    revisionWaitTimer = null;
+    syncPollTimer = null;
+    activeRevisionWait = null;
+    clearCommandWaitNotice();
+    if (warning) showCommandWaitNotice(warning);
+    commandBusy = false;
+    flushCommandQueue();
+  };
+  const finishAcknowledgedCommand = (current, commandId, waitToken) => {
+    if (!current || current.lastCommandId !== commandId) return false;
+    if (current.lastCommandStatus === 'success') {
+      finishRevisionWait(waitToken);
+    } else {
+      commandQueue.length = 0;
+      finishRevisionWait(
+        waitToken,
+        '直前の操作を適用できなかったため、後続の操作を破棄しました。画面の状態を確認し、必要なら操作をやり直してください。'
+      );
+    }
+    return true;
+  };
+  const newBridgeId = (prefix) => {
+    const randomUUID = globalThis.crypto && globalThis.crypto.randomUUID;
+    if (typeof randomUUID === 'function') return randomUUID.call(globalThis.crypto);
+    commandSequence += 1;
+    return `${prefix}-${Date.now()}-${commandSequence}`;
+  };
+  const requestStateSync = () => {
+    const pending = activeRevisionWait;
+    if (!pending || pending.syncToken) return;
+    const field = document.querySelector(
+      '#intuitive-sync-token textarea, #intuitive-sync-token input'
+    );
+    const button = document.querySelector(
+      '#intuitive-sync-submit button, button#intuitive-sync-submit, #intuitive-sync-submit'
+    );
+    if (!field || !button) return;
+    const syncToken = newBridgeId('sync');
+    pending.syncToken = syncToken;
+    const prototype = field instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
+    setter.call(field, syncToken);
+    field.dispatchEvent(new InputEvent('input', {
+      bubbles: true, composed: true, inputType: 'insertText', data: null
+    }));
+    requestAnimationFrame(() => button.click());
+    const awaitSync = () => {
+      if (!activeRevisionWait || activeRevisionWait.waitToken !== pending.waitToken) return;
+      syncPollTimer = null;
+      const ack = document.querySelector(
+        '#intuitive-sync-ack [data-intuitive-sync-token]'
+      );
+      if (ack && ack.dataset.intuitiveSyncToken === syncToken) {
+        const current = editorMeta();
+        if (current && current.nonce !== pending.awaitedNonce) {
+          finishRevisionWait(pending.waitToken);
+        } else if (finishAcknowledgedCommand(
+          current, pending.commandId, pending.waitToken
+        )) {
+          return;
+        } else {
+          commandQueue.length = 0;
+          finishRevisionWait(
+            pending.waitToken,
+            '直前の操作が反映されたか確認できません。画面の状態を確認し、必要なら操作をやり直してください。後続の操作は破棄しました。'
+          );
+        }
+        return;
+      }
+      syncPollTimer = setTimeout(awaitSync, 100);
+    };
+    if (syncPollTimer !== null) clearTimeout(syncPollTimer);
+    syncPollTimer = setTimeout(awaitSync, 100);
+  };
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('[data-intuitive-sync-state]')) return;
+    event.preventDefault();
+    requestStateSync();
+  });
   const flushCommandQueue = () => {
     if (commandBusy || !commandQueue.length) return;
     const queued = commandQueue.shift();
@@ -3342,9 +3881,13 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     const button = document.querySelector(
       '#intuitive-command-submit button, button#intuitive-command-submit, #intuitive-command-submit'
     );
-    if (!field || !button) { setTimeout(flushCommandQueue, 100); return; }
+    if (!field || !button) {
+      commandQueue.unshift(queued);
+      setTimeout(flushCommandQueue, 100);
+      return;
+    }
     commandBusy = true;
-    const previousRevision = meta.revision;
+    const commandId = queued.commandId;
     const prototype = field instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
@@ -3354,37 +3897,152 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     }));
     requestAnimationFrame(() => button.click());
     const started = performance.now();
-    const AWAIT_REVISION_TIMEOUT_MS = 15000;
+    const awaitedNonce = meta.nonce;
+    const waitToken = ++revisionWaitToken;
+    activeRevisionWait = {waitToken, commandId, awaitedNonce, syncToken: ''};
+    let slowNoticeShown = false;
     const awaitRevision = () => {
+      if (waitToken !== revisionWaitToken) return;
+      revisionWaitTimer = null;
       const current = editorMeta();
       const elapsed = performance.now() - started;
-      if (current && current.revision !== previousRevision) {
-        commandBusy = false;
-        flushCommandQueue();
-      } else if (elapsed > AWAIT_REVISION_TIMEOUT_MS) {
-        // Self-recovery safety net: if the server-side revision never
-        // advances (dropped network response, unexpected server exception
-        // that somehow still slips past handle_intuitive_command's own
-        // catch-all), don't let commandBusy stay stuck forever -- that would
-        // silently freeze every subsequent command (including viewport
-        // drags) until the page is reloaded.
-        console.warn(
-          '[intuitive-editor] revision did not advance within',
-          AWAIT_REVISION_TIMEOUT_MS, 'ms; releasing the command queue.'
-        );
-        commandBusy = false;
-        flushCommandQueue();
-      } else {
-        setTimeout(awaitRevision, 50);
+      if (current && current.nonce !== awaitedNonce) {
+        finishRevisionWait(waitToken);
+        return;
       }
+      if (finishAcknowledgedCommand(current, commandId, waitToken)) return;
+      if (elapsed >= AWAIT_REVISION_SLOW_MS && !slowNoticeShown) {
+        slowNoticeShown = showCommandWaitNotice();
+        if (slowNoticeShown) {
+          console.warn(
+            '[intuitive-editor] command is still waiting for its acknowledgement after',
+            AWAIT_REVISION_SLOW_MS, 'ms; the queue remains paused.'
+          );
+        }
+      }
+      const pollInterval = elapsed >= AWAIT_REVISION_SLOW_MS
+        ? AWAIT_REVISION_SLOW_POLL_MS : AWAIT_REVISION_POLL_MS;
+      revisionWaitTimer = setTimeout(awaitRevision, pollInterval);
     };
-    setTimeout(awaitRevision, 50);
+    if (revisionWaitTimer !== null) clearTimeout(revisionWaitTimer);
+    revisionWaitTimer = setTimeout(awaitRevision, AWAIT_REVISION_POLL_MS);
+  };
+  const currentSourcePlayhead = (meta) => {
+    if (!meta || meta.previewMode === 'result') return null;
+    const video = document.querySelector('#intuitive-preview-video video');
+    if (!(video instanceof HTMLVideoElement)) return null;
+    const currentTime = Number(video.currentTime);
+    if (!Number.isFinite(currentTime) || !Number.isFinite(meta.previewStart)
+        || !Number.isFinite(meta.previewEnd)) return null;
+    const absolute = meta.previewStart + currentTime;
+    return Math.max(meta.previewStart, Math.min(meta.previewEnd, absolute));
   };
   const send = (payload) => {
     const meta = editorMeta();
     if (!meta) return;
-    commandQueue.push({payload, nonce: meta.nonce});
+    const queuedPayload = {...payload};
+    queuedPayload.command_id = newBridgeId('command');
+    const playhead = currentSourcePlayhead(meta);
+    if (Number.isFinite(playhead)) queuedPayload.playhead_sec = playhead;
+    commandQueue.push({
+      payload: queuedPayload, nonce: meta.nonce,
+      commandId: queuedPayload.command_id
+    });
     flushCommandQueue();
+  };
+  const currentAdjustmentStep = () => {
+    const selected = document.querySelector('#intuitive-adjust-step input:checked');
+    const step = Number(selected ? selected.value : 1.0);
+    return Number.isFinite(step) && step > 0 ? step : 1.0;
+  };
+  const handleIntuitiveKeydown = (event) => {
+    if (event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const editable = target.closest(
+      'input, textarea, select, [contenteditable]:not([contenteditable="false"])'
+    );
+    const meta = editorMeta();
+    const lowerKey = String(event.key || '').toLowerCase();
+    if (event.ctrlKey && !event.altKey && !event.metaKey && !editable) {
+      const redo = lowerKey === 'y' || (lowerKey === 'z' && event.shiftKey);
+      const undo = lowerKey === 'z' && !event.shiftKey;
+      if (!meta || meta.previewMode === 'result') return;
+      if ((undo && meta.canUndo) || (redo && meta.canRedo)) {
+        event.preventDefault();
+        send({type: redo ? 'redo' : 'undo'});
+      }
+      return;
+    }
+    if (editable || event.ctrlKey || event.altKey || event.metaKey) return;
+
+    const word = target.closest('#intuitive-transcript-words .intuitive-word[role="button"]');
+    if (word) {
+      if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+        event.preventDefault();
+        word.click();
+        return;
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        const words = Array.from(document.querySelectorAll(
+          '#intuitive-transcript-words .intuitive-word[role="button"]'
+        ));
+        const index = words.indexOf(word);
+        const direction = event.key === 'ArrowLeft' ? -1 : 1;
+        const next = words[Math.max(0, Math.min(words.length - 1, index + direction))];
+        if (next) {
+          words.forEach((item) => item.tabIndex = -1);
+          next.tabIndex = 0;
+          next.focus();
+        }
+        return;
+      }
+    }
+
+    const boundary = target.closest('[data-boundary-kind][role="slider"]');
+    if (boundary && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      if (boundary.getAttribute('aria-disabled') === 'true' || !meta
+          || meta.previewMode === 'result' || !meta.timelineEditMode) return;
+      event.preventDefault();
+      const direction = event.key === 'ArrowLeft' ? -1 : 1;
+      const current = Number(boundary.dataset.boundaryTime);
+      if (!Number.isFinite(current)) return;
+      send({
+        type: 'set_boundary', kind: boundary.dataset.boundaryKind,
+        id: boundary.dataset.cutId || null,
+        time: current + direction * currentAdjustmentStep()
+      });
+      return;
+    }
+
+    const viewportPart = target.closest('[data-viewport-drag][role="slider"]');
+    if (viewportPart && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      const overview = viewportPart.closest('[data-intuitive-overview]');
+      if (!overview) return;
+      event.preventDefault();
+      const direction = event.key === 'ArrowLeft' ? -1 : 1;
+      const delta = direction * currentAdjustmentStep();
+      const duration = Number(overview.dataset.duration);
+      const minSpan = Number(overview.dataset.viewportMinSpan);
+      const maxSpan = Number(overview.dataset.viewportMaxSpan);
+      let start = Number(overview.dataset.viewportStart);
+      let end = Number(overview.dataset.viewportEnd);
+      if (![duration, minSpan, maxSpan, start, end].every(Number.isFinite)) return;
+      const mode = viewportPart.dataset.viewportDrag;
+      if (mode === 'move') {
+        const width = end - start;
+        start = Math.max(0, Math.min(duration - width, start + delta));
+        end = start + width;
+      } else if (mode === 'start') {
+        start = Math.max(0, Math.min(end - minSpan, start + delta));
+        start = Math.max(start, end - maxSpan);
+      } else {
+        end = Math.min(duration, Math.max(start + minSpan, end + delta));
+        end = Math.min(end, start + maxSpan);
+      }
+      send({type: 'set_viewport', start, end});
+    }
   };
   const timeAtPointer = (track, event, lo, hi) => {
     const rect = track.getBoundingClientRect();
@@ -3445,6 +4103,28 @@ _INTUITIVE_EDITOR_JS = r"""() => {
       currentDrag.summary.textContent = `${formatTimelineTime(start)} ～ ${formatTimelineTime(end)}（${(end - start).toFixed(1)}秒）`;
     }
   };
+  const updateZoomPlayhead = (zoom, absolute) => {
+    if (!zoom || zoom.dataset.previewMode === 'result' || !Number.isFinite(absolute)) return;
+    const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return;
+    const playhead = zoom.querySelector('.intuitive-playhead');
+    if (!playhead) return;
+    const clamped = Math.max(lo, Math.min(hi, absolute));
+    const percent = (clamped - lo) / (hi - lo) * 100;
+    playhead.style.left = `${percent}%`;
+  };
+  const scheduleZoomPlayhead = (absolute) => {
+    if (!Number.isFinite(absolute)) return;
+    pendingPlayheadAbsolute = absolute;
+    if (playheadFrame !== null) return;
+    playheadFrame = requestAnimationFrame(() => {
+      playheadFrame = null;
+      const pending = pendingPlayheadAbsolute;
+      pendingPlayheadAbsolute = null;
+      const currentZoom = document.querySelector('[data-intuitive-zoom]');
+      updateZoomPlayhead(currentZoom, pending);
+    });
+  };
   const seekZoom = (zoom, event) => {
     if (!zoom || zoom.dataset.previewMode === 'result') return;
     const track = zoom.querySelector('.intuitive-zoom-track');
@@ -3455,22 +4135,37 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     if (video && absolute >= previewStart && absolute <= previewEnd) {
       video.currentTime = Math.max(0, absolute - previewStart);
     }
-    const playhead = zoom.querySelector('.intuitive-playhead');
-    if (playhead) playhead.style.left = `${(absolute - lo) / (hi - lo) * 100}%`;
+    updateZoomPlayhead(zoom, absolute);
     requestTranscriptFocus(absolute);
   };
 
-  document.addEventListener('timeupdate', (event) => {
+  const syncPlayheadFromVideo = (event) => {
     const video = event.target;
     if (!(video instanceof HTMLVideoElement) || !video.closest('#intuitive-preview-video')) return;
     const zoom = document.querySelector('[data-intuitive-zoom]');
     if (!zoom || zoom.dataset.previewMode === 'result') return;
-    const absolute = Number(zoom.dataset.previewStart) + Number(video.currentTime || 0);
-    requestTranscriptFocus(absolute);
-  }, true);
+    const previewStart = Number(zoom.dataset.previewStart);
+    const currentTime = Number(video.currentTime);
+    if (!Number.isFinite(previewStart) || !Number.isFinite(currentTime)) return;
+    const absolute = previewStart + currentTime;
+    scheduleZoomPlayhead(absolute);
+    if (event.type === 'timeupdate') requestTranscriptFocus(absolute);
+  };
+  document.addEventListener('timeupdate', syncPlayheadFromVideo, true);
+  document.addEventListener('seeking', syncPlayheadFromVideo, true);
 
   document.addEventListener('click', (event) => {
     const meta = editorMeta();
+    const historyButton = event.target.closest('[data-intuitive-history]');
+    if (historyButton) {
+      event.preventDefault();
+      const action = historyButton.dataset.intuitiveHistory;
+      if (!meta || meta.previewMode === 'result' || historyButton.disabled) return;
+      if ((action === 'undo' && meta.canUndo) || (action === 'redo' && meta.canRedo)) {
+        send({type: action});
+      }
+      return;
+    }
     const reselectButton = event.target.closest(
       'button#intuitive-reselect-video, #intuitive-reselect-video button'
     );
@@ -3572,6 +4267,9 @@ _INTUITIVE_EDITOR_JS = r"""() => {
     const word = event.target.closest('#intuitive-transcript-words .intuitive-word');
     if (word) {
       if (meta && meta.previewMode === 'result') return;
+      document.querySelectorAll(
+        '#intuitive-transcript-words .intuitive-word[role="button"]'
+      ).forEach((item) => item.tabIndex = item === word ? 0 : -1);
       send({type: 'set_from_word', start: Number(word.dataset.start), end: Number(word.dataset.end)});
       return;
     }
@@ -4596,6 +5294,16 @@ with gr.Blocks(title="動画シーン検索") as demo:
         intuitive_command_submit = gr.Button(
             "command", elem_id="intuitive-command-submit",
         )
+        intuitive_sync_token = gr.Textbox(
+            value="", elem_id="intuitive-sync-token",
+        )
+        intuitive_sync_submit = gr.Button(
+            "sync", elem_id="intuitive-sync-submit",
+        )
+        intuitive_sync_ack = gr.HTML(
+            value='<span data-intuitive-sync-token="" aria-hidden="true"></span>',
+            elem_id="intuitive-sync-ack",
+        )
         intuitive_render_outputs = [
             intuitive_state,
             intuitive_toolbar,
@@ -4621,19 +5329,23 @@ with gr.Blocks(title="動画シーン検索") as demo:
             intuitive_exclusion_list,
             intuitive_selected_time,
         ]
+        intuitive_load_and_search_outputs = [
+            *intuitive_load_outputs,
+            intuitive_search_target,
+        ]
         intuitive_load_btn.click(
-            load_intuitive_editor,
+            load_intuitive_editor_with_search_target,
             inputs=[intuitive_video_select],
-            outputs=intuitive_load_outputs,
+            outputs=intuitive_load_and_search_outputs,
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
         ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
         # `.input` reacts only to a user's fallback selection.  Gallery output
         # may update the Dropdown value too, without starting a duplicate load.
         intuitive_video_select.input(
-            load_intuitive_editor,
+            load_intuitive_editor_with_search_target,
             inputs=[intuitive_video_select],
-            outputs=intuitive_load_outputs,
+            outputs=intuitive_load_and_search_outputs,
             trigger_mode="always_last",
             show_progress="minimal",
             concurrency_id="intuitive-editor-state",
@@ -4665,7 +5377,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         intuitive_reload_btn.click(
             refresh_intuitive_video_picker,
-            inputs=[intuitive_video_filter, intuitive_video_select],
+            inputs=[
+                intuitive_video_filter, intuitive_video_select,
+                intuitive_search_target,
+            ],
             outputs=[
                 intuitive_video_gallery,
                 intuitive_video_gallery_ids,
@@ -4681,7 +5396,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_video_gallery,
                 intuitive_video_select,
                 intuitive_video_gallery_html,
-                *intuitive_load_outputs,
+                *intuitive_load_and_search_outputs,
             ],
             trigger_mode="always_last",
             show_progress="minimal",
@@ -4751,6 +5466,13 @@ with gr.Blocks(title="動画シーン検索") as demo:
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
         )
+        intuitive_sync_submit.click(
+            sync_intuitive_editor,
+            inputs=[intuitive_sync_token, intuitive_state],
+            outputs=[*intuitive_render_outputs, intuitive_sync_ack],
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        )
         intuitive_preview_result_btn.click(
             preview_intuitive_editor,
             inputs=[intuitive_state],
@@ -4771,7 +5493,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_state, intuitive_precise,
                 intuitive_out_dir, intuitive_filename,
             ],
-            outputs=[intuitive_saved_path],
+            outputs=[intuitive_saved_path, intuitive_state, intuitive_toolbar],
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
         )
@@ -4904,7 +5626,9 @@ if __name__ == "__main__":
         webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
         raise SystemExit(0)
 
+    _enable_crash_log()
     _cleanup_stale_index_job()
+    _initialize_preview_cache()
     demo.launch(
         server_name="127.0.0.1",
         server_port=APP_PORT,

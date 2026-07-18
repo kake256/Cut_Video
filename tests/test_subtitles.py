@@ -1,7 +1,9 @@
 import unittest
 
 from moment_retrieval.edit_domain import EditPlan, TimeRange, make_effective_export_plan
-from moment_retrieval.subtitles import map_subtitles
+from moment_retrieval.subtitles import (
+    SubtitleValidationError, map_subtitles, validate_srt_text,
+)
 from moment_retrieval.transcript_types import (
     TimestampGranularity, TranscriptSegment, TranscriptWord,
 )
@@ -38,6 +40,16 @@ class SubtitleTest(unittest.TestCase):
         )
         result = map_subtitles([segment], effective)
         self.assertEqual((result.cues[0].start_ms, result.cues[0].end_ms), (0, 1_000))
+
+    def test_srt_validation_uses_probed_duration_and_frame_tolerance(self):
+        text = "1\n00:00:00,000 --> 00:00:01,034\ntest\n"
+        self.assertEqual(validate_srt_text(text, 1_000, 34), ((0, 1_034),))
+        with self.assertRaises(SubtitleValidationError):
+            validate_srt_text(text, 1_000, 33)
+
+    def test_non_empty_srt_without_timing_is_rejected(self):
+        with self.assertRaises(SubtitleValidationError):
+            validate_srt_text("not an srt", 1_000, 34)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,18 @@
 import io
 import json
 import sqlite3
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import video_tool
 from moment_retrieval import db
+from moment_retrieval.application import DocumentRepository
 from moment_retrieval.contracts import ContractError, failure, success
+from moment_retrieval.publication import publish_text_snapshot
 
 
 class CLIContractTest(unittest.TestCase):
@@ -41,6 +45,7 @@ class CLIContractTest(unittest.TestCase):
             ("synthetic-storage", 1.0, 2.0, "synthetic needle", "[]"),
         )
         db.mark_asr_complete(conn, "synthetic-storage")
+        publish_text_snapshot(conn, None)
         public_id = db.public_video_id(conn, "synthetic-storage")
         args = SimpleNamespace(
             query="needle",
@@ -60,6 +65,50 @@ class CLIContractTest(unittest.TestCase):
         self.assertEqual(len(payload["data"]["text_hits"]), 1)
         self.assertEqual(payload["data"]["semantic_hits"], [])
         embedder.assert_not_called()
+
+    def test_clip_binds_generation_fingerprint_before_central_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "synthetic.mp4"
+            source.write_bytes(b"synthetic-source")
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps({
+                "source_duration_ms": 10_000,
+                "overall": [1_000, 9_000],
+                "exclusions": [],
+            }), encoding="utf-8")
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            db.init_db(conn)
+            db.insert_video(conn, "synthetic-storage", str(source), 10.0)
+            conn.commit()
+            public_id = db.public_video_id(conn, "synthetic-storage")
+            repository = DocumentRepository()
+            fake_result = SimpleNamespace(
+                video_path=root / "clip.mp4",
+                subtitle_path=None,
+                manifest_path=root / "clip.mp4.manifest.json",
+                commit_id="artifact_" + "a" * 32,
+            )
+            args = SimpleNamespace(
+                plan=plan_path,
+                video_id=public_id,
+                output=root / "clip.mp4",
+                precise=False,
+                srt=False,
+            )
+            with (
+                patch("video_tool.db.get_conn", return_value=conn),
+                patch("video_tool.DOCUMENTS", repository),
+                patch("video_tool.save_document", return_value=fake_result) as save,
+            ):
+                payload = video_tool._clip(args)
+
+            document_id = save.call_args.args[0]
+            document = repository.get(document_id)
+            self.assertEqual(document.public_video_id, public_id)
+            self.assertTrue(document.expected_source_fingerprint)
+            self.assertEqual(payload["data"]["public_video_id"], public_id)
 
 
 if __name__ == "__main__":

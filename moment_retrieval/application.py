@@ -28,6 +28,7 @@ class EditorDocument:
     latest_save_sequence: int = 0
     latest_completed_save_sequence: int = 0
     command_results: tuple[tuple[str, int], ...] = ()
+    expected_source_fingerprint: str | None = None
 
     @property
     def current(self) -> EditPlan:
@@ -41,6 +42,8 @@ class SaveTicket:
     sequence: int
     snapshot: EditPlan
     plan_hash: str
+    public_video_id: str | None = None
+    expected_source_fingerprint: str | None = None
 
 
 class DocumentRepository:
@@ -49,10 +52,14 @@ class DocumentRepository:
         self._lock = threading.RLock()
         self.command_cache_size = command_cache_size
 
-    def open(self, public_video_id: str, source_generation: str, plan: EditPlan) -> EditorDocument:
+    def open(
+        self, public_video_id: str, source_generation: str, plan: EditPlan,
+        expected_source_fingerprint: str | None = None,
+    ) -> EditorDocument:
         document = EditorDocument(
             f"doc_{uuid.uuid4().hex}", public_video_id, source_generation,
             EditHistory.create(plan),
+            expected_source_fingerprint=expected_source_fingerprint,
         )
         with self._lock:
             self._documents[document.document_id] = document
@@ -111,17 +118,33 @@ class DocumentRepository:
             self._documents[document_id] = updated
             return updated
 
-    def begin_save(self, document_id: str) -> SaveTicket:
+    def begin_save(
+        self, document_id: str, expected_source_fingerprint: str | None = None,
+    ) -> SaveTicket:
         with self._lock:
             document = self._documents.get(document_id)
             if not document or document.closed:
                 raise ApplicationError("document is closed or missing")
+            if (
+                document.expected_source_fingerprint is not None
+                and expected_source_fingerprint is not None
+                and document.expected_source_fingerprint != expected_source_fingerprint
+            ):
+                raise ApplicationError("source fingerprint does not match the open document")
+            bound_fingerprint = (
+                document.expected_source_fingerprint or expected_source_fingerprint
+            )
             sequence = document.latest_save_sequence + 1
-            updated = replace(document, latest_save_sequence=sequence)
+            updated = replace(
+                document,
+                latest_save_sequence=sequence,
+                expected_source_fingerprint=bound_fingerprint,
+            )
             self._documents[document_id] = updated
             return SaveTicket(
                 document_id, document.source_generation, sequence,
                 document.current, document.current.semantic_signature,
+                document.public_video_id, bound_fingerprint,
             )
 
     def sync_adapter_plan(self, document_id: str, plan: EditPlan, *, clean: bool = False) -> EditorDocument:
@@ -142,7 +165,17 @@ class DocumentRepository:
             raise ApplicationError("artifact commit ID is required")
         with self._lock:
             document = self._documents.get(ticket.document_id)
-            if not document or document.closed or document.source_generation != ticket.source_generation:
+            if (
+                not document
+                or document.closed
+                or document.source_generation != ticket.source_generation
+                or (
+                    ticket.public_video_id is not None
+                    and document.public_video_id != ticket.public_video_id
+                )
+                or document.expected_source_fingerprint
+                != ticket.expected_source_fingerprint
+            ):
                 return None
             if ticket.sequence < document.latest_completed_save_sequence:
                 return document

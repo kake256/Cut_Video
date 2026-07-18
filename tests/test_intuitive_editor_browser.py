@@ -223,7 +223,7 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         card.click()
         root = page.locator("#intuitive-toolbox [data-intuitive-root]")
         root.wait_for(state="visible")
-        page.get_by_text("2. 文字クエリー検索", exact=True).wait_for(
+        page.get_by_text("3. 文字クエリー検索", exact=True).wait_for(
             state="visible"
         )
         search_target_input = page.locator("#intuitive-search-target input")
@@ -240,17 +240,25 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         page.locator(
             "button#intuitive-search-button, #intuitive-search-button button"
         ).click()
+        search_results = page.locator("#intuitive-search-results")
+        search_results.wait_for(state="visible")
+        page.wait_for_function(
+            "() => document.querySelector('#intuitive-search-results')"
+            ".innerText.includes('alpha beta gamma delta')"
+        )
+        search_result_text = search_results.inner_text()
+        self.assertIn("alpha beta gamma delta", search_result_text)
+        self.assertEqual(root.get_attribute("data-nonce"), loaded_nonce)
+        # Search and editor mutations use separate lanes. Results are inert
+        # until the user explicitly selects a row.
+        search_results.locator(".body-cell").first.click()
         page.wait_for_function(
             "([selector, nonce]) => { const root = document.querySelector(selector); "
             "return root && root.dataset.nonce !== nonce "
             "&& root.dataset.editDirty === 'false'; }",
             arg=["#intuitive-toolbox [data-intuitive-root]", loaded_nonce],
         )
-        search_results = page.locator("#intuitive-search-results")
-        search_results.wait_for(state="visible")
-        search_result_text = search_results.inner_text()
-        self.assertIn("alpha beta gamma delta", search_result_text)
-        self.assertIn("● 1", search_result_text)
+        self.assertIn("● 1", search_results.inner_text())
         self.assertIn("synthetic_fixture.mp4", search_target_input.input_value())
         self.assertEqual(root.get_attribute("data-edit-dirty"), "false")
         self.assertEqual(root.get_attribute("data-can-undo"), "false")
@@ -274,6 +282,19 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         page.locator("#intuitive-transcript-words").get_by_text(
             "alpha", exact=True
         ).wait_for(state="visible")
+        preview_panel = page.locator("#intuitive-preview-video")
+        mode_header = page.locator("#intuitive-header")
+        self.assertIn("Source timeline", preview_panel.inner_text())
+        self.assertTrue(
+            mode_header.get_by_role(
+                "button", name="編集結果を確認", exact=True
+            ).is_visible()
+        )
+        self.assertFalse(
+            mode_header.get_by_role(
+                "button", name="元動画へ戻る", exact=True
+            ).is_visible()
+        )
         page.wait_for_function(
             """() => {
               const zoom = document.querySelector('#intuitive-zoom-timeline');
@@ -450,6 +471,17 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             "return root.dataset.previewMode === 'result' && video "
             "&& video.readyState >= 1 && Number.isFinite(video.duration); }"
         )
+        self.assertIn("Result timeline", preview_panel.inner_text())
+        self.assertFalse(
+            mode_header.get_by_role(
+                "button", name="編集結果を確認", exact=True
+            ).is_visible()
+        )
+        self.assertTrue(
+            mode_header.get_by_role(
+                "button", name="元動画へ戻る", exact=True
+            ).is_visible()
+        )
         self.assertNotEqual(
             page.locator("#intuitive-preview-video video").get_attribute("src"),
             source_video_src,
@@ -466,6 +498,17 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         page.wait_for_function(
             "() => document.querySelector("
             "'#intuitive-toolbox [data-intuitive-root]').dataset.previewMode === 'source'"
+        )
+        self.assertIn("Source timeline", preview_panel.inner_text())
+        self.assertTrue(
+            mode_header.get_by_role(
+                "button", name="編集結果を確認", exact=True
+            ).is_visible()
+        )
+        self.assertFalse(
+            mode_header.get_by_role(
+                "button", name="元動画へ戻る", exact=True
+            ).is_visible()
         )
         restored_playhead_left = float(page.locator(
             "[data-intuitive-zoom] .intuitive-playhead"
@@ -921,6 +964,90 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             )
         ]
         self.assertEqual(leftovers, [])
+
+    def test_responsive_layout_has_no_horizontal_overflow(self):
+        for width, height in ((1024, 768), (760, 900)):
+            with self.subTest(viewport=(width, height)):
+                context = self.browser.new_context(
+                    viewport={"width": width, "height": height}
+                )
+                try:
+                    page = context.new_page()
+                    page.set_default_timeout(30_000)
+                    page.goto(self.base_url, wait_until="domcontentloaded")
+                    page.get_by_role("tab", name="直感編集（試作）").click()
+                    page.locator(
+                        "#intuitive-video-card-grid .intuitive-video-card"
+                    ).first.click()
+                    page.locator(
+                        "#intuitive-toolbox [data-intuitive-root]"
+                    ).wait_for(state="visible")
+                    page.get_by_role(
+                        "tab", name="② 詳細編集（任意）", exact=True
+                    ).click()
+                    page.wait_for_timeout(250)
+
+                    layout = page.evaluate("""() => {
+                      const visibleRect = (selector) => {
+                        const node = Array.from(document.querySelectorAll(selector))
+                          .find((item) => item.getClientRects().length
+                            && getComputedStyle(item).display !== 'none');
+                        if (!node) return null;
+                        const r = node.getBoundingClientRect();
+                        return {x: r.x, y: r.y, right: r.right,
+                          bottom: r.bottom, width: r.width};
+                      };
+                      const documentElement = document.documentElement;
+                      return {
+                        clientWidth: documentElement.clientWidth,
+                        scrollWidth: Math.max(documentElement.scrollWidth,
+                          document.body ? document.body.scrollWidth : 0),
+                        header: visibleRect('#intuitive-header'),
+                        mode: visibleRect('#intuitive-mode-row'),
+                        workspace: visibleRect('#intuitive-workspace-row'),
+                        preview: visibleRect('#intuitive-preview-panel'),
+                        transcript: visibleRect('#intuitive-transcript-panel'),
+                        search: visibleRect('#intuitive-search-panel'),
+                        boundary: visibleRect('#intuitive-boundary-controls'),
+                        timelineTools: visibleRect('.intuitive-timeline-toolbox'),
+                        save: visibleRect('#intuitive-save-bar')
+                      };
+                    }""")
+                    self.assertLessEqual(
+                        layout["scrollWidth"], layout["clientWidth"] + 2
+                    )
+                    for name in (
+                        "header", "mode", "workspace", "preview", "transcript",
+                        "search", "boundary", "timelineTools", "save",
+                    ):
+                        rect = layout[name]
+                        self.assertIsNotNone(rect, name)
+                        self.assertGreaterEqual(rect["x"], -2, name)
+                        self.assertLessEqual(
+                            rect["right"], layout["clientWidth"] + 2, name
+                        )
+
+                    if width == 1024:
+                        self.assertAlmostEqual(
+                            layout["preview"]["y"], layout["transcript"]["y"],
+                            delta=3,
+                        )
+                        self.assertGreaterEqual(
+                            layout["search"]["y"],
+                            max(layout["preview"]["bottom"],
+                                layout["transcript"]["bottom"]) - 2,
+                        )
+                    else:
+                        self.assertGreaterEqual(
+                            layout["transcript"]["y"],
+                            layout["preview"]["bottom"] - 2,
+                        )
+                        self.assertGreaterEqual(
+                            layout["search"]["y"],
+                            layout["transcript"]["bottom"] - 2,
+                        )
+                finally:
+                    context.close()
 
 
 if __name__ == "__main__":

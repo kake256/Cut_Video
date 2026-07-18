@@ -87,7 +87,15 @@ def _clip(args) -> dict:
         if not video:
             raise ValueError("video not found")
         public_id = video["public_video_id"]
-        document = DOCUMENTS.open(public_id, video.get("source_generation") or "unknown", plan)
+        source_generation = video.get("source_generation") or "unknown"
+        expected_fingerprint = db.resolve_source_fingerprint(
+            conn, public_id, source_generation, migrate_legacy=True,
+        )
+        conn.commit()
+        document = DOCUMENTS.open(
+            public_id, source_generation, plan,
+            expected_source_fingerprint=expected_fingerprint,
+        )
         subtitle_text = None
         warnings = []
         if args.srt:

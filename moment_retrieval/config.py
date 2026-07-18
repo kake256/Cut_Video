@@ -16,6 +16,19 @@ DB_PATH = LIBRARY_ROOT / "index.db"
 TEXT_INDEX_PATH = SEARCH_ROOT / "text.index"
 SEARCH_GENERATIONS_DIR = SEARCH_ROOT / "generations"
 
+# SQLite / cross-process writer coordination.  WAL keeps readers available
+# while an index draft is being prepared; publication itself still uses a
+# short BEGIN IMMEDIATE compare-and-swap transaction.
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("CUT_VIDEO_SQLITE_BUSY_TIMEOUT_MS", "10000"))
+SQLITE_JOURNAL_MODE = os.environ.get("CUT_VIDEO_SQLITE_JOURNAL_MODE", "WAL").upper()
+SQLITE_SYNCHRONOUS = os.environ.get("CUT_VIDEO_SQLITE_SYNCHRONOUS", "NORMAL").upper()
+WRITER_LEASE_TIMEOUT_SEC = float(
+    os.environ.get("CUT_VIDEO_WRITER_LEASE_TIMEOUT_SEC", "120")
+)
+WRITER_HEARTBEAT_SEC = float(
+    os.environ.get("CUT_VIDEO_WRITER_HEARTBEAT_SEC", "15")
+)
+
 
 def search_generations_dir() -> Path:
     override = os.environ.get("CUT_VIDEO_SEARCH_GENERATIONS_DIR")

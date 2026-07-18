@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from moment_retrieval import db
 from moment_retrieval.publication import PublicationSnapshot, SnapshotMember
@@ -9,6 +10,7 @@ from moment_retrieval.search_service import (
     EvidenceSpan,
     SearchHit,
     SearchService,
+    SearchSnapshotChangedError,
     SEMANTIC_KIND,
     SEMANTIC_PENDING,
     SemanticPendingError,
@@ -89,6 +91,87 @@ class SearchServiceTest(unittest.TestCase):
         self.assertEqual(len(text), 1)
         self.assertEqual(semantic, [])
         self.assertIsInstance(service.semantic_error, RuntimeError)
+
+    def test_text_stage_returns_before_semantic_retrieval(self):
+        semantic_calls = []
+
+        def retrieve(*args):
+            semantic_calls.append(args)
+            return []
+
+        service = SearchService(self.conn, retrieve)
+        hits, publication_id = service.search_text_stage(
+            "命令", public_video_id=self.public_id
+        )
+
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(semantic_calls, [])
+        self.assertIsNone(publication_id)
+
+    def test_semantic_stage_does_not_repeat_text_search(self):
+        semantic_hit = SearchHit(
+            "semantic-1",
+            self.public_id,
+            SEMANTIC_KIND,
+            EvidenceSpan(4000, 5000),
+            4000,
+            5000,
+            "semantic result",
+            semantic_score=0.9,
+        )
+        service = SearchService(self.conn, lambda *_args: [semantic_hit])
+
+        with patch.object(
+            service, "text_search", side_effect=AssertionError("text rerun")
+        ):
+            hits = service.search_semantic_stage(
+                "query", expected_publication_id=None
+            )
+
+        self.assertEqual([hit.hit_id for hit in hits], ["semantic-1"])
+
+    def test_semantic_stage_rejects_changed_publication(self):
+        service = SearchService(self.conn, lambda *_args: [])
+        snapshot = PublicationSnapshot("publication-2", "generation-2", None, ())
+
+        with patch(
+            "moment_retrieval.search_service.resolve_snapshot",
+            return_value=snapshot,
+        ), patch("moment_retrieval.search_service.release_snapshot"):
+            with self.assertRaises(SearchSnapshotChangedError):
+                service.search_semantic_stage(
+                    "query", expected_publication_id="publication-1"
+                )
+
+    def test_text_stage_does_not_hide_snapshot_database_failures(self):
+        service = SearchService(self.conn)
+        with patch(
+            "moment_retrieval.search_service.resolve_snapshot",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                service.search_text_stage("query")
+
+    def test_combined_search_does_not_hide_snapshot_database_failures(self):
+        service = SearchService(self.conn)
+        with patch(
+            "moment_retrieval.search_service.resolve_snapshot",
+            side_effect=sqlite3.DatabaseError("database is malformed"),
+        ):
+            with self.assertRaises(sqlite3.DatabaseError):
+                service.search("query")
+
+    def test_empty_publication_does_not_fall_back_to_legacy_rows(self):
+        service = SearchService(self.conn)
+        snapshot = PublicationSnapshot("publication-empty", None, None, ())
+        with patch(
+            "moment_retrieval.search_service.resolve_snapshot",
+            return_value=snapshot,
+        ), patch("moment_retrieval.search_service.release_snapshot"):
+            hits, publication_id = service.search_text_stage("命令")
+
+        self.assertEqual(publication_id, "publication-empty")
+        self.assertEqual(hits, [])
 
     def test_empty_semantic_coverage_is_reported_as_pending(self):
         snapshot = PublicationSnapshot(

@@ -10,13 +10,19 @@ from typing import Callable, Iterable, Protocol, Sequence
 
 import numpy as np
 
-from .publication import PublicationSnapshot, release_snapshot, resolve_snapshot
+from .publication import (
+    NoActivePublicationError,
+    PublicationSnapshot,
+    release_snapshot,
+    resolve_snapshot,
+)
 
 
 TEXT_KIND = "text"
 SEMANTIC_KIND = "semantic"
 SEMANTIC_PENDING = "SEMANTIC_PENDING"
 SEMANTIC_UNAVAILABLE = "SEMANTIC_UNAVAILABLE"
+SEARCH_STALE = "SEARCH_STALE"
 
 
 class SemanticSearchError(RuntimeError):
@@ -29,6 +35,12 @@ class SemanticPendingError(SemanticSearchError):
 
 class SemanticUnavailableError(SemanticSearchError):
     code = SEMANTIC_UNAVAILABLE
+
+
+class SearchSnapshotChangedError(RuntimeError):
+    """Raised when a staged semantic response no longer matches its text stage."""
+
+    code = SEARCH_STALE
 
 
 @dataclass(frozen=True)
@@ -342,6 +354,22 @@ class SearchService:
         )
         return SearchSnapshot(refs, epoch)
 
+    def _open_search_snapshot(self) -> str | None:
+        self.semantic_error = None
+        self.snapshot = self._capture_snapshot()
+        try:
+            self.publication_snapshot = resolve_snapshot(self.conn)
+        except NoActivePublicationError:
+            self.publication_snapshot = None
+        return (
+            self.publication_snapshot.publication_id
+            if self.publication_snapshot is not None else None
+        )
+
+    def _close_search_snapshot(self) -> None:
+        if self.publication_snapshot:
+            release_snapshot(self.conn, self.publication_snapshot)
+
     def _resolve_scope(self, identifier: str | None) -> tuple[str | None, str | None]:
         if not identifier:
             return None, None
@@ -368,10 +396,24 @@ class SearchService:
         if end_ms is not None:
             where.append("s.start_sec < ?")
             values.append(end_ms / 1000)
-        if self.publication_snapshot and self.publication_snapshot.members:
-            revisions = [member.transcript_revision for member in self.publication_snapshot.members]
-            where.append("s.transcript_revision IN (" + ",".join("?" for _ in revisions) + ")")
-            values.extend(revisions)
+        if self.publication_snapshot is not None:
+            revisions = [
+                member.transcript_revision
+                for member in self.publication_snapshot.members
+                if member.transcript_revision
+            ]
+            if revisions:
+                where.append(
+                    "s.transcript_revision IN ("
+                    + ",".join("?" for _ in revisions)
+                    + ")"
+                )
+                values.extend(revisions)
+            else:
+                # An immutable empty publication means exactly no searchable
+                # transcript. It must never broaden into the legacy all-row
+                # fallback, which is reserved for libraries with no publication.
+                where.append("0 = 1")
         rows = self.conn.execute(
             "SELECT s.*, COALESCE(v.public_video_id, v.video_id) AS public_video_id "
             "FROM asr_segments s JOIN videos v ON v.video_id = s.video_id WHERE "
@@ -510,7 +552,7 @@ class SearchService:
             self.snapshot = self._capture_snapshot()
             try:
                 self.publication_snapshot = resolve_snapshot(self.conn)
-            except Exception:
+            except NoActivePublicationError:
                 self.publication_snapshot = None
             try:
                 text_hits = self.text_search(
@@ -532,3 +574,63 @@ class SearchService:
             finally:
                 if self.publication_snapshot:
                     release_snapshot(self.conn, self.publication_snapshot)
+
+    def search_text_stage(
+        self,
+        query: str,
+        *,
+        public_video_id: str | None = None,
+        limit: int = 20,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> tuple[list[SearchHit], str | None]:
+        """Return fast text hits and the publication identity for a later stage."""
+        with _LEGACY_SEARCH_LOCK:
+            publication_id = self._open_search_snapshot()
+            try:
+                hits = self.text_search(
+                    query,
+                    public_video_id=public_video_id,
+                    limit=limit,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+                return hits, publication_id
+            finally:
+                self._close_search_snapshot()
+
+    def search_semantic_stage(
+        self,
+        query: str,
+        *,
+        expected_publication_id: str | None,
+        public_video_id: str | None = None,
+        limit: int = 5,
+        min_score: float = 0.55,
+    ) -> list[SearchHit]:
+        """Return semantic hits only when the publication still matches stage one."""
+        with _LEGACY_SEARCH_LOCK:
+            publication_id = self._open_search_snapshot()
+            try:
+                if publication_id != expected_publication_id:
+                    raise SearchSnapshotChangedError(
+                        "search publication changed before semantic completion"
+                    )
+                if self.semantic_retriever is None or int(limit) <= 0:
+                    return []
+                try:
+                    candidates = [
+                        hit for hit in self.semantic_retriever(
+                            query, public_video_id, int(limit) * 4, float(min_score)
+                        )
+                        if hit.semantic_score is not None
+                        and hit.semantic_score >= float(min_score)
+                    ]
+                    return self._semantic_nms(candidates, int(limit))
+                except SearchSnapshotChangedError:
+                    raise
+                except Exception as exc:
+                    self.semantic_error = exc
+                    return []
+            finally:
+                self._close_search_snapshot()

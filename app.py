@@ -39,6 +39,7 @@ from moment_retrieval.search_service import (
     retrieve_semantic_hits,
     semantic_error_code,
 )
+from moment_retrieval.staged_search import StagedSearchCoordinator
 from moment_retrieval.edit_domain import (
     EditPlanError,
     TimelineMap,
@@ -54,6 +55,7 @@ from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
 from moment_retrieval.ui_experiment import UIExperimentRecorder, compare_ui_runs
 from moment_retrieval.subtitles import map_subtitles
+from moment_retrieval.ui_assets import _APP_CSS, _INTUITIVE_EDITOR_JS
 from moment_retrieval.transcript_types import parse_segment
 
 PREVIEW_DIR = config.CACHE_ROOT / "previews"
@@ -94,6 +96,7 @@ _index_state = {"proc": None, "stopped": False}
 _ui_experiment_recorder = UIExperimentRecorder(
     config.CACHE_ROOT / "ui-experiment-v1.jsonl"
 )
+_intuitive_search_coordinator = StagedSearchCoordinator()
 
 
 def start_ui_experiment(scenario: str, ui_variant: str, cold: bool):
@@ -533,6 +536,55 @@ def _safe_time_range(start, end) -> tuple[float, float] | None:
     return start_value, end_value
 
 
+def _search_service_for_connection(
+    conn, start_sec: float | None = None, end_sec: float | None = None
+) -> SearchService:
+    """Build the shared text/semantic service for one publication snapshot."""
+    service: SearchService
+
+    def semantic_retriever(text, public_id, limit, threshold):
+        return retrieve_semantic_hits(
+            conn,
+            service.publication_snapshot,
+            text,
+            public_id,
+            limit,
+            threshold,
+            legacy_index_path=config.TEXT_INDEX_PATH,
+            generations_dir=config.search_generations_dir(),
+            encode_query=lambda value: get_embedder().encode([value]),
+            index_loader=VectorIndex.load,
+            start_sec=start_sec,
+            end_sec=end_sec,
+        )
+
+    service = SearchService(conn, semantic_retriever)
+    return service
+
+
+def _decorate_search_results(conn, hits) -> list[dict]:
+    results = [hit.to_legacy_dict() for hit in hits]
+    videos_by_id = {}
+    for video in db.list_videos(conn):
+        filename = video.get("display_name") or Path(video["path"]).name
+        public_id = video.get("public_video_id") or video["video_id"]
+        videos_by_id[public_id] = f"{filename} [{public_id}]"
+    for result in results:
+        result["video_name"] = videos_by_id.get(
+            result["video_id"], result["video_id"]
+        )
+    return results
+
+
+def _decorate_staged_search_results(hits) -> list[dict]:
+    conn = db.get_conn()
+    db.init_db(conn)
+    try:
+        return _decorate_search_results(conn, hits)
+    finally:
+        conn.close()
+
+
 def search_video_results(
     query: str,
     video_choice: str,
@@ -577,22 +629,7 @@ def search_video_results(
                 result["video_name"] = videos_by_id.get(result["video_id"], result["video_id"])
             return results
 
-        def semantic_retriever(text, public_id, limit, threshold):
-            return retrieve_semantic_hits(
-                conn,
-                service.publication_snapshot,
-                text,
-                public_id,
-                limit,
-                threshold,
-                legacy_index_path=config.TEXT_INDEX_PATH,
-                generations_dir=config.search_generations_dir(),
-                encode_query=lambda value: get_embedder().encode([value]),
-                index_loader=VectorIndex.load,
-                start_sec=start_sec, end_sec=end_sec,
-            )
-
-        service = SearchService(conn, semantic_retriever)
+        service = _search_service_for_connection(conn, start_sec, end_sec)
         text_hits, semantic_hits = service.search(
             query, public_video_id=video_filter, text_limit=int(top_k),
             semantic_limit=int(top_k), min_score=float(min_score),
@@ -604,15 +641,7 @@ def search_video_results(
             gr.Info("意味検索の準備中です。文字一致の結果のみ表示します。")
         elif semantic_status:
             gr.Warning("意味検索を利用できないため、文字一致の結果のみ表示します。")
-        results = [hit.to_legacy_dict() for hit in (*text_hits, *semantic_hits)]
-        videos_by_id = {}
-        for video in db.list_videos(conn):
-            filename = video.get("display_name") or Path(video["path"]).name
-            public_id = video.get("public_video_id") or video["video_id"]
-            videos_by_id[public_id] = f"{filename} [{public_id}]"
-        for result in results:
-            result["video_name"] = videos_by_id.get(result["video_id"], result["video_id"])
-        return results
+        return _decorate_search_results(conn, (*text_hits, *semantic_hits))
     finally:
         conn.close()
 
@@ -1038,7 +1067,10 @@ def load_intuitive_video(video_choice: str):
     return (
         gr.update(
             value=preview_path,
-            label=f"直感編集プレビュー: {filename} [{video_id}]",
+            label=(
+                f"1. 動画プレビュー（Source timeline）: "
+                f"{filename} [{video_id}]"
+            ),
         ),
         render_intuitive_transcript(segments),
         info,
@@ -1882,7 +1914,7 @@ def render_intuitive_toolbar(state: dict) -> str:
         f'data-viewport-end="{float(state["viewport_end"]):.3f}" '
         f'data-preview-start="{float(state["preview_start"]):.3f}" '
         f'data-preview-end="{float(state["preview_end"]):.3f}">'
-        f'<div class="intuitive-tool-heading"><strong>3. 文字起こし編集</strong>'
+        f'<div class="intuitive-tool-heading"><strong>2. 文字起こし編集</strong>'
         f'<span class="intuitive-history-actions">'
         f'<button type="button" data-intuitive-history="undo"'
         f'{"" if can_undo else " disabled"} aria-label="元に戻す (Ctrl+Z)">↶ 元に戻す</button>'
@@ -2107,10 +2139,14 @@ def _refresh_intuitive_source(state: dict):
         refreshed,
         gr.update(
             value=preview_path,
-            label=f"直感編集プレビュー: {filename} [{state['video_id']}]",
+            label=(
+                f"1. 動画プレビュー（Source timeline）: "
+                f"{filename} [{state['video_id']}]"
+            ),
         ),
         render_intuitive_transcript(segments, refreshed),
-        f"**表示モード:** 元動画プレビュー　｜　**選択動画:** {html.escape(filename)}　｜　**表示区間:** {interval}",
+        f"**表示モード:** 元動画プレビュー（Source timeline）　｜　"
+        f"**選択動画:** {html.escape(filename)}　｜　**表示区間:** {interval}",
     )
 
 
@@ -2276,7 +2312,8 @@ def load_intuitive_editor(video_choice: str):
     state = _new_intuitive_state(video, start, end)
     transcript = _render_intuitive_transcript_for_state(state)
     return (
-        state, preview, transcript, "**表示モード:** 元動画プレビュー　｜　" + info,
+        state, preview, transcript,
+        "**表示モード:** 元動画プレビュー（Source timeline）　｜　" + info,
         render_intuitive_toolbar(state),
         render_intuitive_state_overview(state),
         render_intuitive_state_zoom(state),
@@ -2403,10 +2440,14 @@ def _load_intuitive_search_result(index: int, results: list[dict]):
         state,
         gr.update(
             value=preview_path,
-            label=f"直感編集プレビュー: {filename} [{state['video_id']}]",
+            label=(
+                f"1. 動画プレビュー（Source timeline）: "
+                f"{filename} [{state['video_id']}]"
+            ),
         ),
         render_intuitive_transcript(segments, state),
-        f"**表示モード:** 元動画プレビュー　｜　**検索結果:** {html.escape(filename)}　｜　**表示区間:** {interval}",
+        f"**表示モード:** 元動画プレビュー（Source timeline）　｜　"
+        f"**検索結果:** {html.escape(filename)}　｜　**表示区間:** {interval}",
         render_intuitive_toolbar(state),
         render_intuitive_state_overview(state),
         render_intuitive_state_zoom(state),
@@ -2434,6 +2475,72 @@ def do_intuitive_search(
         results,
         *_load_intuitive_search_result(0, results),
     )
+
+
+def do_intuitive_search_staged(
+    query: str,
+    video_choice: str,
+    top_k: int,
+    min_score: float,
+    request: gr.Request = None,
+):
+    """Render normalized text hits first, then append semantic hits.
+
+    Search owns a separate concurrency lane from editor mutations.  Results do
+    not change the open edit document until the user explicitly selects a row.
+    A per-session request token prevents a slow older embedding request from
+    overwriting a newer query.
+    """
+    query = str(query or "").strip()
+    if not query:
+        yield [], [], "検索する文字・フレーズを入力してください。"
+        return
+
+    session_id = getattr(request, "session_hash", None)
+    video_filter = parse_video_choice(video_choice)
+    semantic_limit = max(1, int(top_k))
+    text_limit = max(20, semantic_limit)
+    threshold = float(min_score)
+
+    def service_factory(conn):
+        db.init_db(conn)
+        return _search_service_for_connection(conn)
+
+    for stage in _intuitive_search_coordinator.search(
+        query,
+        session_id=session_id,
+        connection_factory=db.get_conn,
+        service_factory=service_factory,
+        public_video_id=video_filter,
+        text_limit=text_limit,
+        semantic_limit=semantic_limit,
+        min_score=threshold,
+    ):
+        results = _decorate_staged_search_results(stage.hits)
+        text_count = len(stage.text_hits)
+        semantic_count = len(stage.semantic_hits)
+        if not stage.complete:
+            status = f"文字一致: {text_count}件。意味検索を実行中…"
+        elif stage.publication_changed:
+            status = (
+                "検索中にインデックスが更新されました。"
+                "文字一致のみ表示しています。再検索してください。"
+            )
+        elif stage.semantic_status == SEMANTIC_PENDING:
+            status = (
+                f"文字一致: {text_count}件。意味検索は準備中のため、"
+                "文字一致のみ表示しています。"
+            )
+        elif stage.semantic_status:
+            status = (
+                f"文字一致: {text_count}件。意味検索を利用できないため、"
+                "文字一致のみ表示しています。"
+            )
+        else:
+            status = (
+                f"文字一致: {text_count}件 / 意味検索: {semantic_count}件"
+            )
+        yield _build_intuitive_table(results), results, status
 
 
 def on_intuitive_search_select(results: list, evt: gr.SelectData):
@@ -2471,12 +2578,22 @@ def preview_intuitive_editor(state: dict):
         "preview_mode": "result",
         "revision": state["revision"] + 1,
     }
+    result_label = (
+        "1. 動画プレビュー（Result timeline）: "
+        f"{Path(state['video_path']).name} [{state['video_id']}]"
+    )
+    preview = (
+        {**preview, "label": result_label}
+        if isinstance(preview, dict)
+        else gr.update(value=preview, label=result_label)
+    )
     return _intuitive_render_outputs(
         result_state,
         (
             preview,
             gr.update(),
-            "**表示モード:** 編集結果プレビュー　｜　" + info.replace("\n", "　"),
+            "**表示モード:** 編集結果プレビュー（Result timeline）　｜　"
+            + info.replace("\n", "　"),
         ),
     )
 
@@ -3347,1520 +3464,10 @@ def build_adjust_row(label: str, target_number, ctx_state, preview_io, slider, s
             )
 
 
-_APP_CSS = """
-.reverse-fill-slider input[type=range]::-webkit-slider-runnable-track {
-  background: linear-gradient(
-    to right,
-    var(--neutral-200) var(--range_progress),
-    var(--slider-color) var(--range_progress)
-  ) !important;
-}
-.reverse-fill-slider input[type=range]::-moz-range-track {
-  background: var(--slider-color) !important;
-}
-.reverse-fill-slider input[type=range]::-moz-range-progress {
-  background: var(--neutral-200) !important;
-}
-.time-slider input[type=number] {
-  min-width: 8.5rem !important;
-  width: 8.5rem !important;
-  font-size: 1.05rem !important;
-  padding: .45rem .6rem !important;
-}
-.clip-timeline-label {
-  display: flex; gap: .8rem; align-items: center; margin: .2rem 0 .35rem;
-  font-size: .9rem;
-}
-.clip-timeline-track {
-  position: relative; height: 1.1rem; overflow: hidden; border-radius: .4rem;
-  background: var(--primary-500); border: 1px solid var(--border-color-primary);
-}
-.clip-timeline-cut, .clip-timeline-hatch-key {
-  background: repeating-linear-gradient(
-    135deg,
-    rgba(45, 45, 45, .92) 0,
-    rgba(45, 45, 45, .92) 4px,
-    rgba(245, 245, 245, .96) 4px,
-    rgba(245, 245, 245, .96) 8px
-  );
-}
-.clip-timeline-cut { position: absolute; inset-block: 0; }
-.clip-timeline-hatch-key { padding: .05rem .35rem; border-radius: .2rem; color: #fff; }
-.clip-timeline-empty { color: var(--body-text-color-subdued); font-size: .9rem; }
-.intuitive-prototype-note {
-  border-left: .3rem solid var(--primary-500); padding: .25rem .6rem;
-  margin: 0 0 .2rem !important;
-  background: var(--background-fill-secondary); border-radius: .35rem;
-}
-.intuitive-prototype-note .prose, .intuitive-prototype-note p { margin: 0 !important; }
-#intuitive-video-picker { margin: 0 0 .2rem !important; }
-#intuitive-video-picker > button { min-height: 2rem !important; padding-block: .25rem !important; }
-body:has(#intuitive-toolbox [data-intuitive-root])
-  #intuitive-video-picker:not(.is-intuitive-reselecting) {
-  display: none !important;
-}
-.intuitive-fallback-picker { margin-top: .2rem !important; }
-/* The real Gallery only exists to keep the original selection/nonce/FIFO
-   wiring intact; the card grid above it is what the user actually sees. */
-.intuitive-gallery-proxy {
-  position: absolute !important; height: 0 !important; min-height: 0 !important;
-  margin: 0 !important; padding: 0 !important; border: 0 !important;
-  overflow: hidden !important; opacity: 0; pointer-events: none;
-}
-.intuitive-video-card-empty {
-  padding: .6rem; color: var(--body-text-color-subdued); font-size: .9rem;
-}
-.intuitive-video-card-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: .6rem; max-height: 380px; overflow-y: auto; padding: .1rem;
-}
-.intuitive-video-card {
-  display: flex; flex-direction: column; gap: .3rem; text-align: left;
-  border: 1px solid var(--border-color-primary); border-radius: .5rem;
-  background: var(--background-fill-primary); padding: .4rem; cursor: pointer;
-  font: inherit; color: inherit;
-}
-.intuitive-video-card:hover {
-  border-color: var(--primary-500); box-shadow: 0 0 0 1px var(--primary-500);
-}
-.intuitive-video-card.is-selected {
-  border-color: var(--primary-500); box-shadow: 0 0 0 2px var(--primary-500);
-  background: var(--background-fill-secondary);
-}
-.intuitive-video-thumb {
-  position: relative; display: block; border-radius: .35rem; overflow: hidden;
-  background: var(--background-fill-secondary); aspect-ratio: 16 / 9;
-}
-.intuitive-video-thumb img {
-  width: 100%; height: 100%; object-fit: cover; display: block;
-}
-.intuitive-video-duration {
-  position: absolute; right: .3rem; bottom: .3rem; padding: .05rem .35rem;
-  border-radius: .25rem; background: rgba(0, 0, 0, .72); color: #fff;
-  font-size: .74rem; font-family: var(--font-mono, monospace);
-}
-.intuitive-video-name {
-  font-size: .86rem; line-height: 1.3; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.intuitive-video-badges { display: flex; flex-wrap: wrap; gap: .25rem; min-height: 1.3rem; }
-.intuitive-video-badge {
-  font-size: .7rem; padding: .05rem .4rem; border-radius: .35rem;
-  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
-  border: 1px solid var(--border-color-primary);
-}
-.intuitive-video-duration, .intuitive-ts-chip, .intuitive-stat,
-.intuitive-selected-boundary-chip, .intuitive-timeline-scale,
-.intuitive-viewport-summary, .intuitive-exclusion-length,
-#intuitive-selected-time input {
-  font-variant-numeric: tabular-nums;
-}
-#intuitive-transcript-panel {
-  border: 1px solid var(--border-color-primary); border-radius: .55rem;
-  overflow: hidden; height: 320px; background: var(--background-fill-primary);
-  display: flex !important; flex-direction: column !important;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
-}
-#intuitive-workspace-row {
-  align-items: stretch !important; gap: .55rem !important;
-  margin: -.45rem 0 0 !important;
-}
-#intuitive-preview-panel, #intuitive-search-panel {
-  min-height: 320px; height: 320px; overflow: hidden;
-  border: 1px solid var(--border-color-primary); border-radius: .55rem;
-  background: var(--background-fill-primary);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
-}
-#intuitive-preview-panel { padding: 0 !important; }
-#intuitive-preview-video { height: 320px !important; min-height: 320px !important; }
-#intuitive-preview-video > div { height: 100% !important; }
-#intuitive-search-panel {
-  padding: .3rem .42rem !important; display: flex !important;
-  flex-direction: column !important; gap: .2rem !important;
-}
-.intuitive-panel-heading {
-  margin: 0 !important; min-height: 24px !important; height: 24px !important;
-  max-height: 24px !important; padding: 0 !important; overflow: hidden !important;
-}
-.intuitive-panel-heading .prose, .intuitive-panel-heading p {
-  margin: 0 !important; font-size: .88rem !important; line-height: 1.25 !important;
-}
-#intuitive-search-query, #intuitive-search-target,
-#intuitive-search-results, .intuitive-search-options,
-.intuitive-search-primary { margin: 0 !important; }
-.intuitive-search-primary, .intuitive-search-options {
-  align-items: center !important; gap: .3rem !important; min-height: 0 !important;
-  height: 38px !important; max-height: 38px !important; overflow: visible !important;
-}
-.intuitive-search-primary > *, .intuitive-search-options > * {
-  min-height: 0 !important; height: 38px !important;
-}
-#intuitive-search-query textarea, #intuitive-search-query input,
-#intuitive-search-target input { min-height: 2.2rem !important; height: 2.2rem !important; }
-#intuitive-search-button, #intuitive-search-button button {
-  min-height: 2.2rem !important; height: 2.2rem !important; font-size: .82rem !important;
-}
-#intuitive-search-target { min-height: 2.2rem !important; height: 2.2rem !important; }
-#intuitive-search-results {
-  flex: 1 1 0 !important; min-height: 0 !important; overflow: auto !important;
-}
-#intuitive-search-results > div { min-height: 0 !important; height: 100% !important; }
-#intuitive-search-results .table-wrap {
-  height: 100% !important; max-height: none !important; overflow: auto !important;
-}
-#intuitive-search-results table { font-size: .76rem !important; }
-#intuitive-search-results th, #intuitive-search-results td {
-  padding: .18rem .3rem !important; white-space: nowrap; max-width: 13rem;
-  overflow: hidden; text-overflow: ellipsis;
-}
-#intuitive-header {
-  border: 1px solid var(--border-color-primary); border-radius: .55rem;
-  background: var(--background-fill-secondary);
-  padding: .25rem .45rem; margin: 0 0 .35rem !important;
-  min-height: 0 !important; height: auto !important;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
-}
-#intuitive-mode-row {
-  align-items: center !important; flex-wrap: nowrap !important;
-  gap: .3rem !important; margin: 0 !important; min-height: 0 !important;
-}
-#intuitive-video-info { min-width: 0; }
-#intuitive-video-info .prose {
-  margin: 0 !important; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  font-size: .82rem !important;
-}
-#intuitive-preview-result, #intuitive-return-source {
-  flex: 0 0 auto !important; align-self: center !important;
-}
-button#intuitive-preview-result, #intuitive-preview-result button {
-  border-color: var(--primary-500); color: var(--primary-500);
-}
-.intuitive-tool-header {
-  position: relative; flex: 0 0 auto !important; align-self: stretch !important;
-  min-height: 0 !important; height: auto !important; max-height: 92px !important;
-  z-index: 2; padding: .08rem .2rem;
-  background: var(--background-fill-secondary);
-  border-bottom: 1px solid var(--border-color-primary);
-}
-.intuitive-tool-header .prose { margin: 0 !important; }
-.intuitive-toolbox { padding: .12rem .28rem; }
-.intuitive-tool-heading {
-  display: flex; align-items: center; justify-content: space-between; gap: .4rem;
-}
-.intuitive-tool-heading strong { white-space: nowrap; font-size: .82rem; }
-.intuitive-history-actions { display: inline-flex; gap: .25rem; }
-.intuitive-history-actions button {
-  border: 1px solid var(--border-color-primary); border-radius: .3rem;
-  padding: .1rem .34rem; font-size: .75rem;
-  background: var(--button-secondary-background-fill); color: var(--body-text-color);
-}
-.intuitive-history-actions button:disabled { opacity: .45; cursor: not-allowed; }
-.intuitive-tool-buttons { display: flex; gap: .2rem; margin: .1rem 0; }
-.intuitive-tool-button {
-  flex: 1; min-width: 4.2rem; border: 1px solid var(--border-color-primary);
-  border-radius: .35rem; padding: .14rem .18rem; cursor: pointer;
-  font-size: .82rem; line-height: 1.15;
-  background: var(--button-secondary-background-fill); color: var(--body-text-color);
-}
-.intuitive-tool-button.is-selected {
-  background: var(--primary-500); color: #fff; border-color: var(--primary-500);
-}
-.intuitive-tool-button:disabled { opacity: .55; cursor: not-allowed; }
-.intuitive-tool-status {
-  font-size: .74rem; line-height: 1.2; color: var(--body-text-color-subdued);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.intuitive-command-wait-notice {
-  display: flex; align-items: center; gap: .55rem;
-  margin: .3rem .35rem 0; padding: .35rem .55rem;
-  border: 1px solid var(--border-color-primary); border-radius: .35rem;
-  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
-  font-size: .78rem; line-height: 1.35;
-}
-.intuitive-command-wait-notice button {
-  flex: 0 0 auto; margin-left: auto; padding: .2rem .55rem;
-  border: 1px solid var(--border-color-primary); border-radius: .3rem;
-  background: var(--button-secondary-background-fill);
-}
-#intuitive-transcript-words {
-  flex: 1 1 0 !important; min-height: 0 !important; height: auto !important;
-  overflow: hidden !important; align-self: stretch !important;
-}
-#intuitive-transcript-words > div,
-#intuitive-transcript-words .prose {
-  height: 100% !important; min-height: 0 !important; overflow: hidden !important;
-}
-.intuitive-transcript-copy {
-  height: 100%; max-height: 100%; min-height: 0; overflow-y: scroll;
-  overscroll-behavior: contain; scrollbar-gutter: stable;
-  touch-action: pan-y; padding: .55rem .65rem; line-height: 1.7;
-}
-.intuitive-word {
-  display: inline-block; margin: .08rem .1rem; padding: .05rem .16rem;
-  border-radius: .2rem; border-bottom: 2px solid transparent; white-space: pre-wrap;
-}
-.intuitive-word:hover { border-bottom-color: var(--primary-500); background: var(--background-fill-secondary); }
-.intuitive-word.is-selected-word { background: #ff9800 !important; color: #111; outline: 2px solid #e67700; }
-.intuitive-word.is-outside-overall { opacity: .32; }
-.intuitive-word.is-excluded-word {
-  background: repeating-linear-gradient(135deg, rgba(80,80,80,.25) 0 4px, rgba(230,230,230,.4) 4px 8px);
-  text-decoration: line-through;
-}
-.intuitive-word.marks-overall-start { border-left: 3px solid #1976d2; }
-.intuitive-word.marks-overall-end { border-right: 3px solid #1976d2; }
-.intuitive-word.marks-pending-cut { border-left: 3px solid #ff9800; }
-.intuitive-word.marks-exclusion-start { box-shadow: inset 3px 0 #555; }
-.intuitive-word.marks-exclusion-end { box-shadow: inset -3px 0 #555; }
-.intuitive-transcript-granularity {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  margin: 0 0 .45rem;
-  padding: .3rem .5rem;
-  border-radius: .35rem;
-  background: var(--background-fill-secondary);
-  color: var(--body-text-color-subdued);
-  font-size: .82rem;
-  display: flex; justify-content: space-between; flex-wrap: wrap; gap: .2rem .6rem;
-}
-.intuitive-transcript-range { color: var(--body-text-color); font-weight: 600; }
-.intuitive-segment {
-  border-radius: .25rem;
-}
-.intuitive-segment-row {
-  display: flex; align-items: baseline; gap: .5rem;
-  padding: .25rem 0; margin: 0 0 .1rem;
-  border-bottom: 1px solid var(--border-color-primary);
-}
-.intuitive-segment-row:last-child { border-bottom: none; }
-.intuitive-segment-row-content { flex: 1 1 auto; min-width: 0; }
-.intuitive-ts-chip {
-  flex: 0 0 auto; font-family: var(--font-mono, monospace); font-size: .78rem;
-  padding: .05rem .35rem; border-radius: .35rem;
-  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
-}
-.intuitive-selected-boundary-chip {
-  display: inline-flex; align-items: center; margin-right: .5rem;
-  padding: .05rem .38rem; border-radius: .35rem; font-weight: 600;
-  background: var(--primary-500); color: #fff; font-variant-numeric: tabular-nums;
-}
-.intuitive-selected-boundary-chip.is-empty {
-  background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
-  font-weight: 400;
-}
-.intuitive-control-group-start {
-  position: relative;
-  margin-left: .25rem !important; padding-left: .5rem !important;
-}
-.intuitive-control-group-start::before {
-  content: ""; position: absolute; left: -.15rem; top: .2rem; bottom: .2rem;
-  width: 1px; background: var(--border-color-primary); pointer-events: none;
-}
-#intuitive-reselect-video { flex: 0 0 auto !important; }
-.intuitive-edit-summary {
-  display: flex; flex-wrap: nowrap; gap: .22rem; align-items: center;
-  padding: 0; margin: 0; border-radius: 0;
-  background: transparent; font-size: .76rem;
-  white-space: nowrap; overflow-x: auto;
-}
-#intuitive-header .intuitive-edit-summary { border: 0; }
-.intuitive-stat {
-  display: inline-flex; align-items: center; gap: .25rem;
-  padding: .08rem .32rem; border-radius: .35rem;
-  background: var(--background-fill-primary);
-  border: 1px solid var(--border-color-primary);
-}
-.intuitive-stat strong { white-space: nowrap; }
-#intuitive-editor-prototype-tab > div > #intuitive-save-bar {
-  display: none !important; position: fixed; left: 50%; bottom: .35rem;
-  transform: translateX(-50%); z-index: 2147483000 !important;
-  isolation: isolate; width: min(1216px, calc(100vw - 2rem));
-  background: var(--background-fill-primary);
-  border: 1px solid var(--border-color-primary); border-radius: .5rem;
-  box-shadow: 0 -.2rem .65rem rgba(0, 0, 0, .18);
-  padding: .3rem .5rem; margin: 0 !important; max-height: 82px;
-}
-body:has(#intuitive-toolbox [data-intuitive-root])
-  #intuitive-editor-prototype-tab > div > #intuitive-save-bar {
-  display: flex !important;
-}
-#intuitive-save-bar #intuitive-save-bar {
-  position: static !important; inset: auto !important; transform: none !important;
-  width: 100% !important; max-height: none !important; padding: 0 !important;
-  border: 0 !important; box-shadow: none !important; overflow: visible !important;
-}
-#intuitive-save-bar .intuitive-compact-row {
-  flex-wrap: nowrap !important; align-items: center !important;
-  gap: .3rem !important; min-height: 0 !important;
-}
-#intuitive-save-bar textarea, #intuitive-save-bar input[type="text"] {
-  min-height: 2.2rem !important; height: 2.2rem !important;
-}
-#intuitive-save-bar button {
-  min-height: 2.2rem !important; height: 2.2rem !important; font-size: .82rem !important;
-}
-#intuitive-save-bar label { font-size: .82rem !important; }
-#intuitive-saved-path {
-  min-height: 1.55rem !important; height: 1.55rem !important;
-  margin-top: .12rem !important; font-size: .72rem !important;
-}
-#intuitive-saved-path textarea, #intuitive-saved-path input {
-  min-height: 1.55rem !important; height: 1.55rem !important;
-}
-#intuitive-editor-prototype-tab { padding-bottom: 5.4rem !important; }
-.intuitive-exclusion-list {
-  margin: .25rem 0 .35rem; border: 1px solid var(--border-color-primary);
-  border-radius: .45rem; background: var(--background-fill-primary);
-}
-.intuitive-exclusion-list summary { cursor: pointer; padding: .35rem .6rem; font-weight: 600; }
-.intuitive-exclusion-list-body { padding: 0 .55rem .45rem; }
-.intuitive-exclusion-row {
-  display: grid; grid-template-columns: 1.7rem minmax(13rem, 1fr) 5rem auto;
-  gap: .5rem; align-items: center; padding: .25rem .35rem;
-  border-top: 1px solid var(--border-color-primary); font-size: .88rem;
-}
-.intuitive-exclusion-row.is-selected { background: var(--background-fill-secondary); }
-.intuitive-exclusion-index { text-align: center; color: var(--body-text-color-subdued); }
-.intuitive-exclusion-length { text-align: right; }
-.intuitive-exclusion-row button, .intuitive-clear-exclusions {
-  min-height: 1.8rem; padding: .15rem .55rem; border: 1px solid var(--border-color-primary);
-  border-radius: .35rem; background: var(--button-secondary-background-fill);
-}
-.intuitive-clear-exclusions { margin-top: .35rem; }
-.intuitive-exclusion-empty { padding: .3rem; color: var(--body-text-color-subdued); }
-.intuitive-compact-row { align-items: end !important; }
-.intuitive-section-heading {
-  margin: .12rem 0 .08rem !important; min-height: 0 !important;
-  padding: 0 0 .08rem; border-bottom: 1px solid var(--border-color-primary);
-}
-.intuitive-boundary-heading { margin-top: 0 !important; }
-#intuitive-boundary-controls {
-  padding: .15rem .32rem !important; border: 1px solid var(--border-color-primary);
-  border-radius: .45rem; background: var(--background-fill-secondary);
-  gap: .25rem !important; flex-wrap: nowrap !important; align-items: end !important;
-  position: relative; margin-top: 1.35rem !important;
-}
-#intuitive-boundary-controls::before {
-  content: "4. 範囲・境界コントロール"; position: absolute;
-  left: 0; top: -1.25rem; font-size: .82rem; font-weight: 700;
-  color: var(--body-text-color-subdued); white-space: nowrap;
-}
-#intuitive-edit-controls-row {
-  align-items: stretch !important; gap: .55rem !important;
-  margin: -.45rem 0 0 !important;
-}
-#intuitive-exclusion-panel { min-width: 0; }
-#intuitive-exclusion-panel .intuitive-exclusion-list {
-  margin: 1.35rem 0 0; max-height: 4.8rem; overflow-y: auto;
-}
-#intuitive-exclusion-panel .intuitive-exclusion-list-body { padding-bottom: .25rem; }
-#intuitive-boundary-controls .form { gap: .3rem !important; }
-#intuitive-boundary-controls button {
-  min-height: 2.2rem !important; height: 2.2rem !important; font-size: .82rem !important;
-}
-#intuitive-adjust-step { min-height: 2.2rem !important; flex: 0 0 360px !important; }
-#intuitive-adjust-step .wrap { flex-wrap: nowrap !important; gap: .12rem !important; }
-#intuitive-selected-time { flex: 0 0 135px !important; min-width: 135px !important; }
-#intuitive-apply-time { flex: 0 0 82px !important; }
-#intuitive-apply-current { flex: 0 0 86px !important; }
-#intuitive-adjust-before, #intuitive-adjust-after { flex: 0 0 68px !important; }
-.intuitive-section-heading .prose, .intuitive-section-heading p {
-  margin: 0 !important; font-size: .74rem !important; font-weight: 700 !important;
-  letter-spacing: .06em; text-transform: uppercase;
-  color: var(--body-text-color-subdued) !important;
-}
-.intuitive-section-heading .prose strong, .intuitive-section-heading p strong { font-weight: 700; }
-.intuitive-compact-note { margin: 0 !important; min-height: 0 !important; font-size: .78rem; }
-.intuitive-compact-note .prose, .intuitive-compact-note p { margin: 0 !important; }
-#intuitive-overview-timeline, #intuitive-zoom-timeline {
-  margin: 0 !important; min-height: 0 !important; padding: 0 !important;
-}
-#intuitive-timeline-tabs {
-  margin: -.35rem 0 0 !important; min-height: 0 !important;
-}
-#intuitive-timeline-tabs > .tab-nav {
-  margin-bottom: .2rem !important;
-}
-#intuitive-timeline-tabs > .tab-nav button {
-  min-height: 2.25rem !important; padding: .35rem .85rem !important;
-  font-weight: 650;
-}
-.intuitive-timeline-tab-guide {
-  margin: 0 0 .15rem !important; min-height: 0 !important;
-  padding: .25rem .55rem !important;
-  border-left: 3px solid var(--primary-500);
-  border-radius: .25rem;
-  background: var(--background-fill-secondary);
-  color: var(--body-text-color-subdued);
-  font-size: .78rem;
-}
-.intuitive-timeline-tab-guide .prose,
-.intuitive-timeline-tab-guide p { margin: 0 !important; }
-.intuitive-overall-range-actions {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: .5rem; margin: 0 0 .2rem; padding: 0 .1rem;
-  color: var(--body-text-color-subdued); font-size: .78rem;
-}
-.intuitive-overall-range-actions .intuitive-fit-overall-button {
-  min-height: 2rem; font-weight: 650;
-}
-#intuitive-overview-timeline, #intuitive-zoom-timeline { margin-top: 0 !important; }
-.intuitive-timeline { margin: .05rem 0 .2rem; }
-.intuitive-inline-section-title {
-  flex: 0 0 auto; font-size: .76rem; font-weight: 700; white-space: nowrap;
-  color: var(--body-text-color-subdued);
-}
-.intuitive-timeline-toolbox {
-  display: flex; align-items: center; gap: .3rem; margin: 0 0 .1rem;
-  padding: .14rem .25rem; border: 1px solid var(--border-color-primary);
-  border-radius: .4rem; background: var(--background-fill-secondary);
-}
-.intuitive-timeline-toolbox > span {
-  flex: 0 0 auto; font-size: .78rem; color: var(--body-text-color-subdued);
-}
-.intuitive-timeline-toolbox .intuitive-tool-buttons {
-  flex: 0 1 34rem; margin: 0;
-}
-.intuitive-timeline-toolbox .intuitive-tool-button { padding-block: .16rem; }
-.intuitive-detail-minimap {
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center; gap: .45rem; margin: 0 0 .16rem;
-  color: var(--body-text-color-subdued); font-size: .7rem;
-}
-.intuitive-detail-minimap-track {
-  position: relative; display: block; height: .42rem;
-  overflow: hidden; border-radius: 999px; background: var(--neutral-300);
-}
-.intuitive-detail-minimap-window {
-  position: absolute; inset-block: 0; min-width: 3px;
-  border-radius: inherit; background: var(--primary-500);
-}
-.intuitive-edit-mode-toggle {
-  flex: 0 0 auto; padding: .18rem .55rem; border-radius: .35rem;
-  border: 1px solid var(--border-color-primary);
-  background: var(--button-secondary-background-fill); color: var(--body-text-color);
-  font-size: .78rem; cursor: pointer; white-space: nowrap;
-}
-.intuitive-edit-mode-toggle.is-on {
-  background: var(--primary-500); color: #fff; border-color: var(--primary-500);
-}
-.intuitive-fit-overall-button {
-  flex: 0 0 auto; padding: .18rem .55rem; border-radius: .35rem;
-  border: 1px solid var(--border-color-primary);
-  background: var(--button-secondary-background-fill); color: var(--body-text-color);
-  font-size: .78rem; cursor: pointer; white-space: nowrap;
-}
-.intuitive-fit-overall-button:hover {
-  border-color: var(--primary-500); color: var(--primary-500);
-}
-/* The drag-edit lock affects only draggable handles and empty-track cut
-   gestures.  The four click-to-place tools remain fully available. */
-[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-handle,
-[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-cut-handle {
-  opacity: .45; cursor: default; pointer-events: none;
-}
-[data-intuitive-zoom][data-timeline-edit-mode="false"] .intuitive-zoom-track {
-  cursor: pointer;
-}
-body:has(#intuitive-toolbox [data-active-tool]:not([data-active-tool=""]))
-  [data-intuitive-zoom][data-preview-mode="source"] .intuitive-zoom-track {
-  cursor: crosshair;
-}
-.intuitive-timeline-scale {
-  display: flex; justify-content: space-between; color: var(--body-text-color-subdued);
-  font-size: .8rem; margin-bottom: .1rem;
-}
-.intuitive-timeline-scale strong { font-size: .76rem; color: var(--body-text-color); }
-.intuitive-overview-track, .intuitive-zoom-track {
-  position: relative; overflow: hidden; border: 1px solid var(--border-color-primary);
-  border-radius: .45rem; background: var(--neutral-200);
-}
-.intuitive-overview-track { height: 1rem; overflow: visible; }
-.intuitive-overview-window {
-  position: absolute; left: 28%; width: 44%; inset-block: .1rem;
-  border: 2px solid var(--primary-500); background: color-mix(in srgb, var(--primary-500) 22%, transparent);
-  cursor: grab; z-index: 2;
-}
-.intuitive-viewport-summary {
-  display: flex; justify-content: space-between; flex-wrap: wrap; gap: .25rem .8rem;
-  margin-top: .12rem; color: var(--body-text-color-subdued); font-size: .78rem;
-}
-.intuitive-viewport-summary span:last-child { display: none; }
-.intuitive-viewport-summary strong { color: var(--body-text-color); font-weight: 600; }
-.intuitive-overall-window {
-  position: absolute; inset-block: .2rem; border-radius: .2rem;
-  background: color-mix(in srgb, #4aa3df 35%, transparent); z-index: 1;
-}
-.intuitive-viewport-grip {
-  position: absolute; top: -2px; bottom: -2px; width: .55rem;
-  background: var(--primary-500); cursor: ew-resize;
-}
-.intuitive-viewport-grip.start { left: -.25rem; }
-.intuitive-viewport-grip.end { right: -.25rem; }
-.intuitive-viewport-interaction {
-  position: absolute; left: 50%; top: -7px; bottom: -7px;
-  width: max(100%, 32px); transform: translateX(-50%); z-index: 5;
-}
-.intuitive-viewport-move { position: absolute; inset: 0 10px; cursor: grab; }
-.intuitive-viewport-interaction .intuitive-viewport-grip { width: 10px; top: 0; bottom: 0; }
-.intuitive-viewport-interaction .intuitive-viewport-grip.start { left: 0; }
-.intuitive-viewport-interaction .intuitive-viewport-grip.end { right: 0; }
-.intuitive-zoom-track { height: 2.6rem; background: var(--neutral-300); cursor: crosshair; }
-.intuitive-zoom-overall {
-  position: absolute; inset-block: 0; background: var(--primary-500); opacity: .82;
-}
-.intuitive-transcript-window {
-  position: absolute; top: 0; height: .38rem; z-index: 5; pointer-events: none;
-  background: #7e57c2; box-shadow: 0 1px 0 rgba(255,255,255,.75);
-}
-.intuitive-zoom-hint {
-  position: absolute; inset: 0; display: grid; place-items: center;
-  pointer-events: none; color: rgba(255,255,255,.78); font-size: .78rem;
-  text-shadow: 0 1px 2px #222;
-}
-.intuitive-cut-zone {
-  position: absolute; left: 37%; width: 18%; inset-block: 0;
-  background: repeating-linear-gradient(135deg, #333 0, #333 5px, #eee 5px, #eee 10px);
-  cursor: pointer;
-}
-.intuitive-cut-zone.is-selected-cut {
-  outline: 3px solid var(--primary-500); outline-offset: -3px; z-index: 3;
-}
-/* C: timeline colors are limited to three -- primary (save range), grey
-   hatch (excluded), red (playhead). Handles reuse primary at reduced
-   saturation instead of introducing a fourth (orange) hue. */
-.intuitive-cut-handle {
-  position: absolute; top: 0; bottom: 0; width: .55rem;
-  background: color-mix(in srgb, var(--primary-500) 75%, #fff 25%);
-  cursor: ew-resize; z-index: 3;
-}
-.intuitive-cut-handle.start { left: 0; }
-.intuitive-cut-handle.end { right: 0; }
-.intuitive-handle {
-  position: absolute; top: .2rem; bottom: .2rem; width: .7rem;
-  border-radius: .25rem; background: var(--primary-500); border: 2px solid #fff;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35); cursor: ew-resize;
-  transform: translateX(-50%); z-index: 4;
-}
-.intuitive-playhead {
-  position: absolute; left: 68%; inset-block: 0; width: 3px; background: #e53935;
-}
-.intuitive-playhead::before {
-  content: ""; position: absolute; left: -5px; top: 0;
-  border-left: 6px solid transparent; border-right: 6px solid transparent;
-  border-top: 8px solid #e53935;
-}
-.intuitive-timeline-legend { display: flex; flex-wrap: wrap; gap: .65rem; margin-top: .18rem; font-size: .76rem; }
-.intuitive-timeline-legend span:last-child { display: none; }
-.intuitive-legend-keep { color: var(--primary-500); }
-.intuitive-legend-cut { color: var(--body-text-color-subdued); }
-.intuitive-legend-position { color: #e53935; }
-.intuitive-legend-transcript { color: #7e57c2; }
-#intuitive-command-json, #intuitive-command-submit,
-#intuitive-sync-token, #intuitive-sync-submit, #intuitive-sync-ack {
-  display: none !important;
-}
-body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-before,
-body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-before button,
-body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-after,
-body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-after button,
-body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-step,
-body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) button#intuitive-adjust-before,
-body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-adjust-before button,
-body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) button#intuitive-adjust-after,
-body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-adjust-after button {
-  pointer-events: none !important; opacity: .5 !important;
-}
-body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-apply-current,
-body:has(#intuitive-toolbox [data-active-tool=""]) #intuitive-apply-current,
-body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-apply-time,
-body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-apply-time {
-  pointer-events: none !important; opacity: .5 !important;
-}
-@media (max-width: 1180px) {
-  #intuitive-workspace-row { flex-wrap: wrap !important; }
-  #intuitive-preview-panel { min-width: 55% !important; }
-  #intuitive-transcript-panel { min-width: 40% !important; }
-  #intuitive-search-panel {
-    min-width: 100% !important; min-height: 280px !important; height: 280px;
-  }
-  #intuitive-edit-controls-row { flex-wrap: wrap !important; }
-  #intuitive-edit-controls-row > div { min-width: 100% !important; }
-  #intuitive-editor-prototype-tab > div > #intuitive-save-bar {
-    position: static; transform: none; width: 100%; max-height: none;
-    margin-top: .35rem !important;
-  }
-  #intuitive-editor-prototype-tab { padding-bottom: 0 !important; }
-}
-@media (max-width: 760px) {
-  #intuitive-preview-panel, #intuitive-transcript-panel, #intuitive-search-panel {
-    min-width: 100% !important;
-  }
-  #intuitive-boundary-controls { flex-wrap: wrap !important; }
-  .intuitive-timeline-toolbox { align-items: stretch; flex-direction: column; }
-  #intuitive-mode-row, #intuitive-save-bar .intuitive-compact-row {
-    flex-wrap: wrap !important; overflow-x: auto;
-  }
-}
-"""
 
 
-_INTUITIVE_EDITOR_JS = r"""() => {
-  if (document.__intuitiveEditorInstalled) return;
-  document.__intuitiveEditorInstalled = true;
-  let drag = null;
-  let commandBusy = false;
-  let revisionWaitTimer = null;
-  let revisionWaitToken = 0;
-  let syncPollTimer = null;
-  let commandSequence = 0;
-  let activeRevisionWait = null;
-  let playheadFrame = null;
-  let pendingPlayheadAbsolute = null;
-  let transcriptFocusPending = null;
-  let fallbackSwitchArmed = false;
-  const commandQueue = [];
-  const DIRTY_EDIT_SWITCH_WARNING = '現在の編集内容はこの画面から失われます。動画を切り替えますか？';
-  const PENDING_OPERATION_SWITCH_WARNING = '処理中の操作が完了した後に動画を切り替えます。よろしいですか？';
-  const FALLBACK_SWITCH_KEYS = new Set(['Enter', ' ', 'ArrowDown', 'ArrowUp']);
-  const AWAIT_REVISION_SLOW_MS = 15000;
-  const AWAIT_REVISION_POLL_MS = 50;
-  const AWAIT_REVISION_SLOW_POLL_MS = 750;
-  const COMMAND_WAIT_NOTICE_ID = 'intuitive-command-wait-notice';
 
-  const editorMeta = () => {
-    const root = document.querySelector('#intuitive-toolbox [data-intuitive-root]');
-    if (!root) return null;
-    const meta = {
-      revision: Number(root.dataset.revision), nonce: root.dataset.nonce,
-      lastCommandId: root.dataset.lastCommandId || '',
-      lastCommandStatus: root.dataset.lastCommandStatus || '',
-      previewMode: root.dataset.previewMode || 'source',
-      activeTool: root.dataset.activeTool || '',
-      editDirty: root.dataset.editDirty === 'true',
-      canUndo: root.dataset.canUndo === 'true',
-      canRedo: root.dataset.canRedo === 'true',
-      transcriptStart: Number(root.dataset.transcriptStart),
-      transcriptEnd: Number(root.dataset.transcriptEnd),
-      viewportStart: Number(root.dataset.viewportStart),
-      viewportEnd: Number(root.dataset.viewportEnd),
-      previewStart: Number(root.dataset.previewStart),
-      previewEnd: Number(root.dataset.previewEnd),
-      hasSelectedBoundary: root.dataset.hasSelectedBoundary === 'true',
-      timelineEditMode: root.dataset.timelineEditMode === 'true'
-    };
-    if (transcriptFocusPending && transcriptFocusPending.nonce === meta.nonce
-        && transcriptFocusPending.time >= meta.transcriptStart
-        && transcriptFocusPending.time <= meta.transcriptEnd) {
-      transcriptFocusPending = null;
-    }
-    return meta;
-  };
-  const intuitivePickerParts = () => {
-    const picker = document.getElementById('intuitive-video-picker');
-    const accordion = picker ? picker.closest('.gr-accordion') || picker : null;
-    return {
-      picker,
-      accordion,
-      content: accordion
-        ? accordion.querySelector(':scope > [data-testid="accordion-content"]') : null,
-      button: accordion ? accordion.querySelector(':scope > button.label-wrap') : null
-    };
-  };
-  const openIntuitivePicker = () => {
-    const {picker, accordion, content, button} = intuitivePickerParts();
-    if (picker) picker.classList.add('is-intuitive-reselecting');
-    if (content && button && getComputedStyle(content).display === 'none') button.click();
-    if (accordion) accordion.scrollIntoView({block: 'start', behavior: 'smooth'});
-  };
-  const confirmDirtySessionReplacement = () => {
-    const meta = editorMeta();
-    const hasDirtyEdit = Boolean(meta && meta.editDirty);
-    const hasPendingOperation = commandBusy || commandQueue.length > 0;
-    if (!hasDirtyEdit && !hasPendingOperation) return true;
-    const warning = hasDirtyEdit
-      ? DIRTY_EDIT_SWITCH_WARNING : PENDING_OPERATION_SWITCH_WARNING;
-    const confirmed = window.confirm(warning);
-    if (confirmed) {
-      // Commands that have not started belong to the session being replaced.
-      // Drop them now; an in-flight command is serialized by Gradio's shared
-      // concurrency_id and its eventual response precedes the replacement.
-      commandQueue.length = 0;
-    }
-    return confirmed;
-  };
-  const stopDirtySessionReplacement = (event) => {
-    if (confirmDirtySessionReplacement()) return false;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    return true;
-  };
-  const isReplacementClick = (event) => {
-    const target = event.target;
-    const gallery = target.closest('#intuitive-video-gallery');
-    const galleryCard = target.closest('button, [role="button"], .gallery-item');
-    if (gallery && galleryCard) return true;
-    return Boolean(target.closest(
-      'button#intuitive-load-video, #intuitive-load-video button, ' +
-      'button#intuitive-search-button, #intuitive-search-button button'
-    ));
-  };
-  const isSearchResultSelection = (event) => {
-    const resultCell = event.target.closest(
-      '#intuitive-search-results .body-cell, ' +
-      '#intuitive-search-results td, ' +
-      '#intuitive-search-results [role="gridcell"]'
-    );
-    if (!resultCell) return false;
-    return Boolean(resultCell.closest('.virtual-row, tr, [role="row"]'));
-  };
 
-  // All click-driven session replacements share one capture-phase guard.
-  // Result-table blank space, headers and scrollbars do not match a data cell.
-  document.addEventListener('click', (event) => {
-    if (isReplacementClick(event)) stopDirtySessionReplacement(event);
-  }, true);
-
-  // Gradio 6.19 Dataframe dispatches selection from mousedown on a
-  // .body-cell inside .virtual-row. Guard that exact phase so cancellation
-  // stops the select callback; headers, blank space and scrollbars do not
-  // match a data cell. Search results are excluded from the click guard above,
-  // so one gesture can never prompt twice.
-  document.addEventListener('mousedown', (event) => {
-    if (isSearchResultSelection(event)) stopDirtySessionReplacement(event);
-  }, true);
-
-  // The visible card grid is a display-only layer. Forward its clicks (by
-  // index) onto the matching button inside the hidden proxy Gallery so the
-  // exact same selection path runs: the dirty-session confirm above, then
-  // Gradio's own Gallery `select` handler (nonce/FIFO, auto-preview,
-  // Accordion-close all stay wired to that Gallery, untouched).
-  document.addEventListener('click', (event) => {
-    const card = event.target.closest('#intuitive-video-card-grid .intuitive-video-card');
-    if (!card) return;
-    const index = Number(card.dataset.index);
-    if (!Number.isInteger(index) || index < 0) return;
-    const buttons = document.querySelectorAll('#intuitive-video-gallery .gallery-item button');
-    const target = buttons[index];
-    if (target) target.click();
-  }, true);
-
-  // The fallback Dropdown changes value before its Gradio callback.  Confirm
-  // on the opening pointer/key action so cancellation cannot leave a displayed
-  // value that was never loaded.  The reselect button itself does not confirm;
-  // confirmation remains at the actual choice, avoiding a double prompt.
-  const armFallbackSwitch = (event) => {
-    if (!event.target.closest('#intuitive-video-select') || fallbackSwitchArmed) return;
-    if (stopDirtySessionReplacement(event)) return;
-    fallbackSwitchArmed = true;
-  };
-  document.addEventListener('pointerdown', armFallbackSwitch, true);
-  document.addEventListener('keydown', (event) => {
-    if (event.isComposing || event.keyCode === 229) return;
-    // Keep fallback keyboard selection and search submit in this same capture
-    // listener. Their DOM targets are mutually exclusive, so Enter can never
-    // produce two confirmations for one user gesture.
-    if (FALLBACK_SWITCH_KEYS.has(event.key)) armFallbackSwitch(event);
-    if (
-      event.key === 'Enter'
-      && event.target.closest('#intuitive-search-query')
-    ) stopDirtySessionReplacement(event);
-    handleIntuitiveKeydown(event);
-  }, true);
-  document.addEventListener('focusout', (event) => {
-    if (event.target.closest('#intuitive-video-select')) {
-      setTimeout(() => { fallbackSwitchArmed = false; }, 0);
-    }
-  }, true);
-  document.addEventListener('input', (event) => {
-    if (event.target.closest('#intuitive-video-select')) fallbackSwitchArmed = false;
-  }, true);
-  const clearCommandWaitNotice = () => {
-    document.getElementById(COMMAND_WAIT_NOTICE_ID)?.remove();
-  };
-  const showCommandWaitNotice = (message = '') => {
-    const root = document.querySelector('#intuitive-toolbox [data-intuitive-root]');
-    if (!root) return false;
-    const existing = document.getElementById(COMMAND_WAIT_NOTICE_ID);
-    const notice = existing || document.createElement('div');
-    notice.id = COMMAND_WAIT_NOTICE_ID;
-    notice.className = 'intuitive-command-wait-notice';
-    notice.setAttribute('role', 'status');
-    notice.setAttribute('aria-live', 'polite');
-    notice.replaceChildren();
-    const text = document.createElement('span');
-    text.textContent = message || '処理中です。続けて行った操作は順番に反映されます。';
-    notice.appendChild(text);
-    if (!message) {
-      const syncButton = document.createElement('button');
-      syncButton.type = 'button';
-      syncButton.textContent = '状態を再確認';
-      syncButton.setAttribute('data-intuitive-sync-state', '');
-      notice.appendChild(syncButton);
-    }
-    if (!existing) root.insertAdjacentElement('afterend', notice);
-    return true;
-  };
-  const finishRevisionWait = (waitToken, warning = '') => {
-    if (waitToken !== revisionWaitToken) return;
-    if (revisionWaitTimer !== null) clearTimeout(revisionWaitTimer);
-    if (syncPollTimer !== null) clearTimeout(syncPollTimer);
-    revisionWaitTimer = null;
-    syncPollTimer = null;
-    activeRevisionWait = null;
-    clearCommandWaitNotice();
-    if (warning) showCommandWaitNotice(warning);
-    commandBusy = false;
-    flushCommandQueue();
-  };
-  const finishAcknowledgedCommand = (current, commandId, waitToken) => {
-    if (!current || current.lastCommandId !== commandId) return false;
-    if (current.lastCommandStatus === 'success') {
-      finishRevisionWait(waitToken);
-    } else {
-      commandQueue.length = 0;
-      finishRevisionWait(
-        waitToken,
-        '直前の操作を適用できなかったため、後続の操作を破棄しました。画面の状態を確認し、必要なら操作をやり直してください。'
-      );
-    }
-    return true;
-  };
-  const newBridgeId = (prefix) => {
-    const randomUUID = globalThis.crypto && globalThis.crypto.randomUUID;
-    if (typeof randomUUID === 'function') return randomUUID.call(globalThis.crypto);
-    commandSequence += 1;
-    return `${prefix}-${Date.now()}-${commandSequence}`;
-  };
-  const requestStateSync = () => {
-    const pending = activeRevisionWait;
-    if (!pending || pending.syncToken) return;
-    const field = document.querySelector(
-      '#intuitive-sync-token textarea, #intuitive-sync-token input'
-    );
-    const button = document.querySelector(
-      '#intuitive-sync-submit button, button#intuitive-sync-submit, #intuitive-sync-submit'
-    );
-    if (!field || !button) return;
-    const syncToken = newBridgeId('sync');
-    pending.syncToken = syncToken;
-    const prototype = field instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
-    setter.call(field, syncToken);
-    field.dispatchEvent(new InputEvent('input', {
-      bubbles: true, composed: true, inputType: 'insertText', data: null
-    }));
-    requestAnimationFrame(() => button.click());
-    const awaitSync = () => {
-      if (!activeRevisionWait || activeRevisionWait.waitToken !== pending.waitToken) return;
-      syncPollTimer = null;
-      const ack = document.querySelector(
-        '#intuitive-sync-ack [data-intuitive-sync-token]'
-      );
-      if (ack && ack.dataset.intuitiveSyncToken === syncToken) {
-        const current = editorMeta();
-        if (current && current.nonce !== pending.awaitedNonce) {
-          finishRevisionWait(pending.waitToken);
-        } else if (finishAcknowledgedCommand(
-          current, pending.commandId, pending.waitToken
-        )) {
-          return;
-        } else {
-          commandQueue.length = 0;
-          finishRevisionWait(
-            pending.waitToken,
-            '直前の操作が反映されたか確認できません。画面の状態を確認し、必要なら操作をやり直してください。後続の操作は破棄しました。'
-          );
-        }
-        return;
-      }
-      syncPollTimer = setTimeout(awaitSync, 100);
-    };
-    if (syncPollTimer !== null) clearTimeout(syncPollTimer);
-    syncPollTimer = setTimeout(awaitSync, 100);
-  };
-  document.addEventListener('click', (event) => {
-    if (!event.target.closest('[data-intuitive-sync-state]')) return;
-    event.preventDefault();
-    requestStateSync();
-  });
-  const flushCommandQueue = () => {
-    if (commandBusy || !commandQueue.length) return;
-    const queued = commandQueue.shift();
-    const meta = editorMeta();
-    if (!meta) {
-      commandQueue.unshift(queued);
-      setTimeout(flushCommandQueue, 100);
-      return;
-    }
-    if (queued.nonce !== meta.nonce) {
-      flushCommandQueue();
-      return;
-    }
-    const payload = queued.payload;
-    const field = document.querySelector('#intuitive-command-json textarea, #intuitive-command-json input');
-    const button = document.querySelector(
-      '#intuitive-command-submit button, button#intuitive-command-submit, #intuitive-command-submit'
-    );
-    if (!field || !button) {
-      commandQueue.unshift(queued);
-      setTimeout(flushCommandQueue, 100);
-      return;
-    }
-    commandBusy = true;
-    const commandId = queued.commandId;
-    const prototype = field instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
-    setter.call(field, JSON.stringify({...payload, ...meta}));
-    field.dispatchEvent(new InputEvent('input', {
-      bubbles: true, composed: true, inputType: 'insertText', data: null
-    }));
-    requestAnimationFrame(() => button.click());
-    const started = performance.now();
-    const awaitedNonce = meta.nonce;
-    const waitToken = ++revisionWaitToken;
-    activeRevisionWait = {waitToken, commandId, awaitedNonce, syncToken: ''};
-    let slowNoticeShown = false;
-    const awaitRevision = () => {
-      if (waitToken !== revisionWaitToken) return;
-      revisionWaitTimer = null;
-      const current = editorMeta();
-      const elapsed = performance.now() - started;
-      if (current && current.nonce !== awaitedNonce) {
-        finishRevisionWait(waitToken);
-        return;
-      }
-      if (finishAcknowledgedCommand(current, commandId, waitToken)) return;
-      if (elapsed >= AWAIT_REVISION_SLOW_MS && !slowNoticeShown) {
-        slowNoticeShown = showCommandWaitNotice();
-        if (slowNoticeShown) {
-          console.warn(
-            '[intuitive-editor] command is still waiting for its acknowledgement after',
-            AWAIT_REVISION_SLOW_MS, 'ms; the queue remains paused.'
-          );
-        }
-      }
-      const pollInterval = elapsed >= AWAIT_REVISION_SLOW_MS
-        ? AWAIT_REVISION_SLOW_POLL_MS : AWAIT_REVISION_POLL_MS;
-      revisionWaitTimer = setTimeout(awaitRevision, pollInterval);
-    };
-    if (revisionWaitTimer !== null) clearTimeout(revisionWaitTimer);
-    revisionWaitTimer = setTimeout(awaitRevision, AWAIT_REVISION_POLL_MS);
-  };
-  const currentSourcePlayhead = (meta) => {
-    if (!meta || meta.previewMode === 'result') return null;
-    const video = document.querySelector('#intuitive-preview-video video');
-    if (!(video instanceof HTMLVideoElement)) return null;
-    const currentTime = Number(video.currentTime);
-    if (!Number.isFinite(currentTime) || !Number.isFinite(meta.previewStart)
-        || !Number.isFinite(meta.previewEnd)) return null;
-    const absolute = meta.previewStart + currentTime;
-    return Math.max(meta.previewStart, Math.min(meta.previewEnd, absolute));
-  };
-  const send = (payload) => {
-    const meta = editorMeta();
-    if (!meta) return;
-    const queuedPayload = {...payload};
-    queuedPayload.command_id = newBridgeId('command');
-    const playhead = currentSourcePlayhead(meta);
-    if (Number.isFinite(playhead)) queuedPayload.playhead_sec = playhead;
-    commandQueue.push({
-      payload: queuedPayload, nonce: meta.nonce,
-      commandId: queuedPayload.command_id
-    });
-    flushCommandQueue();
-  };
-  const currentAdjustmentStep = () => {
-    const selected = document.querySelector('#intuitive-adjust-step input:checked');
-    const step = Number(selected ? selected.value : 1.0);
-    return Number.isFinite(step) && step > 0 ? step : 1.0;
-  };
-  const intuitiveEditorIsVisible = () => {
-    return Array.from(document.querySelectorAll(
-      '#intuitive-editor-prototype-tab'
-    )).some((tab) => {
-      const style = getComputedStyle(tab);
-      return style.display !== 'none' && style.visibility !== 'hidden'
-        && tab.getClientRects().length > 0;
-    });
-  };
-  const handleIntuitiveKeydown = (event) => {
-    if (event.defaultPrevented || event.repeat || event.isComposing || event.keyCode === 229) return;
-    if (!intuitiveEditorIsVisible()) return;
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const editable = target.closest(
-      'input, textarea, select, [contenteditable]:not([contenteditable="false"])'
-    );
-    const meta = editorMeta();
-    const lowerKey = String(event.key || '').toLowerCase();
-    if (event.ctrlKey && !event.altKey && !event.metaKey && !editable) {
-      const redo = lowerKey === 'y' || (lowerKey === 'z' && event.shiftKey);
-      const undo = lowerKey === 'z' && !event.shiftKey;
-      if (!meta || meta.previewMode === 'result') return;
-      if ((undo && meta.canUndo) || (redo && meta.canRedo)) {
-        event.preventDefault();
-        send({type: redo ? 'redo' : 'undo'});
-      }
-      return;
-    }
-    if (editable || event.ctrlKey || event.altKey || event.metaKey) return;
-
-    const word = target.closest('#intuitive-transcript-words .intuitive-word[role="button"]');
-    if (word) {
-      if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
-        event.preventDefault();
-        word.click();
-        return;
-      }
-      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-        event.preventDefault();
-        const words = Array.from(document.querySelectorAll(
-          '#intuitive-transcript-words .intuitive-word[role="button"]'
-        ));
-        const index = words.indexOf(word);
-        const direction = event.key === 'ArrowLeft' ? -1 : 1;
-        const next = words[Math.max(0, Math.min(words.length - 1, index + direction))];
-        if (next) {
-          words.forEach((item) => item.tabIndex = -1);
-          next.tabIndex = 0;
-          next.focus();
-        }
-        return;
-      }
-    }
-
-    const boundary = target.closest('[data-boundary-kind][role="slider"]');
-    if (boundary && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
-      if (boundary.getAttribute('aria-disabled') === 'true' || !meta
-          || meta.previewMode === 'result' || !meta.timelineEditMode) return;
-      event.preventDefault();
-      const direction = event.key === 'ArrowLeft' ? -1 : 1;
-      const current = Number(boundary.dataset.boundaryTime);
-      if (!Number.isFinite(current)) return;
-      send({
-        type: 'set_boundary', kind: boundary.dataset.boundaryKind,
-        id: boundary.dataset.cutId || null,
-        time: current + direction * currentAdjustmentStep()
-      });
-      return;
-    }
-
-    const viewportPart = target.closest('[data-viewport-drag][role="slider"]');
-    if (viewportPart && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
-      const overview = viewportPart.closest('[data-intuitive-overview]');
-      if (!overview) return;
-      event.preventDefault();
-      const direction = event.key === 'ArrowLeft' ? -1 : 1;
-      const delta = direction * currentAdjustmentStep();
-      const duration = Number(overview.dataset.duration);
-      const minSpan = Number(overview.dataset.viewportMinSpan);
-      const maxSpan = Number(overview.dataset.viewportMaxSpan);
-      let start = Number(overview.dataset.viewportStart);
-      let end = Number(overview.dataset.viewportEnd);
-      if (![duration, minSpan, maxSpan, start, end].every(Number.isFinite)) return;
-      const mode = viewportPart.dataset.viewportDrag;
-      if (mode === 'move') {
-        const width = end - start;
-        start = Math.max(0, Math.min(duration - width, start + delta));
-        end = start + width;
-      } else if (mode === 'start') {
-        start = Math.max(0, Math.min(end - minSpan, start + delta));
-        start = Math.max(start, end - maxSpan);
-      } else {
-        end = Math.min(duration, Math.max(start + minSpan, end + delta));
-        end = Math.min(end, start + maxSpan);
-      }
-      send({type: 'set_viewport', start, end});
-    }
-  };
-  const timeAtPointer = (track, event, lo, hi) => {
-    const rect = track.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(rect.width, 1)));
-    return lo + ratio * (hi - lo);
-  };
-  const requestTranscriptFocus = (absolute) => {
-    const meta = editorMeta();
-    if (!meta || meta.previewMode === 'result' || !Number.isFinite(absolute)) return;
-    const span = Math.max(0, meta.transcriptEnd - meta.transcriptStart);
-    const margin = Math.min(8, span * .2);
-    if (absolute >= meta.transcriptStart + margin && absolute <= meta.transcriptEnd - margin) {
-      transcriptFocusPending = null;
-      return;
-    }
-    const inside = absolute >= meta.transcriptStart && absolute <= meta.transcriptEnd;
-    const cannotShiftLeft = meta.transcriptStart <= meta.viewportStart + .001;
-    const cannotShiftRight = meta.transcriptEnd >= meta.viewportEnd - .001;
-    if (inside && ((absolute < meta.transcriptStart + margin && cannotShiftLeft)
-        || (absolute > meta.transcriptEnd - margin && cannotShiftRight))) {
-      transcriptFocusPending = null;
-      return;
-    }
-    if (transcriptFocusPending && transcriptFocusPending.nonce === meta.nonce
-        && Math.abs(transcriptFocusPending.time - absolute) < 1) return;
-    transcriptFocusPending = {nonce: meta.nonce, time: absolute};
-    send({type: 'set_transcript_focus', time: absolute});
-  };
-  const formatTimelineTime = (value) => {
-    const totalCentiseconds = Math.round(Math.max(0, Number(value) || 0) * 100);
-    const hours = Math.floor(totalCentiseconds / 360000);
-    const minutes = Math.floor((totalCentiseconds % 360000) / 6000);
-    const remainder = ((totalCentiseconds % 6000) / 100).toFixed(2).padStart(5, '0');
-    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${remainder}`;
-  };
-  const updateViewportDrag = (currentDrag, event) => {
-    const rect = currentDrag.track.getBoundingClientRect();
-    const delta = (event.clientX - currentDrag.startX) / Math.max(rect.width, 1) * currentDrag.duration;
-    const minSpan = currentDrag.minSpan;
-    const maxSpan = currentDrag.maxSpan;
-    let start = currentDrag.start, end = currentDrag.end;
-    if (currentDrag.mode === 'move') {
-      const width = end - start;
-      start = Math.max(currentDrag.previewStart, Math.min(currentDrag.previewEnd - width, start + delta));
-      end = start + width;
-    } else if (currentDrag.mode === 'start') {
-      start = Math.max(currentDrag.previewStart, Math.min(end - minSpan, start + delta));
-      if (end - start > maxSpan) start = end - maxSpan;
-    } else {
-      end = Math.min(currentDrag.previewEnd, Math.max(start + minSpan, end + delta));
-      if (end - start > maxSpan) end = start + maxSpan;
-    }
-    currentDrag.nextStart = start;
-    currentDrag.nextEnd = end;
-    currentDrag.overlay.style.left = `${start / currentDrag.duration * 100}%`;
-    currentDrag.overlay.style.width = `${(end - start) / currentDrag.duration * 100}%`;
-    if (currentDrag.summary) {
-      currentDrag.summary.textContent = `${formatTimelineTime(start)} ～ ${formatTimelineTime(end)}（${(end - start).toFixed(1)}秒）`;
-    }
-  };
-  const updateZoomPlayhead = (zoom, absolute) => {
-    if (!zoom || zoom.dataset.previewMode === 'result' || !Number.isFinite(absolute)) return;
-    const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
-    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return;
-    const playhead = zoom.querySelector('.intuitive-playhead');
-    if (!playhead) return;
-    const clamped = Math.max(lo, Math.min(hi, absolute));
-    const percent = (clamped - lo) / (hi - lo) * 100;
-    playhead.style.left = `${percent}%`;
-  };
-  const scheduleZoomPlayhead = (absolute) => {
-    if (!Number.isFinite(absolute)) return;
-    pendingPlayheadAbsolute = absolute;
-    if (playheadFrame !== null) return;
-    playheadFrame = requestAnimationFrame(() => {
-      playheadFrame = null;
-      const pending = pendingPlayheadAbsolute;
-      pendingPlayheadAbsolute = null;
-      const currentZoom = document.querySelector('[data-intuitive-zoom]');
-      updateZoomPlayhead(currentZoom, pending);
-    });
-  };
-  const seekZoom = (zoom, event) => {
-    if (!zoom || zoom.dataset.previewMode === 'result') return;
-    const track = zoom.querySelector('.intuitive-zoom-track');
-    const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
-    const absolute = timeAtPointer(track, event, lo, hi);
-    const video = document.querySelector('#intuitive-preview-video video');
-    const previewStart = Number(zoom.dataset.previewStart), previewEnd = Number(zoom.dataset.previewEnd);
-    if (video && absolute >= previewStart && absolute <= previewEnd) {
-      video.currentTime = Math.max(0, absolute - previewStart);
-    }
-    updateZoomPlayhead(zoom, absolute);
-    requestTranscriptFocus(absolute);
-  };
-
-  const syncPlayheadFromVideo = (event) => {
-    const video = event.target;
-    if (!(video instanceof HTMLVideoElement) || !video.closest('#intuitive-preview-video')) return;
-    const zoom = document.querySelector('[data-intuitive-zoom]');
-    if (!zoom || zoom.dataset.previewMode === 'result') return;
-    const previewStart = Number(zoom.dataset.previewStart);
-    const currentTime = Number(video.currentTime);
-    if (!Number.isFinite(previewStart) || !Number.isFinite(currentTime)) return;
-    const absolute = previewStart + currentTime;
-    scheduleZoomPlayhead(absolute);
-    if (event.type === 'timeupdate') requestTranscriptFocus(absolute);
-  };
-  document.addEventListener('timeupdate', syncPlayheadFromVideo, true);
-  document.addEventListener('seeking', syncPlayheadFromVideo, true);
-
-  document.addEventListener('click', (event) => {
-    const meta = editorMeta();
-    const pickerParts = intuitivePickerParts();
-    if (pickerParts.button && pickerParts.button.contains(event.target)) {
-      requestAnimationFrame(() => {
-        if (pickerParts.content
-            && getComputedStyle(pickerParts.content).display === 'none'
-            && pickerParts.picker) {
-          pickerParts.picker.classList.remove('is-intuitive-reselecting');
-        }
-      });
-    }
-    const historyButton = event.target.closest('[data-intuitive-history]');
-    if (historyButton) {
-      event.preventDefault();
-      const action = historyButton.dataset.intuitiveHistory;
-      if (!meta || meta.previewMode === 'result' || historyButton.disabled) return;
-      if ((action === 'undo' && meta.canUndo) || (action === 'redo' && meta.canRedo)) {
-        send({type: action});
-      }
-      return;
-    }
-    const reselectButton = event.target.closest(
-      'button#intuitive-reselect-video, #intuitive-reselect-video button'
-    );
-    if (reselectButton) {
-      event.preventDefault();
-      openIntuitivePicker();
-      return;
-    }
-    const currentButton = event.target.closest(
-      'button#intuitive-apply-current, #intuitive-apply-current button'
-    );
-    if (currentButton) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result' || !meta.activeTool) return;
-      const video = document.querySelector('#intuitive-preview-video video');
-      if (!(video instanceof HTMLVideoElement) || !Number.isFinite(video.currentTime)
-          || !Number.isFinite(meta.previewStart)) return;
-      const absolute = meta.previewStart + Number(video.currentTime);
-      if (absolute < meta.previewStart - .001 || absolute > meta.previewEnd + .001) return;
-      send({type: 'set_current_position', time: absolute});
-      return;
-    }
-    const timeButton = event.target.closest(
-      'button#intuitive-apply-time, #intuitive-apply-time button'
-    );
-    if (timeButton) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result' || !meta.hasSelectedBoundary) return;
-      const input = document.querySelector('#intuitive-selected-time input');
-      const value = Number(input ? input.value : NaN);
-      if (!Number.isFinite(value)) return;
-      send({type: 'set_selected_time', time: value});
-      return;
-    }
-    const removeButton = event.target.closest('[data-intuitive-remove-exclusion]');
-    if (removeButton) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result' || removeButton.disabled) return;
-      send({type: 'remove_exclusion', id: removeButton.dataset.intuitiveRemoveExclusion});
-      return;
-    }
-    const clearButton = event.target.closest('[data-intuitive-clear-exclusions]');
-    if (clearButton) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result' || clearButton.disabled) return;
-      send({type: 'clear_exclusions'});
-      return;
-    }
-    const adjustButton = event.target.closest(
-      'button#intuitive-adjust-before, #intuitive-adjust-before button, ' +
-      'button#intuitive-adjust-after, #intuitive-adjust-after button'
-    );
-    if (adjustButton) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result') return;
-      // Sent even when no boundary is selected yet (e.g. reached via keyboard,
-      // bypassing the CSS pointer-events guard below): dispatch_intuitive_command
-      // rejects it server-side and handle_intuitive_command surfaces a visible
-      // gr.Warning ("先に調整する境界を選択してください。"), so this never fails silently.
-      // 秒数調整もHTMLツールやタイムラインと同じFIFOへ通す。
-      // Gradioの独立callbackにすると、完了前のタイムライン操作が古い
-      // revisionを保持したまま実行され、直前の境界編集と競合する。
-      const selected = document.querySelector('#intuitive-adjust-step input:checked');
-      const step = Number(selected ? selected.value : 1.0);
-      const direction = adjustButton.matches('#intuitive-adjust-before')
-        || adjustButton.closest('#intuitive-adjust-before') ? -1 : 1;
-      send({type: 'adjust_selected', delta: direction * (Number.isFinite(step) ? step : 1.0)});
-      return;
-    }
-    const editModeToggle = event.target.closest('[data-intuitive-toggle-edit-mode]');
-    if (editModeToggle) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result') return;
-      send({type: 'set_timeline_edit_mode', enabled: !meta.timelineEditMode});
-      return;
-    }
-    const fitOverallButton = event.target.closest('[data-intuitive-fit-overall]');
-    if (fitOverallButton) {
-      event.preventDefault();
-      if (!meta || meta.previewMode === 'result') return;
-      // Applying the viewport is an explicit plan operation, but it does not
-      // unlock unrelated drag gestures.
-      send({type: 'fit_overall_to_viewport'});
-      return;
-    }
-    const tool = event.target.closest('[data-intuitive-tool]');
-    if (tool) {
-      // Both toolboxes arm the same canonical active_tool.  Drag editing is a
-      // separate lock and must not change as a side effect of tool selection.
-      send({type: 'set_tool', tool: tool.dataset.intuitiveTool});
-      return;
-    }
-    const word = event.target.closest('#intuitive-transcript-words .intuitive-word');
-    if (word) {
-      if (meta && meta.previewMode === 'result') return;
-      document.querySelectorAll(
-        '#intuitive-transcript-words .intuitive-word[role="button"]'
-      ).forEach((item) => item.tabIndex = item === word ? 0 : -1);
-      send({type: 'set_from_word', start: Number(word.dataset.start), end: Number(word.dataset.end)});
-      return;
-    }
-    const cut = event.target.closest('[data-cut-id]');
-    if (cut && !event.target.closest('[data-boundary-kind]')) {
-      if (meta && meta.previewMode === 'result') return;
-      send({type: 'select_boundary', kind: 'exclusion_start', id: cut.dataset.cutId});
-      return;
-    }
-    const zoomTrack = event.target.closest(
-      '[data-intuitive-zoom] .intuitive-zoom-track'
-    );
-    const zoom = zoomTrack ? zoomTrack.closest('[data-intuitive-zoom]') : null;
-    if (zoom && !event.target.closest('[data-boundary-kind]')) {
-      // A selected tool always turns a position click into boundary placement,
-      // regardless of the independent drag-edit lock.  With no tool, click
-      // keeps its ordinary seek behavior.
-      if (meta && meta.previewMode !== 'result' && meta.activeTool) {
-        const track = zoom.querySelector('.intuitive-zoom-track');
-        const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
-        send({type: 'set_from_timeline', time: timeAtPointer(track, event, lo, hi)});
-      } else {
-        seekZoom(zoom, event);
-      }
-    }
-  });
-
-  document.addEventListener('pointerdown', (event) => {
-    if (event.target.closest('.intuitive-timeline-toolbox')) return;
-    const viewportPart = event.target.closest('[data-viewport-drag]');
-    if (viewportPart) {
-      const root = viewportPart.closest('[data-intuitive-overview]');
-      const track = root.querySelector('.intuitive-overview-track');
-      drag = {
-        type: 'viewport', mode: viewportPart.dataset.viewportDrag,
-        root, track, startX: event.clientX,
-        start: Number(root.dataset.viewportStart), end: Number(root.dataset.viewportEnd),
-        previewStart: 0, previewEnd: Number(root.dataset.duration),
-        duration: Number(root.dataset.duration), overlay: root.querySelector('.intuitive-overview-window'),
-        minSpan: Number(root.dataset.viewportMinSpan), maxSpan: Number(root.dataset.viewportMaxSpan),
-        summary: root.querySelector('[data-viewport-summary]'),
-        pointerId: event.pointerId, captureTarget: viewportPart
-      };
-      if (viewportPart.setPointerCapture) viewportPart.setPointerCapture(event.pointerId);
-      event.preventDefault();
-      return;
-    }
-    const boundary = event.target.closest('[data-boundary-kind]');
-    if (boundary) {
-      const root = boundary.closest('[data-intuitive-zoom]');
-      if (root && root.dataset.previewMode === 'result') return;
-      // Boundary dragging is protected by the independent drag-edit lock.
-      if (root && root.dataset.timelineEditMode !== 'true') return;
-      drag = {
-        type: 'boundary', root, track: root.querySelector('.intuitive-zoom-track'),
-        kind: boundary.dataset.boundaryKind, id: boundary.dataset.cutId || null,
-        element: boundary
-      };
-      drag.pointerId = event.pointerId; drag.captureTarget = boundary;
-      if (boundary.setPointerCapture) boundary.setPointerCapture(event.pointerId);
-      event.preventDefault();
-      return;
-    }
-    const zoomTrack = event.target.closest(
-      '[data-intuitive-zoom] .intuitive-zoom-track'
-    );
-    const zoom = zoomTrack ? zoomTrack.closest('[data-intuitive-zoom]') : null;
-    if (zoom && !event.target.closest('[data-cut-id]')) {
-      if (zoom.dataset.previewMode === 'result') return;
-      // Empty-track cut dragging is protected by the same drag-edit lock.
-      if (zoom.dataset.timelineEditMode !== 'true') return;
-      const meta = editorMeta();
-      // ツール選択中の短いクリックは境界指定としてclickハンドラへ渡す。
-      // 未選択時だけ従来どおり横ドラッグによる途中カットを開始する。
-      if (meta && meta.activeTool) return;
-      const track = zoom.querySelector('.intuitive-zoom-track');
-      const lo = Number(zoom.dataset.viewStart), hi = Number(zoom.dataset.viewEnd);
-      const startTime = timeAtPointer(track, event, lo, hi);
-      const overallStart = Number(zoom.dataset.overallStart);
-      const overallEnd = Number(zoom.dataset.overallEnd);
-      if (startTime < overallStart || startTime > overallEnd) return;
-      const marker = document.createElement('div');
-      marker.className = 'intuitive-cut-zone intuitive-new-cut';
-      marker.style.left = `${(startTime - lo) / (hi - lo) * 100}%`;
-      marker.style.width = '0%';
-      track.appendChild(marker);
-      drag = {
-        type: 'new_cut', root: zoom, track, lo, hi,
-        startTime, startX: event.clientX, marker, overallStart, overallEnd
-      };
-      drag.pointerId = event.pointerId; drag.captureTarget = track;
-      if (track.setPointerCapture) track.setPointerCapture(event.pointerId);
-      event.preventDefault();
-    }
-  });
-
-  document.addEventListener('pointermove', (event) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    if (drag.type === 'boundary') {
-      const lo = Number(drag.root.dataset.viewStart), hi = Number(drag.root.dataset.viewEnd);
-      const time = timeAtPointer(drag.track, event, lo, hi);
-      drag.time = time;
-      drag.element.style.left = `${(time - lo) / (hi - lo) * 100}%`;
-      return;
-    }
-    if (drag.type === 'new_cut') {
-      const time = Math.max(
-        drag.overallStart,
-        Math.min(drag.overallEnd, timeAtPointer(drag.track, event, drag.lo, drag.hi))
-      );
-      drag.endTime = time;
-      drag.distance = Math.abs(event.clientX - drag.startX);
-      const left = Math.min(drag.startTime, time), right = Math.max(drag.startTime, time);
-      drag.marker.style.left = `${(left - drag.lo) / (drag.hi - drag.lo) * 100}%`;
-      drag.marker.style.width = `${(right - left) / (drag.hi - drag.lo) * 100}%`;
-      return;
-    }
-    updateViewportDrag(drag, event);
-  });
-
-  const finishDrag = (event, cancelled = false) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    if (!cancelled && drag.type === 'viewport') {
-      // pointerup can arrive without a final pointermove (especially on a quick
-      // resize), so always derive the committed range from the release point.
-      updateViewportDrag(drag, event);
-    }
-    if (!cancelled && drag.type === 'new_cut') {
-      drag.endTime = Math.max(
-        drag.overallStart,
-        Math.min(drag.overallEnd, timeAtPointer(drag.track, event, drag.lo, drag.hi))
-      );
-      drag.distance = Math.abs(event.clientX - drag.startX);
-    }
-    if (!cancelled && drag.type === 'boundary' && Number.isFinite(drag.time)) {
-      send({type: 'set_boundary', kind: drag.kind, id: drag.id, time: drag.time});
-    } else if (!cancelled &&
-      drag.type === 'new_cut' && Number.isFinite(drag.endTime)
-      && drag.distance >= 5
-    ) {
-      send({type: 'add_exclusion', start: drag.startTime, end: drag.endTime});
-    } else if (!cancelled && drag.type === 'viewport' && Number.isFinite(drag.nextStart)) {
-      send({type: 'set_viewport', start: drag.nextStart, end: drag.nextEnd});
-    } else if (!cancelled && drag.type === 'new_cut' && drag.distance < 5) {
-      seekZoom(drag.root, event);
-    }
-    if (drag.marker) drag.marker.remove();
-    if (drag.captureTarget && drag.captureTarget.releasePointerCapture) {
-      try { drag.captureTarget.releasePointerCapture(drag.pointerId); } catch (_) {}
-    }
-    drag = null;
-  };
-  document.addEventListener('pointerup', (event) => finishDrag(event, false));
-  document.addEventListener('pointercancel', (event) => finishDrag(event, true));
-}"""
 
 
 _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS = r"""() => {
@@ -5603,10 +4210,27 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     elem_id="intuitive-preview-video",
                 )
             with gr.Column(
+                scale=4, min_width=400,
+                elem_id="intuitive-transcript-panel",
+            ):
+                intuitive_toolbar = gr.HTML(
+                    '<div class="intuitive-toolbox"><strong>2. 文字起こし編集</strong>'
+                    '<div class="intuitive-tool-buttons">'
+                    '<button disabled>全体開始</button><button disabled>全体終了</button>'
+                    '<button disabled>除外開始</button><button disabled>除外終了</button></div>'
+                    '<div class="intuitive-tool-status">動画を読み込んでください。</div></div>',
+                    elem_id="intuitive-toolbox",
+                    elem_classes=["intuitive-tool-header"],
+                )
+                intuitive_transcript = gr.HTML(
+                    render_intuitive_transcript([]),
+                    elem_id="intuitive-transcript-words",
+                )
+            with gr.Column(
                 scale=3, min_width=280, elem_id="intuitive-search-panel",
             ):
                 gr.Markdown(
-                    "**2. 文字クエリー検索**",
+                    "**3. 文字クエリー検索**",
                     elem_classes=["intuitive-panel-heading"],
                 )
                 with gr.Row(elem_classes=["intuitive-search-primary"]):
@@ -5634,22 +4258,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     label="検索結果（行を選ぶと即プレビュー）", show_label=False,
                     elem_id="intuitive-search-results",
                 )
-            with gr.Column(
-                scale=4, min_width=400,
-                elem_id="intuitive-transcript-panel",
-            ):
-                intuitive_toolbar = gr.HTML(
-                    '<div class="intuitive-toolbox"><strong>3. 文字起こし編集</strong>'
-                    '<div class="intuitive-tool-buttons">'
-                    '<button disabled>全体開始</button><button disabled>全体終了</button>'
-                    '<button disabled>除外開始</button><button disabled>除外終了</button></div>'
-                    '<div class="intuitive-tool-status">動画を読み込んでください。</div></div>',
-                    elem_id="intuitive-toolbox",
-                    elem_classes=["intuitive-tool-header"],
-                )
-                intuitive_transcript = gr.HTML(
-                    render_intuitive_transcript([]),
-                    elem_id="intuitive-transcript-words",
+                intuitive_search_status = gr.Markdown(
+                    "検索すると、文字一致を先に表示し、意味検索結果を後から追加します。",
+                    elem_id="intuitive-search-status",
                 )
 
         # 全体の俯瞰と詳細操作は同じ EditPlan を見る二つの表示です。
@@ -5947,36 +4558,29 @@ with gr.Blocks(title="動画シーン検索") as demo:
         intuitive_search_outputs = [
             intuitive_result_table,
             intuitive_search_results,
-            intuitive_state,
-            intuitive_preview,
-            intuitive_transcript,
-            intuitive_video_info,
-            intuitive_toolbar,
-            intuitive_overview_timeline,
-            intuitive_zoom_timeline,
-            intuitive_summary,
-            intuitive_exclusion_list,
-            intuitive_selected_time,
+            intuitive_search_status,
         ]
         intuitive_search_btn.click(
-            do_intuitive_search,
+            do_intuitive_search_staged,
             inputs=[
                 intuitive_query, intuitive_search_target,
-                gr.State(5), gr.State(config.MIN_SCORE), intuitive_state,
+                gr.State(5), gr.State(config.MIN_SCORE),
             ],
             outputs=intuitive_search_outputs,
-            concurrency_id="intuitive-editor-state",
-            concurrency_limit=1,
+            trigger_mode="always_last",
+            concurrency_id="intuitive-search",
+            concurrency_limit=2,
         ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
         intuitive_query.submit(
-            do_intuitive_search,
+            do_intuitive_search_staged,
             inputs=[
                 intuitive_query, intuitive_search_target,
-                gr.State(5), gr.State(config.MIN_SCORE), intuitive_state,
+                gr.State(5), gr.State(config.MIN_SCORE),
             ],
             outputs=intuitive_search_outputs,
-            concurrency_id="intuitive-editor-state",
-            concurrency_limit=1,
+            trigger_mode="always_last",
+            concurrency_id="intuitive-search",
+            concurrency_limit=2,
         ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
         intuitive_result_table.select(
             on_intuitive_search_select,

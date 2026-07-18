@@ -54,6 +54,63 @@ class Phase1IdentityTest(unittest.TestCase):
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
         conn.close()
 
+    def test_source_generation_keeps_private_expected_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.mp4"
+            source.write_bytes(b"synthetic-v1")
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            db.init_db(conn)
+            db.insert_video(conn, "synthetic", str(source), 10.0)
+            video = db.get_video(conn, "synthetic")
+            fingerprint = db.resolve_source_fingerprint(
+                conn, video["public_video_id"], video["source_generation"],
+            )
+            self.assertTrue(fingerprint)
+            source.write_bytes(b"synthetic-v2")
+            self.assertEqual(
+                db.resolve_source_fingerprint(
+                    conn, video["public_video_id"], video["source_generation"],
+                ),
+                fingerprint,
+            )
+            conn.close()
+
+    def test_null_legacy_fingerprint_is_backfilled_only_from_recorded_locator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.mp4"
+            source.write_bytes(b"legacy-source")
+            conn = sqlite3.connect(":memory:")
+            conn.row_factory = sqlite3.Row
+            db.init_db(conn)
+            db.insert_video(conn, "legacy", str(source), 10.0)
+            video = db.get_video(conn, "legacy")
+            conn.execute(
+                "UPDATE sources SET private_fingerprint = NULL WHERE source_generation = ?",
+                (video["source_generation"],),
+            )
+            migrated = db.resolve_source_fingerprint(
+                conn, video["public_video_id"], video["source_generation"],
+            )
+            stored = conn.execute(
+                "SELECT private_fingerprint FROM sources WHERE source_generation = ?",
+                (video["source_generation"],),
+            ).fetchone()[0]
+            self.assertTrue(migrated)
+            self.assertEqual(stored, migrated)
+            conn.close()
+
+    def test_missing_legacy_locator_keeps_source_identity_unknown(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        db.init_db(conn)
+        db.insert_video(conn, "missing", "X:/missing/synthetic.mp4", 10.0)
+        video = db.get_video(conn, "missing")
+        self.assertIsNone(db.resolve_source_fingerprint(
+            conn, video["public_video_id"], video["source_generation"],
+        ))
+        conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

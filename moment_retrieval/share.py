@@ -13,6 +13,7 @@ import json
 import math
 import os
 import tempfile
+import time
 import uuid
 import zipfile
 import zlib
@@ -41,6 +42,10 @@ _MAX_ITEMS = 500_000
 _MAX_TEXT_LENGTH = 2_000_000
 _MAX_VECTOR_DIM = 8192
 _MAX_DURATION_SEC = 31 * 24 * 60 * 60
+
+
+def _install_compatibility_index(draft_path: Path) -> None:
+    os.replace(draft_path, config.TEXT_INDEX_PATH)
 
 
 def _opaque_id(prefix: str) -> str:
@@ -326,28 +331,52 @@ def export_index(
     conn = db.get_conn()
     db.init_db(conn)
     try:
-        video = db.get_video(conn, video_id)
-        if not video:
-            raise ShareError("選択した動画のインデックスが見つかりません。")
+        # Capture transcript rows, chunk IDs and their immutable vector
+        # generation from one SQLite read snapshot.  A force publication may
+        # commit concurrently in WAL mode; separate autocommit SELECTs would
+        # otherwise allow an old transcript to be paired with new chunks.
+        conn.execute("BEGIN")
+        try:
+            video = db.get_video(conn, video_id)
+            if not video:
+                raise ShareError("選択した動画のインデックスが見つかりません。")
 
-        raw_segments = db.get_segments(conn, video_id)
-        storage_id = video["video_id"]
-        chunk_rows = conn.execute(
-            "SELECT chunk_id, start_sec, end_sec, text FROM text_chunks "
-            "WHERE video_id = ? ORDER BY chunk_id",
-            (storage_id,),
-        ).fetchall()
-        raw_chunks = [dict(row) for row in chunk_rows]
-        chunk_ids = [int(chunk["chunk_id"]) for chunk in raw_chunks]
+            raw_segments = db.get_segments(conn, video_id)
+            storage_id = video["video_id"]
+            active_revision = db.get_active_transcript_revision(conn, storage_id)
+            if active_revision is None:
+                chunk_rows = conn.execute(
+                    "SELECT chunk_id, start_sec, end_sec, text FROM text_chunks "
+                    "WHERE video_id = ? ORDER BY chunk_id",
+                    (storage_id,),
+                ).fetchall()
+            else:
+                chunk_rows = conn.execute(
+                    "SELECT chunk_id, start_sec, end_sec, text FROM text_chunks "
+                    "WHERE video_id = ? AND transcript_revision = ? ORDER BY chunk_id",
+                    (storage_id, active_revision),
+                ).fetchall()
+            raw_chunks = [dict(row) for row in chunk_rows]
+            chunk_ids = [int(chunk["chunk_id"]) for chunk in raw_chunks]
+            vector_index_path = None
+            if chunk_ids:
+                from .publication import _current_vector_index_path
+
+                vector_index_path = _current_vector_index_path(conn)
+                if vector_index_path is None or not vector_index_path.exists():
+                    raise ShareError("FAISSインデックスが見つかりません。")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         segments = _sanitize_ranges(raw_segments, "segments")
         chunks = _sanitize_ranges(raw_chunks, "chunks")
         duration = _safe_float(video.get("duration"), "duration")
 
         if chunk_ids:
-            if not config.TEXT_INDEX_PATH.exists():
-                raise ShareError("FAISSインデックスが見つかりません。")
-            vindex = VectorIndex.load(config.TEXT_INDEX_PATH, 1)
+            assert vector_index_path is not None
+            vindex = VectorIndex.load(vector_index_path, 1)
             try:
                 vectors = np.stack(
                     [vindex.index.reconstruct(chunk_id) for chunk_id in chunk_ids]
@@ -441,9 +470,21 @@ def export_index(
 
 
 def _compensate_imported_video(conn, video_id: str) -> None:
-    """FAISS publish失敗時に、commit済みの新規行を可能な限り除去する。"""
+    """Publication前の失敗時にcommit済みimport draftを除去する。"""
+    row = conn.execute(
+        "SELECT source_generation FROM videos WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    source_generation = str(row[0]) if row and row[0] else None
     try:
         db.delete_video(conn, video_id)
+        if source_generation:
+            conn.execute(
+                "DELETE FROM transcript_revisions WHERE source_generation = ? "
+                "AND transcript_revision NOT IN "
+                "(SELECT transcript_revision FROM search_publication_members)",
+                (source_generation,),
+            )
+            conn.commit()
         return
     except Exception:
         try:
@@ -456,7 +497,26 @@ def _compensate_imported_video(conn, video_id: str) -> None:
             recovery_conn = db.get_conn()
             recovery_conn.execute("DELETE FROM text_chunks WHERE video_id = ?", (video_id,))
             recovery_conn.execute("DELETE FROM asr_segments WHERE video_id = ?", (video_id,))
+            recovery_conn.execute(
+                "DELETE FROM active_transcripts WHERE source_generation = ?",
+                (source_generation,),
+            )
+            recovery_conn.execute(
+                "DELETE FROM legacy_video_aliases WHERE public_video_id IN "
+                "(SELECT public_video_id FROM videos WHERE video_id = ?)",
+                (video_id,),
+            )
+            recovery_conn.execute(
+                "DELETE FROM sources WHERE source_generation = ?",
+                (source_generation,),
+            )
             recovery_conn.execute("DELETE FROM videos WHERE video_id = ?", (video_id,))
+            recovery_conn.execute(
+                "DELETE FROM transcript_revisions WHERE source_generation = ? "
+                "AND transcript_revision NOT IN "
+                "(SELECT transcript_revision FROM search_publication_members)",
+                (source_generation,),
+            )
             recovery_conn.commit()
             return
         except Exception as recovery_error:
@@ -474,8 +534,8 @@ def _compensate_imported_video(conn, video_id: str) -> None:
                 recovery_conn.close()
 
 
-def import_index(zip_path: Path) -> Iterator[str]:
-    """共有zipを検証してインポートする。進捗メッセージをyieldする。"""
+def _import_index_locked(zip_path: Path, conn, writer_lease) -> Iterator[str]:
+    """Import implementation executed under one cross-process writer lease."""
     zip_path = Path(zip_path)
     if not zip_path.is_file():
         raise ShareError("インポートする共有zipが見つかりません。")
@@ -489,14 +549,14 @@ def import_index(zip_path: Path) -> Iterator[str]:
     )
     placeholder_path = (Path("video") / "__unlinked__" / f"{video_id}.mp4").as_posix()
 
-    conn = db.get_conn()
-    db.init_db(conn)
     publication_row = conn.execute(
         "SELECT current_publication_id FROM library_state WHERE singleton = 1"
     ).fetchone()
     expected_publication = str(publication_row[0]) if publication_row and publication_row[0] else None
     temp_index_path: Path | None = None
     db_committed = False
+    publication_committed = False
+    post_messages: list[str] = []
     try:
         yield "インポートを開始しました（送信元のパスと旧IDは使用しません）"
         existing = db.get_video(conn, video_id)
@@ -514,21 +574,30 @@ def import_index(zip_path: Path) -> Iterator[str]:
         )
         yield "  匿名化した動画情報を登録しました"
 
+        revision = db.begin_transcript_revision(
+            conn,
+            video_id,
+            asr_config={"model": "shared-index", "language": "unknown"},
+            reuse_draft=False,
+            commit=False,
+        )
+
         for segment in package["segments"]:
             conn.execute(
                 "INSERT INTO asr_segments "
-                "(video_id, start_sec, end_sec, text, words_json) VALUES (?, ?, ?, ?, ?)",
+                "(video_id, start_sec, end_sec, text, words_json, transcript_revision) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     video_id,
                     segment["start_sec"],
                     segment["end_sec"],
                     segment["text"],
                     segment.get("words_json"),
+                    revision,
                 ),
             )
         yield f"  文字起こしセグメントを登録しました ({len(package['segments'])} 件)"
-
-        revision = db.mark_asr_complete(conn, video_id, commit=False)
+        db.complete_transcript_revision(conn, revision, commit=False)
 
         new_chunk_ids: list[int] = []
         for chunk in package["chunks"]:
@@ -540,128 +609,205 @@ def import_index(zip_path: Path) -> Iterator[str]:
             new_chunk_ids.append(int(cursor.lastrowid))
         yield f"  検索用チャンクを登録しました ({len(new_chunk_ids)} 件)"
 
-        if new_chunk_ids:
-            index_path = Path(config.TEXT_INDEX_PATH)
-            index_path.parent.mkdir(parents=True, exist_ok=True)
-            if index_path.exists():
-                vindex = VectorIndex.load(index_path, int(vectors.shape[1]))
-                actual_dim = int(getattr(vindex.index, "d", vectors.shape[1]))
-                if actual_dim != int(vectors.shape[1]):
-                    raise ShareError("既存インデックスと共有ベクトルの次元が一致しません。")
-            else:
-                vindex = VectorIndex(int(vectors.shape[1]))
-            previous_count = int(vindex.index.ntotal)
-            vindex.add(np.asarray(new_chunk_ids, dtype="int64"), vectors)
-            with tempfile.NamedTemporaryFile(
-                suffix=".index.tmp", dir=index_path.parent, delete=False
-            ) as temporary:
-                temp_index_path = Path(temporary.name)
-            vindex.save(temp_index_path)
-            verified = VectorIndex.load(temp_index_path, int(vectors.shape[1]))
-            if (
-                int(getattr(verified.index, "d", -1)) != int(vectors.shape[1])
-                or int(verified.index.ntotal) != previous_count + len(new_chunk_ids)
-            ):
-                raise ShareError("一時検索インデックスの検証に失敗しました。")
-            for chunk_id, expected in zip(new_chunk_ids, vectors):
-                try:
-                    actual = verified.index.reconstruct(int(chunk_id))
-                except RuntimeError as exc:
-                    raise ShareError("一時検索インデックスのID検証に失敗しました。") from exc
-                if not np.allclose(actual, expected, rtol=1e-5, atol=1e-6):
-                    raise ShareError("一時検索インデックスのvector検証に失敗しました。")
-
         conn.commit()
         db_committed = True
 
-        if temp_index_path is not None:
-            try:
-                os.replace(temp_index_path, config.TEXT_INDEX_PATH)
-                temp_index_path = None
-            except OSError as exc:
-                # Phase 2の世代publish導入までの補償処理。DBだけが残る状態を避ける。
-                _compensate_imported_video(conn, video_id)
-                db_committed = False
-                raise ShareError("検索インデックスを安全に公開できませんでした。") from exc
-            yield "  FAISSインデックスへ登録しました"
-
         try:
-            from .publication import publish_current_generation, publish_text_snapshot
+            from .publication import (
+                build_vector_index_draft,
+                publish_current_generation,
+                publish_text_snapshot,
+            )
             if new_chunk_ids:
-                publish_current_generation(conn, expected_publication)
+                replacements = {
+                    int(chunk_id): np.asarray(vector, dtype="float32")
+                    for chunk_id, vector in zip(new_chunk_ids, vectors)
+                }
+                temp_index_path, _expected_ids = build_vector_index_draft(
+                    conn,
+                    {video_id: revision},
+                    replacements,
+                    int(vectors.shape[1]),
+                )
+                publish_current_generation(
+                    conn,
+                    expected_publication,
+                    transcript_updates={video_id: revision},
+                    vector_draft_path=temp_index_path,
+                    writer_lease=writer_lease,
+                )
             else:
-                publish_text_snapshot(conn, expected_publication)
+                publish_text_snapshot(
+                    conn,
+                    expected_publication,
+                    transcript_updates={video_id: revision},
+                    writer_lease=writer_lease,
+                )
         except Exception as exc:
             _compensate_imported_video(conn, video_id)
             db_committed = False
             raise ShareError("共有インデックスのpublication公開に失敗しました。") from exc
+        publication_committed = True
+
+        if temp_index_path is not None:
+            try:
+                _install_compatibility_index(temp_index_path)
+                temp_index_path = None
+            except OSError:
+                post_messages.append(
+                    "  注意: 互換インデックスの更新に失敗しましたが、"
+                    "公開済み検索世代は利用できます。"
+                )
+            post_messages.append("  FAISSインデックスへ登録しました")
 
         if package["legacy"]:
-            yield "  旧形式を安全に変換し、送信元のパスと旧IDを破棄しました"
-        yield "警告: 元動画は未接続です。検索はできますが、プレビュー・保存には再関連付けが必要です。"
-        yield "インポートが完了しました。"
+            post_messages.append(
+                "  旧形式を安全に変換し、送信元のパスと旧IDを破棄しました"
+            )
+        post_messages.append(
+            "警告: 元動画は未接続です。検索はできますが、"
+            "プレビュー・保存には再関連付けが必要です。"
+        )
+        post_messages.append("インポートが完了しました。")
+        return post_messages
     except ShareError:
+        if db_committed and not publication_committed:
+            _compensate_imported_video(conn, video_id)
+            db_committed = False
         if not db_committed:
             conn.rollback()
         raise
     except Exception as exc:
+        if db_committed and not publication_committed:
+            _compensate_imported_video(conn, video_id)
+            db_committed = False
         if not db_committed:
             conn.rollback()
         raise ShareError("共有インデックスの登録に失敗しました。") from exc
     finally:
         if temp_index_path is not None:
             temp_index_path.unlink(missing_ok=True)
+
+
+def import_index(zip_path: Path) -> Iterator[str]:
+    """共有zipを検証してインポートする。進捗メッセージをyieldする。"""
+    from .publication import LeaseManager, PublicationError
+
+    conn = db.get_conn()
+    try:
+        with LeaseManager(conn).writer() as writer_lease:
+            db.init_db(conn)
+            post_messages = yield from _import_index_locked(
+                zip_path, conn, writer_lease
+            )
+        if post_messages:
+            yield from post_messages
+    except PublicationError as exc:
+        raise ShareError("別のライブラリ更新処理が実行中です。") from exc
+    finally:
         conn.close()
 
 
 def relink_video(public_video_id: str, source_path: Path, *, duration_tolerance: float = 0.25) -> dict:
     """Attach an unlinked shared transcript to a local source after validation."""
     from . import utils
-    from .publication import private_source_fingerprint
+    from .publication import (
+        LeaseManager,
+        PublicationError,
+        private_source_fingerprint,
+    )
 
     source_path = Path(source_path)
     if not source_path.is_file():
         raise ShareError("再関連付けする元動画が見つかりません。")
-    actual_duration = float(utils.probe_duration(source_path))
     conn = db.get_conn()
-    db.init_db(conn)
+    result: dict | None = None
     try:
-        publication_row = conn.execute(
-            "SELECT current_publication_id FROM library_state WHERE singleton = 1"
-        ).fetchone()
-        expected_publication = str(publication_row[0]) if publication_row and publication_row[0] else None
-        video = db.get_video(conn, public_video_id)
-        if not video:
-            raise ShareError("再関連付け対象の動画が見つかりません。")
-        expected_duration = float(video.get("duration") or 0.0)
-        if abs(actual_duration - expected_duration) > duration_tolerance:
-            raise ShareError("動画の長さが共有インデックスと一致しないため、関連付けを拒否しました。")
-        fingerprint = private_source_fingerprint(source_path)
-        old_generation = video.get("source_generation")
-        new_generation = f"src_{uuid.uuid4().hex}"
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "INSERT INTO sources(source_generation, public_video_id, locator, private_fingerprint, status) "
-            "VALUES(?, ?, ?, ?, 'available')",
-            (new_generation, public_video_id, str(source_path.resolve()), fingerprint),
-        )
-        conn.execute(
-            "UPDATE videos SET path = ?, source_generation = ?, source_state = 'available' "
-            "WHERE public_video_id = ?",
-            (str(source_path.resolve()), new_generation, public_video_id),
-        )
-        conn.execute(
-            "UPDATE active_transcripts SET source_generation = ? WHERE public_video_id = ?",
-            (new_generation, public_video_id),
-        )
-        conn.execute(
-            "UPDATE transcript_revisions SET source_generation = ? WHERE source_generation = ?",
-            (new_generation, old_generation),
-        )
-        conn.commit()
-        from .publication import publish_text_snapshot
-        publish_text_snapshot(conn, expected_publication)
-        return db.get_public_video(conn, public_video_id)
+        with LeaseManager(conn).writer() as writer_lease:
+            db.init_db(conn)
+            actual_duration = float(utils.probe_duration(source_path))
+            publication_row = conn.execute(
+                "SELECT current_publication_id FROM library_state WHERE singleton = 1"
+            ).fetchone()
+            expected_publication = (
+                str(publication_row[0])
+                if publication_row and publication_row[0] else None
+            )
+            video = db.get_video(conn, public_video_id)
+            if not video:
+                raise ShareError("再関連付け対象の動画が見つかりません。")
+            expected_duration = float(video.get("duration") or 0.0)
+            if abs(actual_duration - expected_duration) > duration_tolerance:
+                raise ShareError(
+                    "動画の長さが共有インデックスと一致しないため、関連付けを拒否しました。"
+                )
+            fingerprint = private_source_fingerprint(source_path)
+            old_generation = video.get("source_generation")
+            if not old_generation:
+                raise ShareError("再関連付け対象のsource generationが不明です。")
+            source_identity = conn.execute(
+                "SELECT private_fingerprint FROM sources "
+                "WHERE source_generation = ? AND public_video_id = ?",
+                (old_generation, public_video_id),
+            ).fetchone()
+            if source_identity is None:
+                raise ShareError("再関連付け対象のsource generationが見つかりません。")
+            if source_identity[0] and str(source_identity[0]) != fingerprint:
+                raise ShareError(
+                    "元動画の内容が既存source generationと異なります。"
+                    "新しい動画として登録してください。"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT owner_token, state, expires_at FROM job_records "
+                "WHERE job_id = ?",
+                (writer_lease.job_id,),
+            ).fetchone()
+            if (
+                not row
+                or str(row[0]) != writer_lease.owner_token
+                or str(row[1]) != "running"
+                or float(row[2]) < time.time()
+            ):
+                raise PublicationError("writer lease was lost")
+            source_update = conn.execute(
+                "UPDATE sources SET locator = ?, "
+                "private_fingerprint = COALESCE(private_fingerprint, ?), "
+                "status = 'available' WHERE source_generation = ? "
+                "AND public_video_id = ?",
+                (
+                    str(source_path.resolve()),
+                    fingerprint,
+                    old_generation,
+                    public_video_id,
+                ),
+            )
+            if source_update.rowcount != 1:
+                raise ShareError("再関連付け対象のsource generationが見つかりません。")
+            conn.execute(
+                "UPDATE videos SET path = ?, "
+                "source_state = 'available' WHERE public_video_id = ?",
+                (str(source_path.resolve()), public_video_id),
+            )
+            latest = conn.execute(
+                "SELECT current_publication_id FROM library_state WHERE singleton = 1"
+            ).fetchone()
+            latest_publication = str(latest[0]) if latest and latest[0] else None
+            if latest_publication != expected_publication:
+                raise PublicationError("publication compare-and-swap failed")
+            result_row = conn.execute(
+                "SELECT * FROM videos WHERE public_video_id = ?", (public_video_id,)
+            ).fetchone()
+            result = dict(result_row) if result_row else None
+            if result is None:
+                raise ShareError("再関連付け結果を確認できませんでした。")
+            conn.commit()
+            writer_lease.publication_committed = True
+        assert result is not None
+        return result
+    except PublicationError as exc:
+        conn.rollback()
+        raise ShareError("別のライブラリ更新処理が実行中か、公開状態が更新されました。") from exc
     except Exception:
         conn.rollback()
         raise

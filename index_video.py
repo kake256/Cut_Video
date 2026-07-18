@@ -9,6 +9,7 @@ ASR結果は完了時点でDBに保存されるため、後段(埋め込み等)�
 再実行時に文字起こしをやり直さずに再開できる。
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Iterator, Optional
@@ -18,7 +19,6 @@ import numpy as np
 from moment_retrieval import config, db, utils
 from moment_retrieval.chunker import build_chunks
 from moment_retrieval.embedder import TextEmbedder
-from moment_retrieval.vector_index import VectorIndex
 
 
 class IndexError_(Exception):
@@ -29,6 +29,10 @@ class IndexError_(Exception):
 ASR_FLUSH_INTERVAL_SEC = 300.0
 # 進捗表示の間隔 (実時間秒)
 ASR_PROGRESS_INTERVAL_SEC = 15.0
+
+
+def _install_compatibility_index(draft_path: Path) -> None:
+    os.replace(draft_path, config.TEXT_INDEX_PATH)
 
 
 def _extract_audio_tail(video: Path, start_sec: float) -> Path:
@@ -51,7 +55,8 @@ def _extract_audio_tail(video: Path, start_sec: float) -> Path:
 def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
                               asr_model: str, device: str, compute_type: str,
                               language: str, batch_size: Optional[int] = None,
-                              finalize_asr: bool = True) -> Iterator[str]:
+                              finalize_asr: bool = True,
+                              transcript_revision: str | None = None) -> Iterator[str]:
     """ストリーミング文字起こし。進捗をyieldし、定期的にDBへ途中保存する。
 
     途中失敗しても保存済み区間は再利用され、次回は続きから再開される。
@@ -65,7 +70,9 @@ def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
     tmp_audio = None
 
     if db.get_video(conn, video_id):
-        last_end = db.get_last_segment_end(conn, video_id)
+        last_end = db.get_last_segment_end(
+            conn, video_id, transcript_revision=transcript_revision
+        )
         if last_end > 0:
             start_offset = last_end
             yield (f"  前回の途中結果を検出。{utils.format_timestamp(last_end)} "
@@ -98,7 +105,12 @@ def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
     def _flush():
         nonlocal pending
         for seg in pending:
-            db.insert_segment(conn, video_id, seg)
+            db.insert_segment(
+                conn,
+                video_id,
+                seg,
+                transcript_revision=transcript_revision,
+            )
         conn.commit()
         pending = []
 
@@ -123,13 +135,57 @@ def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
         if tmp_audio is not None:
             tmp_audio.unlink(missing_ok=True)
 
-    saved_total = len(db.get_segments(conn, video_id))
+    saved_total = len(
+        db.get_segments(
+            conn, video_id, transcript_revision=transcript_revision
+        )
+    )
     if saved_total == 0:
         raise IndexError_("文字起こし結果が空でした(無音動画の可能性があります)。")
 
     if finalize_asr:
-        db.mark_asr_complete(conn, video_id)
+        if transcript_revision is None:
+            db.mark_asr_complete(conn, video_id)
+        else:
+            db.complete_transcript_revision(conn, transcript_revision)
     yield f"  文字起こし完了 (セグメント数: {saved_total})"
+
+
+def _build_verified_index_draft(
+    conn,
+    video_id: str,
+    transcript_revision: str,
+    chunks,
+    vectors: np.ndarray,
+    transcript_updates: dict[str, str] | None = None,
+) -> tuple[Path, list[int]]:
+    """Build an exact prospective-generation FAISS draft without publishing it."""
+    if len(chunks) != len(vectors) or len(chunks) == 0:
+        raise IndexError_("検索用チャンクまたは埋め込み結果が空です。")
+    db.delete_chunks_for_revision(conn, video_id, transcript_revision)
+    chunk_ids = [
+        db.insert_chunk(
+            conn,
+            video_id,
+            chunk,
+            transcript_revision=transcript_revision,
+        )
+        for chunk in chunks
+    ]
+    conn.commit()
+    from moment_retrieval.publication import build_vector_index_draft
+
+    replacements = {
+        int(chunk_id): np.asarray(vector, dtype="float32")
+        for chunk_id, vector in zip(chunk_ids, vectors)
+    }
+    draft_path, _expected_ids = build_vector_index_draft(
+        conn,
+        transcript_updates,
+        replacements,
+        int(vectors.shape[1]),
+    )
+    return draft_path, chunk_ids
 
 
 def run_indexing(
@@ -144,116 +200,209 @@ def run_indexing(
     compute_type: str = None,
     batch_size: Optional[int] = None,
 ) -> Iterator[str]:
-    """インデックス構築パイプライン。進捗メッセージをyieldする。
-
-    失敗時はIndexError_を送出する。
-    """
+    """Build a draft revision and switch the current publication only after CAS."""
     chunk_sec = chunk_sec if chunk_sec is not None else config.CHUNK_SEC
     overlap_sec = overlap_sec if overlap_sec is not None else config.OVERLAP_SEC
     asr_model = asr_model or config.ASR_MODEL_SIZE
     device = device or config.ASR_DEVICE
     compute_type = compute_type or config.ASR_COMPUTE_TYPE
-
+    video = Path(video)
     if not video.exists():
         raise IndexError_(f"動画が見つかりません: {video}")
 
-    conn = db.get_conn()
-    db.init_db(conn)
     from moment_retrieval.publication import (
-        PublicationError, private_source_fingerprint, publish_current_generation,
-        publish_text_snapshot,
+        LeaseManager,
+        PublicationError,
+        private_source_fingerprint,
+        publish_current_generation,
     )
-    expected_row = conn.execute(
-        "SELECT current_publication_id FROM library_state WHERE singleton = 1"
-    ).fetchone()
-    expected_publication = str(expected_row[0]) if expected_row and expected_row[0] else None
-    source_fingerprint = private_source_fingerprint(video)
 
-    if video_id is None:
-        existing_at_path = db.find_video_by_path(conn, str(video.resolve()))
-        video_id = (
-            existing_at_path["video_id"] if existing_at_path
-            else db.new_public_video_id()
-        )
-
-    existing_chunk_ids = db.get_chunk_ids(conn, video_id)
-    if existing_chunk_ids and not force:
-        raise IndexError_(
-            f"video_id '{video_id}' は既にインデックス済みです。"
-            "作り直す場合は「再インデックス」を指定してください。"
-        )
-
-    if force and db.get_video(conn, video_id):
-        if config.TEXT_INDEX_PATH.exists() and existing_chunk_ids:
-            vindex = VectorIndex.load(config.TEXT_INDEX_PATH, 1)
-            vindex.remove(np.array(existing_chunk_ids, dtype="int64"))
-            vindex.save(config.TEXT_INDEX_PATH)
-        db.delete_video(conn, video_id)
-        yield f"既存インデックスを削除しました: {video_id}"
-
-    duration = utils.probe_duration(video)
-
-    yield f"[1/4] 文字起こし中... (model={asr_model}, device={device})"
-    if db.get_video(conn, video_id) and db.is_asr_complete(conn, video_id):
-        yield "  保存済みのASR結果を再利用します"
-    else:
-        yield from _transcribe_with_progress(
-            conn, video_id, video, duration, asr_model, device, compute_type, language,
-            batch_size=batch_size, finalize_asr=False,
-        )
-        if private_source_fingerprint(video) != source_fingerprint:
-            raise IndexError_("文字起こし中に元動画が変更されたため、結果を公開しませんでした。")
-        db.mark_asr_complete(conn, video_id)
-        try:
-            text_snapshot = publish_text_snapshot(conn, expected_publication)
-            expected_publication = text_snapshot.publication_id
-        except PublicationError as exc:
-            raise IndexError_(f"文字起こし公開に失敗しました: {exc}") from exc
-
-    from moment_retrieval.asr import Segment
-
-    segments = [
-        Segment(start=r["start_sec"], end=r["end_sec"], text=r["text"])
-        for r in db.get_segments(conn, video_id)
-    ]
-    yield f"  セグメント数: {len(segments)}"
-
-    yield "[2/4] 検索用チャンクを生成中..."
-    chunks = build_chunks(segments, target_sec=chunk_sec, overlap_sec=overlap_sec)
-    yield f"  チャンク数: {len(chunks)}"
-
-    yield "[3/4] テキスト埋め込みを計算中... (BGE-M3)"
-    embedder = TextEmbedder()
-    vectors = embedder.encode([c.text for c in chunks])
-
-    yield "[4/4] DB / FAISSインデックスへ登録中..."
-    if config.TEXT_INDEX_PATH.exists():
-        vindex = VectorIndex.load(config.TEXT_INDEX_PATH, vectors.shape[1])
-    else:
-        vindex = VectorIndex(vectors.shape[1])
-
-    chunk_ids = [db.insert_chunk(conn, video_id, chunk) for chunk in chunks]
-    vindex.add(np.array(chunk_ids, dtype="int64"), vectors)
-    vindex.save(config.TEXT_INDEX_PATH)
-
-    conn.commit()
-    if private_source_fingerprint(video) != source_fingerprint:
-        raise IndexError_("埋め込み中に元動画が変更されたため、検索世代を公開しませんでした。")
-    video_record = db.get_video(conn, video_id)
-    if video_record:
-        conn.execute(
-            "UPDATE sources SET private_fingerprint = ?, status = 'available' "
-            "WHERE source_generation = ?",
-            (source_fingerprint, video_record["source_generation"]),
-        )
-        conn.commit()
+    conn = db.get_conn()
+    draft_index_path: Path | None = None
+    post_messages: list[str] = []
     try:
-        snapshot = publish_current_generation(conn, expected_publication)
+        with LeaseManager(conn).writer() as writer_lease:
+            db.init_db(conn)
+            expected_row = conn.execute(
+                "SELECT current_publication_id FROM library_state WHERE singleton = 1"
+            ).fetchone()
+            expected_publication = (
+                str(expected_row[0]) if expected_row and expected_row[0] else None
+            )
+            source_fingerprint = private_source_fingerprint(video)
+            resolved_path = str(video.resolve())
+
+            if video_id is None:
+                existing_at_path = db.find_video_by_path(conn, resolved_path)
+                video_id = (
+                    existing_at_path["video_id"]
+                    if existing_at_path else db.new_public_video_id()
+                )
+            existing_video = db.get_video(conn, video_id)
+            if existing_video and Path(existing_video["path"]).resolve() != video.resolve():
+                raise IndexError_(
+                    "既存video IDを別の元動画で再インデックスできません。"
+                    "先に再関連付けを行ってください。"
+                )
+            if existing_video is None:
+                db.insert_video(conn, video_id, resolved_path, utils.probe_duration(video))
+                conn.commit()
+                existing_video = db.get_video(conn, video_id)
+            else:
+                stored_fingerprint = conn.execute(
+                    "SELECT private_fingerprint FROM sources "
+                    "WHERE source_generation = ?",
+                    (existing_video["source_generation"],),
+                ).fetchone()
+                expected_fingerprint = (
+                    str(stored_fingerprint[0])
+                    if stored_fingerprint and stored_fingerprint[0]
+                    else None
+                )
+                if (
+                    expected_fingerprint is not None
+                    and expected_fingerprint != source_fingerprint
+                ):
+                    raise IndexError_(
+                        "元動画の内容が登録時と異なります。既存source generationを"
+                        "上書きせず、再関連付けまたは新しい動画として登録してください。"
+                    )
+
+            active_revision = db.get_active_transcript_revision(conn, video_id)
+            active_chunk_ids = (
+                db.get_chunk_ids(
+                    conn, video_id, transcript_revision=active_revision
+                )
+                if active_revision else []
+            )
+            if active_chunk_ids and not force:
+                raise IndexError_(
+                    f"video_id '{video_id}' は既にインデックス済みです。"
+                    "作り直す場合は「再インデックス」を指定してください。"
+                )
+
+            duration = float(existing_video.get("duration") or utils.probe_duration(video))
+            transcript_updates: dict[str, str] = {}
+            public_video_id = str(existing_video["public_video_id"])
+            if force or active_revision is None:
+                revision = db.begin_transcript_revision(
+                    conn,
+                    video_id,
+                    asr_config={
+                        "model": asr_model,
+                        "language": language,
+                        "device": device,
+                        "compute_type": compute_type,
+                        "batch_size": batch_size,
+                    },
+                )
+                revision_status = db.transcript_revision_status(conn, revision)
+                draft_segments = db.get_segments(
+                    conn, video_id, transcript_revision=revision
+                )
+                yield f"[1/4] 文字起こし中... (model={asr_model}, device={device})"
+                if revision_status == "TEXT_READY" and draft_segments:
+                    yield "  完成済みの未公開ASR draftを再利用します"
+                else:
+                    yield from _transcribe_with_progress(
+                        conn,
+                        video_id,
+                        video,
+                        duration,
+                        asr_model,
+                        device,
+                        compute_type,
+                        language,
+                        batch_size=batch_size,
+                        finalize_asr=False,
+                        transcript_revision=revision,
+                    )
+                    if private_source_fingerprint(video) != source_fingerprint:
+                        raise IndexError_(
+                            "文字起こし中に元動画が変更されたため、結果を公開しませんでした。"
+                        )
+                    db.complete_transcript_revision(conn, revision)
+                transcript_updates[public_video_id] = revision
+            else:
+                revision = active_revision
+                yield f"[1/4] 文字起こし中... (model={asr_model}, device={device})"
+                yield "  保存済みのASR結果を再利用します"
+
+            from moment_retrieval.asr import Segment
+
+            segments = [
+                Segment(start=row["start_sec"], end=row["end_sec"], text=row["text"])
+                for row in db.get_segments(
+                    conn, video_id, transcript_revision=revision
+                )
+            ]
+            yield f"  セグメント数: {len(segments)}"
+            yield "[2/4] 検索用チャンクを生成中..."
+            chunks = build_chunks(
+                segments, target_sec=chunk_sec, overlap_sec=overlap_sec
+            )
+            yield f"  チャンク数: {len(chunks)}"
+
+            yield "[3/4] テキスト埋め込みを計算中... (BGE-M3)"
+            vectors = TextEmbedder().encode([chunk.text for chunk in chunks])
+            if private_source_fingerprint(video) != source_fingerprint:
+                raise IndexError_(
+                    "埋め込み中に元動画が変更されたため、検索世代を公開しませんでした。"
+                )
+
+            yield "[4/4] DB / FAISSインデックスへ登録中..."
+            draft_index_path, chunk_ids = _build_verified_index_draft(
+                conn,
+                video_id,
+                revision,
+                chunks,
+                vectors,
+                transcript_updates,
+            )
+            if private_source_fingerprint(video) != source_fingerprint:
+                raise IndexError_(
+                    "検索世代の公開直前に元動画が変更されたため、"
+                    "結果を公開しませんでした。"
+                )
+            writer_lease.assert_owned()
+            try:
+                snapshot = publish_current_generation(
+                    conn,
+                    expected_publication,
+                    transcript_updates=transcript_updates,
+                    vector_draft_path=draft_index_path,
+                    source_fingerprints={
+                        str(existing_video["source_generation"]): source_fingerprint
+                    },
+                    writer_lease=writer_lease,
+                )
+            except PublicationError as exc:
+                raise IndexError_(f"検索世代の公開に失敗しました: {exc}") from exc
+            compatibility_warning = None
+            try:
+                _install_compatibility_index(draft_index_path)
+                draft_index_path = None
+            except OSError:
+                compatibility_warning = (
+                    "  注意: 互換インデックスの更新に失敗しましたが、"
+                    "公開済み検索世代は利用できます。"
+                )
+            post_messages.append(
+                f"  検索世代を公開しました: {snapshot.generation_id}"
+            )
+            if compatibility_warning:
+                post_messages.append(compatibility_warning)
+            post_messages.append(
+                f"完了: video_id='{video_id}' / "
+                f"チャンク {len(chunk_ids)} 件を登録しました。"
+            )
+        yield from post_messages
     except PublicationError as exc:
-        raise IndexError_(f"検索世代の公開に失敗しました: {exc}") from exc
-    yield f"  検索世代を公開しました: {snapshot.generation_id}"
-    conn.close()
-    yield f"完了: video_id='{video_id}' / チャンク {len(chunks)} 件を登録しました。"
+        raise IndexError_(f"別のライブラリ更新処理が実行中です: {exc}") from exc
+    finally:
+        if draft_index_path is not None:
+            draft_index_path.unlink(missing_ok=True)
+        conn.close()
 
 
 def main():

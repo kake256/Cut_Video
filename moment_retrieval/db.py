@@ -12,6 +12,9 @@ from . import config
 SCHEMA_VERSION = 4
 PUBLIC_ID_PREFIX = "vid_"
 
+_JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+_SYNCHRONOUS_MODES = {"OFF", "NORMAL", "FULL", "EXTRA"}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
     video_id TEXT PRIMARY KEY,
@@ -130,6 +133,49 @@ def new_public_video_id() -> str:
     return f"{PUBLIC_ID_PREFIX}{uuid.uuid4().hex}"
 
 
+def _fingerprint_available_source(path: str | Path) -> str | None:
+    """Return the private local fingerprint without exposing source material.
+
+    The import is deliberately local because ``publication`` also imports this
+    module.  Missing or concurrently replaced legacy sources remain unknown and
+    are not silently rebound to a generation.
+    """
+    source = Path(path)
+    if not source.is_file():
+        return None
+    try:
+        from .publication import private_source_fingerprint
+        return private_source_fingerprint(source)
+    except OSError:
+        return None
+
+
+def configure_connection(conn: sqlite3.Connection) -> None:
+    """Apply the process-wide SQLite concurrency and integrity policy."""
+    busy_timeout = max(0, int(config.SQLITE_BUSY_TIMEOUT_MS))
+    journal_mode = str(config.SQLITE_JOURNAL_MODE).upper()
+    synchronous = str(config.SQLITE_SYNCHRONOUS).upper()
+    if journal_mode not in _JOURNAL_MODES:
+        raise ValueError(f"unsupported SQLite journal mode: {journal_mode}")
+    if synchronous not in _SYNCHRONOUS_MODES:
+        raise ValueError(f"unsupported SQLite synchronous mode: {synchronous}")
+    conn.execute(f"PRAGMA busy_timeout = {busy_timeout}")
+    conn.execute("PRAGMA foreign_keys = ON")
+    if not conn.in_transaction:
+        conn.execute(f"PRAGMA journal_mode = {journal_mode}")
+        conn.execute(f"PRAGMA synchronous = {synchronous}")
+
+
+def ensure_writer_lease_schema(conn: sqlite3.Connection) -> None:
+    """Create only the coordination table needed before full schema bootstrap."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS job_records ("
+        "job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner_token TEXT NOT NULL, "
+        "owner_pid INTEGER NOT NULL, state TEXT NOT NULL, heartbeat REAL NOT NULL, "
+        "expires_at REAL NOT NULL, payload_json TEXT)"
+    )
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -232,6 +278,23 @@ def _backfill_publication_metadata(conn: sqlite3.Connection) -> None:
             "VALUES(?, ?, ?, ?)",
             (source_generation, public_id, row[2], source_status),
         )
+        stored_fingerprint = conn.execute(
+            "SELECT private_fingerprint FROM sources "
+            "WHERE source_generation = ? AND public_video_id = ?",
+            (source_generation, public_id),
+        ).fetchone()
+        if (
+            source_status == "available"
+            and stored_fingerprint is not None
+            and not stored_fingerprint[0]
+        ):
+            fingerprint = _fingerprint_available_source(row[2])
+            if fingerprint is not None:
+                conn.execute(
+                    "UPDATE sources SET private_fingerprint = COALESCE(private_fingerprint, ?) "
+                    "WHERE source_generation = ? AND public_video_id = ?",
+                    (fingerprint, source_generation, public_id),
+                )
         if not row[3]:
             continue
         revision = f"tr_{uuid.uuid4().hex}"
@@ -294,7 +357,17 @@ def init_db(conn: sqlite3.Connection, *, create_backup: bool = True) -> Path | N
     behind repository resolution while all public DTOs use ``public_video_id``.
     A file database is backed up once before an old schema is changed.
     """
+    configure_connection(conn)
     current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {current} is newer than supported "
+            f"version {SCHEMA_VERSION}"
+        )
+    if current == SCHEMA_VERSION:
+        # Current-schema callers are overwhelmingly read paths.  Avoid taking
+        # a write lock and rerunning legacy backfills on every callback.
+        return None
     had_videos = bool(
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='videos'"
@@ -321,8 +394,12 @@ def init_db(conn: sqlite3.Connection, *, create_backup: bool = True) -> Path | N
 
 def get_conn() -> sqlite3.Connection:
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(
+        config.DB_PATH,
+        timeout=max(0.0, float(config.SQLITE_BUSY_TIMEOUT_MS) / 1000.0),
+    )
     conn.row_factory = sqlite3.Row
+    configure_connection(conn)
     return conn
 
 
@@ -360,10 +437,57 @@ def public_video_id(conn: sqlite3.Connection, identifier: str) -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
+def resolve_source_fingerprint(
+    conn: sqlite3.Connection,
+    public_video_id: str,
+    source_generation: str,
+    *,
+    migrate_legacy: bool = True,
+) -> str | None:
+    """Resolve the private fingerprint bound to one immutable source generation.
+
+    Legacy rows may have a null fingerprint.  When their recorded locator still
+    exists, the first resolution computes and stores the local fingerprint.  A
+    missing locator or an unknown generation stays unresolved so preview/save
+    callers can block and ask for an explicit relink.  Callers own the database
+    transaction and must commit if they want a legacy backfill persisted.
+    """
+    row = conn.execute(
+        "SELECT locator, private_fingerprint, status FROM sources "
+        "WHERE public_video_id = ? AND source_generation = ?",
+        (public_video_id, source_generation),
+    ).fetchone()
+    if row is None:
+        return None
+    fingerprint = row[1]
+    if fingerprint:
+        return str(fingerprint)
+    if not migrate_legacy or str(row[2] or "") != "available" or not row[0]:
+        return None
+    fingerprint = _fingerprint_available_source(str(row[0]))
+    if fingerprint is None:
+        return None
+    conn.execute(
+        "UPDATE sources SET private_fingerprint = ? "
+        "WHERE public_video_id = ? AND source_generation = ? "
+        "AND private_fingerprint IS NULL",
+        (fingerprint, public_video_id, source_generation),
+    )
+    current = conn.execute(
+        "SELECT private_fingerprint FROM sources "
+        "WHERE public_video_id = ? AND source_generation = ?",
+        (public_video_id, source_generation),
+    ).fetchone()
+    return str(current[0]) if current and current[0] else None
+
+
 def insert_video(conn: sqlite3.Connection, video_id: str, path: str, duration: float) -> None:
     public_id = video_id if video_id.startswith(PUBLIC_ID_PREFIX) else new_public_video_id()
     source_generation = f"src_{uuid.uuid4().hex}"
     source_status = "available" if Path(path).exists() else "missing"
+    source_fingerprint = (
+        _fingerprint_available_source(path) if source_status == "available" else None
+    )
     conn.execute(
         "INSERT INTO videos (video_id, path, duration, public_video_id, display_name, "
         "source_generation, source_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -374,8 +498,9 @@ def insert_video(conn: sqlite3.Connection, video_id: str, path: str, duration: f
         (video_id, public_id),
     )
     conn.execute(
-        "INSERT INTO sources(source_generation, public_video_id, locator, status) VALUES(?, ?, ?, ?)",
-        (source_generation, public_id, path, source_status),
+        "INSERT INTO sources(source_generation, public_video_id, locator, private_fingerprint, status) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (source_generation, public_id, path, source_fingerprint, source_status),
     )
 
 
@@ -422,26 +547,170 @@ def find_video_by_path(conn: sqlite3.Connection, path: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def insert_segment(conn: sqlite3.Connection, video_id: str, segment) -> None:
+def begin_transcript_revision(
+    conn: sqlite3.Connection,
+    video_id: str,
+    *,
+    asr_config: dict | None = None,
+    reuse_draft: bool = True,
+    commit: bool = True,
+) -> str:
+    """Create or resume an unpublished transcript revision for one source."""
+    storage_id = _storage_id(conn, video_id) or video_id
+    video = conn.execute(
+        "SELECT public_video_id, source_generation FROM videos WHERE video_id = ?",
+        (storage_id,),
+    ).fetchone()
+    if not video:
+        raise ValueError("video does not exist")
+    config_json = json.dumps(
+        asr_config or {"model": "unknown", "language": "unknown"},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if reuse_draft:
+        existing = conn.execute(
+            "SELECT r.transcript_revision FROM transcript_revisions r "
+            "LEFT JOIN active_transcripts a "
+            "ON a.transcript_revision = r.transcript_revision "
+            "WHERE r.source_generation = ? AND r.asr_config_json = ? "
+            "AND r.status IN ('BUILDING', 'TEXT_READY') "
+            "AND a.transcript_revision IS NULL ORDER BY r.rowid DESC LIMIT 1",
+            (video[1], config_json),
+        ).fetchone()
+        if existing:
+            return str(existing[0])
+    revision = f"tr_{uuid.uuid4().hex}"
+    conn.execute(
+        "INSERT INTO transcript_revisions"
+        "(transcript_revision, source_generation, status, asr_config_json) "
+        "VALUES(?, ?, 'BUILDING', ?)",
+        (revision, video[1], config_json),
+    )
+    if commit:
+        conn.commit()
+    return revision
+
+
+def complete_transcript_revision(
+    conn: sqlite3.Connection, transcript_revision: str, *, commit: bool = True
+) -> None:
+    cursor = conn.execute(
+        "UPDATE transcript_revisions SET status = 'TEXT_READY' "
+        "WHERE transcript_revision = ? AND status IN ('BUILDING', 'TEXT_READY')",
+        (transcript_revision,),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("transcript revision is not an active draft")
+    if commit:
+        conn.commit()
+
+
+def transcript_revision_status(
+    conn: sqlite3.Connection, transcript_revision: str
+) -> str | None:
+    row = conn.execute(
+        "SELECT status FROM transcript_revisions WHERE transcript_revision = ?",
+        (transcript_revision,),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def get_active_transcript_revision(
+    conn: sqlite3.Connection, video_id: str
+) -> str | None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    row = conn.execute(
+        "SELECT a.transcript_revision FROM active_transcripts a JOIN videos v "
+        "ON v.public_video_id = a.public_video_id WHERE v.video_id = ?",
+        (storage_id,),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def activate_transcript_revision(
+    conn: sqlite3.Connection, public_video_id: str, transcript_revision: str
+) -> str:
+    row = conn.execute(
+        "SELECT r.source_generation FROM transcript_revisions r JOIN videos v "
+        "ON v.source_generation = r.source_generation "
+        "WHERE v.public_video_id = ? AND r.transcript_revision = ?",
+        (public_video_id, transcript_revision),
+    ).fetchone()
+    if not row:
+        raise ValueError("transcript revision does not belong to the video source")
+    source_generation = str(row[0])
+    previous = conn.execute(
+        "SELECT transcript_revision FROM active_transcripts WHERE public_video_id = ?",
+        (public_video_id,),
+    ).fetchone()
+    if previous and str(previous[0]) != transcript_revision:
+        conn.execute(
+            "UPDATE transcript_revisions SET status = 'SUPERSEDED' "
+            "WHERE transcript_revision = ?",
+            (previous[0],),
+        )
+    conn.execute(
+        "INSERT INTO active_transcripts(public_video_id, source_generation, transcript_revision) "
+        "VALUES(?, ?, ?) ON CONFLICT(public_video_id) DO UPDATE SET "
+        "source_generation=excluded.source_generation, "
+        "transcript_revision=excluded.transcript_revision",
+        (public_video_id, source_generation, transcript_revision),
+    )
+    conn.execute(
+        "UPDATE transcript_revisions SET status = 'ACTIVE' WHERE transcript_revision = ?",
+        (transcript_revision,),
+    )
+    conn.execute(
+        "UPDATE videos SET asr_complete = 1 WHERE public_video_id = ?",
+        (public_video_id,),
+    )
+    return source_generation
+
+
+def insert_segment(
+    conn: sqlite3.Connection,
+    video_id: str,
+    segment,
+    *,
+    transcript_revision: str | None = None,
+) -> None:
     storage_id = _storage_id(conn, video_id) or video_id
     words_json = json.dumps(
         [{"word": w.word, "start": w.start, "end": w.end} for w in segment.words],
         ensure_ascii=False,
     )
     conn.execute(
-        "INSERT INTO asr_segments (video_id, start_sec, end_sec, text, words_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (storage_id, segment.start, segment.end, segment.text, words_json),
+        "INSERT INTO asr_segments "
+        "(video_id, start_sec, end_sec, text, words_json, transcript_revision) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            storage_id,
+            segment.start,
+            segment.end,
+            segment.text,
+            words_json,
+            transcript_revision,
+        ),
     )
 
 
-def insert_chunk(conn: sqlite3.Connection, video_id: str, chunk) -> int:
+def insert_chunk(
+    conn: sqlite3.Connection,
+    video_id: str,
+    chunk,
+    *,
+    transcript_revision: str | None = None,
+) -> int:
     storage_id = _storage_id(conn, video_id) or video_id
-    revision_row = conn.execute(
-        "SELECT a.transcript_revision FROM active_transcripts a JOIN videos v "
-        "ON v.public_video_id = a.public_video_id WHERE v.video_id = ?", (storage_id,)
-    ).fetchone()
-    revision = str(revision_row[0]) if revision_row else None
+    revision = transcript_revision
+    if revision is None:
+        revision_row = conn.execute(
+            "SELECT a.transcript_revision FROM active_transcripts a JOIN videos v "
+            "ON v.public_video_id = a.public_video_id WHERE v.video_id = ?", (storage_id,)
+        ).fetchone()
+        revision = str(revision_row[0]) if revision_row else None
     cur = conn.execute(
         "INSERT INTO text_chunks (video_id, start_sec, end_sec, text, transcript_revision) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -498,34 +767,101 @@ def is_asr_complete(conn: sqlite3.Connection, video_id: str) -> bool:
     return bool(row and row["asr_complete"])
 
 
-def get_last_segment_end(conn: sqlite3.Connection, video_id: str) -> float:
+def get_last_segment_end(
+    conn: sqlite3.Connection,
+    video_id: str,
+    *,
+    transcript_revision: str | None = None,
+) -> float:
     storage_id = _storage_id(conn, video_id) or video_id
-    row = conn.execute(
-        "SELECT MAX(end_sec) AS m FROM asr_segments WHERE video_id = ?", (storage_id,)
-    ).fetchone()
+    effective_revision = (
+        transcript_revision
+        if transcript_revision is not None
+        else get_active_transcript_revision(conn, storage_id)
+    )
+    if effective_revision is None:
+        row = conn.execute(
+            "SELECT MAX(end_sec) AS m FROM asr_segments WHERE video_id = ?",
+            (storage_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT MAX(end_sec) AS m FROM asr_segments "
+            "WHERE video_id = ? AND transcript_revision = ?",
+            (storage_id, effective_revision),
+        ).fetchone()
     return float(row["m"]) if row and row["m"] is not None else 0.0
 
 
-def get_segments(conn: sqlite3.Connection, video_id: str) -> list[dict]:
+def get_segments(
+    conn: sqlite3.Connection,
+    video_id: str,
+    *,
+    transcript_revision: str | None = None,
+) -> list[dict]:
     storage_id = _storage_id(conn, video_id) or video_id
-    rows = conn.execute(
-        "SELECT * FROM asr_segments WHERE video_id = ? ORDER BY start_sec", (storage_id,)
-    ).fetchall()
+    effective_revision = (
+        transcript_revision
+        if transcript_revision is not None
+        else get_active_transcript_revision(conn, storage_id)
+    )
+    if effective_revision is None:
+        rows = conn.execute(
+            "SELECT * FROM asr_segments WHERE video_id = ? ORDER BY start_sec",
+            (storage_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM asr_segments WHERE video_id = ? "
+            "AND transcript_revision = ? ORDER BY start_sec",
+            (storage_id, effective_revision),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_indexed_video_ids(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute(
         "SELECT DISTINCT v.public_video_id FROM text_chunks c "
-        "JOIN videos v ON v.video_id = c.video_id"
+        "JOIN videos v ON v.video_id = c.video_id "
+        "JOIN active_transcripts a ON a.public_video_id = v.public_video_id "
+        "AND a.transcript_revision = c.transcript_revision"
     ).fetchall()
     return {str(r[0]) for r in rows}
 
 
-def get_chunk_ids(conn: sqlite3.Connection, video_id: str) -> list[int]:
+def get_chunk_ids(
+    conn: sqlite3.Connection,
+    video_id: str,
+    *,
+    transcript_revision: str | None = None,
+) -> list[int]:
     storage_id = _storage_id(conn, video_id) or video_id
-    rows = conn.execute("SELECT chunk_id FROM text_chunks WHERE video_id = ?", (storage_id,)).fetchall()
+    effective_revision = (
+        transcript_revision
+        if transcript_revision is not None
+        else get_active_transcript_revision(conn, storage_id)
+    )
+    if effective_revision is None:
+        rows = conn.execute(
+            "SELECT chunk_id FROM text_chunks WHERE video_id = ?", (storage_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT chunk_id FROM text_chunks WHERE video_id = ? "
+            "AND transcript_revision = ?",
+            (storage_id, effective_revision),
+        ).fetchall()
     return [int(r["chunk_id"]) for r in rows]
+
+
+def delete_chunks_for_revision(
+    conn: sqlite3.Connection, video_id: str, transcript_revision: str
+) -> None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    conn.execute(
+        "DELETE FROM text_chunks WHERE video_id = ? AND transcript_revision = ?",
+        (storage_id, transcript_revision),
+    )
 
 
 def delete_video(conn: sqlite3.Connection, video_id: str) -> None:

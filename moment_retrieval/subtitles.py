@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .edit_domain import EffectiveExportPlan, TimeRange
 from .transcript_types import TimestampGranularity, TranscriptSegment, TranscriptWord
+
+
+class SubtitleValidationError(ValueError):
+    pass
+
+
+_SRT_TIMING = re.compile(
+    r"^\s*(\d+):([0-5]\d):([0-5]\d),(\d{3})\s*-->\s*"
+    r"(\d+):([0-5]\d):([0-5]\d),(\d{3})\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +46,46 @@ def format_srt_time(value_ms: int) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     seconds, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def _srt_groups_to_ms(groups: tuple[str, ...]) -> int:
+    hours, minutes, seconds, milliseconds = (int(value) for value in groups)
+    return hours * 3_600_000 + minutes * 60_000 + seconds * 1000 + milliseconds
+
+
+def validate_srt_text(
+    text: str, output_duration_ms: int, tolerance_ms: int,
+) -> tuple[tuple[int, int], ...]:
+    """Validate generated SRT timing against the probed output artifact.
+
+    Cue text is intentionally not returned or logged.  An empty SRT is valid
+    when every transcript cue was removed by the edit plan.
+    """
+    duration = int(output_duration_ms)
+    tolerance = max(0, int(tolerance_ms))
+    if duration < 0:
+        raise SubtitleValidationError("output duration must not be negative")
+    if not text.strip():
+        return ()
+    timings: list[tuple[int, int]] = []
+    for line in text.splitlines():
+        if "-->" not in line:
+            continue
+        match = _SRT_TIMING.fullmatch(line)
+        if match is None:
+            raise SubtitleValidationError("invalid SRT timing line")
+        start_ms = _srt_groups_to_ms(match.groups()[:4])
+        end_ms = _srt_groups_to_ms(match.groups()[4:])
+        if not 0 <= start_ms < end_ms:
+            raise SubtitleValidationError("SRT cue must have a positive duration")
+        if end_ms > duration + tolerance:
+            raise SubtitleValidationError("SRT cue exceeds the probed output duration")
+        if timings and start_ms < timings[-1][0]:
+            raise SubtitleValidationError("SRT cues are not in timeline order")
+        timings.append((start_ms, end_ms))
+    if not timings:
+        raise SubtitleValidationError("non-empty SRT has no timing cues")
+    return tuple(timings)
 
 
 def _containing_range(ranges: tuple[TimeRange, ...], start: int, end: int) -> TimeRange | None:

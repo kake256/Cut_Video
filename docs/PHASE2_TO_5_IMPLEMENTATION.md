@@ -14,18 +14,31 @@ requires real user measurements. It does not mark the candidate UI as adopted.
   manifest in a generation-specific directory. Staging is atomically renamed.
 - Search pins one publication and its member revisions for the complete request.
   Semantic retrieval uses the same covered revisions and immutable vector file.
-- Writer ownership uses PID plus a random process token, heartbeat and expiry.
-  Reader leases protect an open generation. Stale leases and unreferenced
-  generation directories can be recovered.
-- Indexing checks a sampled private source fingerprint after ASR and embedding,
-  before publication. Whisper remains in the existing subprocess.
+- Every indexing, import and relink writer acquires the same cross-process writer
+  lease. Ownership uses a job ID, PID, random process token, heartbeat and
+  expiry; a live writer of any type blocks every other writer type.
+- Forced re-indexing writes a draft transcript revision, draft segments and
+  draft chunks without changing the active revision. It builds a prospective
+  immutable FAISS generation containing the exact expected chunk IDs and
+  verifies count, dimension and every reconstructable vector before publication.
+- Publication renames the verified generation and then performs the writer-owner
+  check, source-fingerprint check and expected-publication CAS in one
+  `BEGIN IMMEDIATE` transaction. Only that transaction activates the replacement
+  revision and generation. A CAS failure leaves the prior publication, active
+  rows and compatibility index untouched.
+- The legacy compatibility `text.index` copy is refreshed only after the
+  immutable publication commits. Failure to refresh that copy is reported as a
+  warning and does not invalidate the committed generation.
+- A recorded private source fingerprint is checked before ASR, after embedding,
+  after the exact draft is built and immediately before publication. A source
+  first seen by an older schema is backfilled conditionally during the same CAS.
+  Whisper remains in the existing subprocess.
 
-Known migration boundary: the legacy `force` re-index command still starts from
-the compatibility storage rows. Publication prevents mixed search requests, but
-fully retaining the previous active ASR while a forced replacement is being
-transcribed requires moving the remaining legacy indexing writer to revision-
-specific draft rows. That writer migration is deliberately not hidden by a UI
-claim and should be the next indexing hardening item.
+Reader-lease rows are issued and released, but physical garbage collection of
+superseded generations remains **deferred**. Reader heartbeat and atomic
+lease-acquisition hardening must be completed before that GC is enabled; current
+publication correctness does not depend on deleting an old generation after a
+lease expires. Cleanup is limited to safe orphan/staging recovery.
 
 ## Phase 2A.2 — share v2 and relinking
 
@@ -36,8 +49,10 @@ claim and should be the next indexing hardening item.
 - Same public ID plus same digest is idempotent. Different content is rejected.
 - Source path, old alias, private fingerprint and original filename are absent.
 - The share tab can select a local source for an unlinked import. Duration is
-  validated before a new local source generation and private fingerprint are
-  registered. A mismatch leaves the shared record unlinked.
+  validated before the local locator, private fingerprint and linked status are
+  updated. Relinking preserves the imported source generation, transcript
+  revisions and publication identity; it does not rewrite historical revision
+  ownership. A mismatch leaves the shared record unlinked.
 
 ## Phase 2B — save and artifact transaction
 
@@ -49,9 +64,17 @@ claim and should be the next indexing hardening item.
   owns the artifact TimelineMap.
 - ffmpeg supports a cancellation event without unread-pipe deadlocks.
 - Video, optional SRT and manifest are prepared in a job directory on the output
-  filesystem. Source fingerprint is checked again before publish.
+  filesystem. The expected source fingerprint is carried by the editor document
+  and save ticket, checked before staging starts, and checked again immediately
+  before any public output is replaced.
+- Staged video validation uses ffprobe's video-stream duration (with format
+  duration as a fallback), stream time base and frame-rate-aware tolerances.
+  Precise multi-range output allows one container/frame tolerance per kept range;
+  fast mode records duration drift as a manifest warning.
 - The manifest is the commit marker. A publish journal allows stale staging and
   partially exposed files to be rolled back after a crash.
+- Manifest duration fields describe the plan and measured artifact without
+  exposing a source path or private fingerprint.
 - The intuitive editor uses this path for real local sources; the old callback
   remains only as a compatibility fallback for synthetic/legacy adapters.
 
@@ -62,7 +85,9 @@ claim and should be the next indexing hardening item.
 - Complete word groups are mapped through the artifact TimelineMap. A word cut
   internally is omitted with a warning. Segment fallback is emitted only when
   the whole segment is contained in one kept range.
-- Cues use UTF-8 `HH:MM:SS,mmm`, stable ordering and output-duration tolerance.
+- Cues use UTF-8 `HH:MM:SS,mmm`, stable ordering and one-frame output-duration
+  tolerance. Requesting an SRT forces precise video encoding so that cue timing
+  and the committed video share the same precise TimelineMap.
 - The intuitive save bar and versioned CLI can request SRT. Video, SRT, warnings
   and commit manifest share one artifact transaction.
 
@@ -95,6 +120,25 @@ roadmap exit condition (“no history push/pop in app.py”) is not claimed yet.
 
 - The current intuitive editor is the candidate single-backend adapter: search,
   preview, timestamped transcript, overview/zoom timelines and fixed save bar.
+- The workspace follows Preview → Transcript → Search. At widths from 761 to
+  1180 px, preview and transcript remain together and search moves to the next
+  row; at 760 px and below the workspace, header, boundary controls, timelines
+  and save controls stack vertically.
+- Preview state is labelled explicitly as Source or Result. Only the action that
+  is valid for the displayed state is visible, reducing accidental edits against
+  result-relative time.
+- Search is staged: normalized exact/text matches are yielded immediately, then
+  semantic results arrive on a separate concurrency lane. Each request carries a
+  session token and pinned publication; superseded or stale semantic completion
+  cannot overwrite a newer result. Selecting a result row is the explicit action
+  that opens it in the editor.
+- The large CSS and editor JavaScript payloads have moved from `app.py` to
+  required UTF-8 assets under `assets/`, loaded through
+  `moment_retrieval.ui_assets`. Missing or invalid assets fail at startup instead
+  of silently degrading the editor. Search staging is likewise isolated in
+  `moment_retrieval.staged_search`.
+- Gradio is pinned to `6.19.0` in `requirements.txt` so the tested component and
+  browser-event behavior does not drift with an unconstrained dependency update.
 - An opt-in comparison panel records only scenario, UI variant, warm/cold flag,
   elapsed time, action/error counts and acceptance. Query, video ID, filename and
   path are not accepted by the recorder.

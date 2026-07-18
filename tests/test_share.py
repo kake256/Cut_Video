@@ -10,6 +10,11 @@ from unittest.mock import patch
 import numpy as np
 
 from moment_retrieval import config, db
+from moment_retrieval.publication import (
+    LeaseManager,
+    build_vector_index_draft,
+    publish_current_generation,
+)
 from moment_retrieval.share import (
     PACKAGE_FORMAT,
     PACKAGE_SCHEMA_VERSION,
@@ -129,6 +134,137 @@ class SharePackageTest(unittest.TestCase):
                 with self.assertRaisesRegex(ShareError, "確認"):
                     export_index(source_id, root / "out")
 
+    def test_export_keeps_one_snapshot_when_force_publication_commits_mid_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with configured_store(root):
+                source = root / "synthetic-source.mp4"
+                source.write_bytes(b"stable synthetic source")
+                public_id = db.new_public_video_id()
+                old_segment = type(
+                    "Segment",
+                    (),
+                    {
+                        "start": 1.0,
+                        "end": 2.0,
+                        "text": "old transcript",
+                        "words": [],
+                    },
+                )()
+                new_segment = type(
+                    "Segment",
+                    (),
+                    {
+                        "start": 3.0,
+                        "end": 4.0,
+                        "text": "new transcript",
+                        "words": [],
+                    },
+                )()
+
+                conn = db.get_conn()
+                db.init_db(conn)
+                try:
+                    db.insert_video(conn, public_id, str(source), 10.0)
+                    db.insert_segment(conn, public_id, old_segment)
+                    db.mark_asr_complete(conn, public_id)
+                    old_chunk_id = db.insert_chunk(conn, public_id, old_segment)
+                    conn.commit()
+                    old_index = VectorIndex(2)
+                    old_index.add(
+                        np.asarray([old_chunk_id], dtype="int64"),
+                        np.asarray([[1.0, 0.0]], dtype="float32"),
+                    )
+                    old_index.save(config.TEXT_INDEX_PATH)
+                    old_publication = publish_current_generation(conn, None)
+
+                    draft_revision = db.begin_transcript_revision(
+                        conn,
+                        public_id,
+                        asr_config={"model": "synthetic-force"},
+                        reuse_draft=False,
+                    )
+                    db.insert_segment(
+                        conn,
+                        public_id,
+                        new_segment,
+                        transcript_revision=draft_revision,
+                    )
+                    new_chunk_id = db.insert_chunk(
+                        conn,
+                        public_id,
+                        new_segment,
+                        transcript_revision=draft_revision,
+                    )
+                    db.complete_transcript_revision(conn, draft_revision)
+                    draft_path, _ = build_vector_index_draft(
+                        conn,
+                        {public_id: draft_revision},
+                        {
+                            new_chunk_id: np.asarray(
+                                [0.0, 1.0], dtype="float32"
+                            )
+                        },
+                        2,
+                    )
+                finally:
+                    conn.close()
+
+                original_get_active = db.get_active_transcript_revision
+                revision_reads = 0
+                force_committed = False
+
+                def publish_force_on_second_revision_read(export_conn, identifier):
+                    nonlocal revision_reads, force_committed
+                    revision_reads += 1
+                    if revision_reads == 2:
+                        force_committed = True
+                        writer = db.get_conn()
+                        try:
+                            publish_current_generation(
+                                writer,
+                                old_publication.publication_id,
+                                transcript_updates={public_id: draft_revision},
+                                vector_draft_path=draft_path,
+                            )
+                        finally:
+                            writer.close()
+                    return original_get_active(export_conn, identifier)
+
+                try:
+                    with patch.object(
+                        db,
+                        "get_active_transcript_revision",
+                        side_effect=publish_force_on_second_revision_read,
+                    ):
+                        archive = export_index(
+                            public_id,
+                            root / "exports",
+                            confirm_sensitive=True,
+                        )
+                finally:
+                    draft_path.unlink(missing_ok=True)
+
+                self.assertTrue(force_committed)
+                with zipfile.ZipFile(archive) as package:
+                    manifest = json.loads(package.read("manifest.json"))
+                    vectors = np.load(
+                        io.BytesIO(package.read("vectors.npy")),
+                        allow_pickle=False,
+                    )
+                self.assertEqual(
+                    [segment["text"] for segment in manifest["segments"]],
+                    ["old transcript"],
+                )
+                self.assertEqual(
+                    [chunk["text"] for chunk in manifest["chunks"]],
+                    ["old transcript"],
+                )
+                np.testing.assert_allclose(
+                    vectors,
+                    np.asarray([[1.0, 0.0]], dtype="float32"),
+                )
+
     def test_export_is_anonymous_and_uses_safe_archive_name(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -218,6 +354,66 @@ class SharePackageTest(unittest.TestCase):
                     linked = relink_video(public_id, source)
                 self.assertEqual(linked["source_state"], "available")
                 self.assertEqual(Path(linked["path"]), source.resolve())
+
+    def test_relink_preserves_source_and_transcript_revision_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _, _ = self._export_fixture(
+                root / "source", root / "packages"
+            )
+            local_source = root / "matching.mp4"
+            local_source.write_bytes(b"synthetic matching source")
+            with configured_store(root / "destination"):
+                list(import_index(archive))
+                conn = db.get_conn()
+                try:
+                    video = db.list_videos(conn)[0]
+                    public_id = video["public_video_id"]
+                    old_generation = video["source_generation"]
+                    old_revision = db.get_active_transcript_revision(
+                        conn, public_id
+                    )
+                    old_publication = conn.execute(
+                        "SELECT current_publication_id FROM library_state"
+                    ).fetchone()[0]
+                finally:
+                    conn.close()
+
+                with patch(
+                    "moment_retrieval.utils.probe_duration", return_value=42.0
+                ):
+                    linked = relink_video(public_id, local_source)
+
+                self.assertEqual(linked["source_generation"], old_generation)
+                conn = db.get_conn()
+                try:
+                    self.assertEqual(
+                        db.get_active_transcript_revision(conn, public_id),
+                        old_revision,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT source_generation FROM transcript_revisions "
+                            "WHERE transcript_revision = ?",
+                            (old_revision,),
+                        ).fetchone()[0],
+                        old_generation,
+                    )
+                    source_row = conn.execute(
+                        "SELECT locator, status FROM sources "
+                        "WHERE source_generation = ?",
+                        (old_generation,),
+                    ).fetchone()
+                    self.assertEqual(Path(source_row[0]), local_source.resolve())
+                    self.assertEqual(source_row[1], "available")
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT current_publication_id FROM library_state"
+                        ).fetchone()[0],
+                        old_publication,
+                    )
+                finally:
+                    conn.close()
 
     def test_legacy_import_discards_source_path_and_ids(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -465,6 +661,12 @@ class SharePackageTest(unittest.TestCase):
                         conn.execute("SELECT COUNT(*) FROM text_chunks").fetchone()[0],
                         0,
                     )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM job_records WHERE state = 'running'"
+                        ).fetchone()[0],
+                        0,
+                    )
                 finally:
                     conn.close()
                 self.assertFalse(config.TEXT_INDEX_PATH.exists())
@@ -480,21 +682,29 @@ class SharePackageTest(unittest.TestCase):
                 db.init_db(conn)
                 try:
                     db.insert_video(conn, "synthetic-existing", "synthetic.mp4", 5.0)
-                    cursor = conn.execute(
-                        "INSERT INTO text_chunks "
-                        "(video_id, start_sec, end_sec, text) VALUES (?, ?, ?, ?)",
-                        ("synthetic-existing", 0.0, 1.0, "synthetic existing"),
+                    segment = type(
+                        "Segment", (),
+                        {"start": 0.0, "end": 1.0, "text": "synthetic existing", "words": []},
+                    )()
+                    db.insert_segment(conn, "synthetic-existing", segment)
+                    db.mark_asr_complete(conn, "synthetic-existing")
+                    existing_chunk_id = db.insert_chunk(
+                        conn, "synthetic-existing", segment
                     )
-                    existing_chunk_id = int(cursor.lastrowid)
                     conn.commit()
+                    existing_index = VectorIndex(2)
+                    existing_index.add(
+                        np.asarray([existing_chunk_id], dtype="int64"),
+                        np.asarray([[0.0, 1.0]], dtype="float32"),
+                    )
+                    existing_index.save(config.TEXT_INDEX_PATH)
+                    publish_current_generation(conn, None)
+                    # The compatibility file is deliberately stale.  Import
+                    # must preserve the active vector from the immutable
+                    # publication generation, not from this mutable file.
+                    VectorIndex(2).save(config.TEXT_INDEX_PATH)
                 finally:
                     conn.close()
-                existing_index = VectorIndex(2)
-                existing_index.add(
-                    np.asarray([existing_chunk_id], dtype="int64"),
-                    np.asarray([[0.0, 1.0]], dtype="float32"),
-                )
-                existing_index.save(config.TEXT_INDEX_PATH)
 
                 list(import_index(archive))
 
@@ -521,10 +731,10 @@ class SharePackageTest(unittest.TestCase):
             )
             with configured_store(root / "destination"):
                 with patch(
-                    "moment_retrieval.share.os.replace",
+                    "moment_retrieval.publication._install_staged_generation",
                     side_effect=OSError("synthetic publish failure"),
                 ):
-                    with self.assertRaisesRegex(ShareError, "安全に公開"):
+                    with self.assertRaisesRegex(ShareError, "publication公開"):
                         list(import_index(archive))
                 conn = db.get_conn()
                 try:
@@ -535,6 +745,12 @@ class SharePackageTest(unittest.TestCase):
                     )
                     self.assertEqual(
                         conn.execute("SELECT COUNT(*) FROM text_chunks").fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM transcript_revisions"
+                        ).fetchone()[0],
                         0,
                     )
                 finally:
@@ -549,7 +765,7 @@ class SharePackageTest(unittest.TestCase):
             with configured_store(root / "destination"):
                 with (
                     patch(
-                        "moment_retrieval.share.os.replace",
+                        "moment_retrieval.publication._install_staged_generation",
                         side_effect=OSError("synthetic publish failure"),
                     ),
                     patch(
@@ -557,13 +773,119 @@ class SharePackageTest(unittest.TestCase):
                         side_effect=OSError("synthetic primary compensation failure"),
                     ),
                 ):
-                    with self.assertRaisesRegex(ShareError, "安全に公開"):
+                    with self.assertRaisesRegex(ShareError, "publication公開"):
                         list(import_index(archive))
                 conn = db.get_conn()
                 try:
                     self.assertEqual(db.list_videos(conn), [])
                 finally:
                     conn.close()
+
+    def test_compatibility_index_failure_after_cas_keeps_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _, _ = self._export_fixture(
+                root / "source", root / "packages"
+            )
+            with configured_store(root / "destination"):
+                with patch(
+                    "moment_retrieval.share._install_compatibility_index",
+                    side_effect=OSError("synthetic compatibility failure"),
+                ):
+                    messages = list(import_index(archive))
+                conn = db.get_conn()
+                try:
+                    current = conn.execute(
+                        "SELECT current_publication_id FROM library_state"
+                    ).fetchone()[0]
+                    self.assertIsNotNone(current)
+                    self.assertEqual(len(db.list_videos(conn)), 1)
+                    job_states = [
+                        row[0] for row in conn.execute(
+                            "SELECT state FROM job_records"
+                        ).fetchall()
+                    ]
+                    self.assertEqual(job_states, ["complete"])
+                finally:
+                    conn.close()
+                self.assertIn("互換インデックス", "\n".join(messages))
+
+    def test_first_post_publish_progress_is_outside_writer_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _, _ = self._export_fixture(
+                root / "source", root / "packages"
+            )
+            with configured_store(root / "destination"):
+                progress = import_index(archive)
+                for _ in range(4):
+                    next(progress)
+                post_publish_message = next(progress)
+                self.assertIn("FAISS", post_publish_message)
+                conn = db.get_conn()
+                try:
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM job_records WHERE state = 'running'"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM job_records WHERE state = 'complete'"
+                        ).fetchone()[0],
+                        1,
+                    )
+                    self.assertIsNotNone(
+                        conn.execute(
+                            "SELECT current_publication_id FROM library_state"
+                        ).fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+                progress.close()
+
+    def test_import_rejects_a_concurrent_library_writer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _, _ = self._export_fixture(
+                root / "source", root / "packages"
+            )
+            with configured_store(root / "destination"):
+                blocker = db.get_conn()
+                db.init_db(blocker)
+                try:
+                    with LeaseManager(blocker).writer():
+                        with self.assertRaisesRegex(ShareError, "別のライブラリ更新"):
+                            list(import_index(archive))
+                finally:
+                    blocker.close()
+
+    def test_relink_rejects_a_concurrent_library_writer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "synthetic-source.mp4"
+            source.write_bytes(b"synthetic")
+            with configured_store(root):
+                blocker = db.get_conn()
+                db.init_db(blocker)
+                public_id = db.new_public_video_id()
+                db.insert_video(
+                    blocker, public_id, "video/__unlinked__/synthetic.mp4", 5.0
+                )
+                blocker.commit()
+                try:
+                    with LeaseManager(blocker).writer():
+                        with (
+                            patch(
+                                "moment_retrieval.utils.probe_duration",
+                                return_value=5.0,
+                            ),
+                            self.assertRaisesRegex(ShareError, "別のライブラリ更新"),
+                        ):
+                            relink_video(public_id, source)
+                finally:
+                    blocker.close()
 
 
 if __name__ == "__main__":

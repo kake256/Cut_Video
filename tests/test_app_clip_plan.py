@@ -1416,7 +1416,7 @@ class ClipPlanTest(unittest.TestCase):
 
         self.assertIn('data-active-tool="overall_end"', toolbar)
         self.assertIn('data-edit-dirty="false"', toolbar)
-        self.assertIn("3. 文字起こし編集", toolbar)
+        self.assertIn("2. 文字起こし編集", toolbar)
         self.assertNotIn('data-intuitive-preview-action', toolbar)
         self.assertIn("intuitive-timeline-toolbox", zoom)
         self.assertIn("共通境界ツール", zoom)
@@ -2100,7 +2100,9 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertIsNone(output[0]["active_tool"])
         self.assertEqual(output[0]["preview_mode"], "result")
+        self.assertIn("Result timeline", output[4]["label"])
         self.assertIn("編集結果プレビュー", output[6])
+        self.assertIn("Result timeline", output[6])
         self.assertIn('data-preview-mode="result"', output[3])
 
         with patch("app.on_save", return_value="saved.mp4") as save:
@@ -2165,7 +2167,9 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(output[0]["preview_mode"], "source")
         self.assertIsNone(output[0]["active_tool"])
         self.assertEqual(output[4]["value"], "source.mp4")
+        self.assertIn("Source timeline", output[4]["label"])
         self.assertIn("元動画プレビュー", output[6])
+        self.assertIn("Source timeline", output[6])
         self.assertIn('data-preview-mode="source"', render_intuitive_state_zoom(output[0]))
 
     def test_result_preview_tool_click_returns_to_source_and_arms_tool(self):
@@ -2982,6 +2986,7 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-search-target",
             "intuitive-search-button",
             "intuitive-search-results",
+            "intuitive-search-status",
             "intuitive-preview-result",
             "intuitive-return-source",
         }.issubset(elem_ids))
@@ -3007,6 +3012,18 @@ class ClipPlanTest(unittest.TestCase):
                 if found is not None:
                     return found
             return None
+
+        workspace = find_layout_node(
+            config["layout"], components_by_elem_id["intuitive-workspace-row"]["id"]
+        )
+        self.assertEqual(
+            [child["id"] for child in workspace["children"]],
+            [
+                components_by_elem_id["intuitive-preview-panel"]["id"],
+                components_by_elem_id["intuitive-transcript-panel"]["id"],
+                components_by_elem_id["intuitive-search-panel"]["id"],
+            ],
+        )
 
         def descendant_ids(node):
             ids = set()
@@ -3104,6 +3121,10 @@ class ClipPlanTest(unittest.TestCase):
             components_by_elem_id["intuitive-preview-video"]["props"]["height"],
             320,
         )
+        self.assertIn(
+            "Source timeline",
+            components_by_elem_id["intuitive-preview-video"]["props"]["label"],
+        )
         self.assertEqual(
             components_by_elem_id["intuitive-transcript-panel"]["props"].get("min_width"),
             400,
@@ -3161,6 +3182,28 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn(".intuitive-cut-zone", _APP_CSS)
         self.assertIn(".intuitive-playhead", _APP_CSS)
         self.assertIn(".intuitive-tool-buttons", _APP_CSS)
+        self.assertIn(
+            "#intuitive-return-source { display: none !important; }", _APP_CSS
+        )
+        self.assertIn(
+            'body:has(#intuitive-toolbox [data-preview-mode="result"])\n'
+            '  #intuitive-preview-result { display: none !important; }',
+            _APP_CSS,
+        )
+        self.assertIn(
+            'body:has(#intuitive-toolbox [data-preview-mode="result"])\n'
+            '  #intuitive-return-source { display: flex !important; }',
+            _APP_CSS,
+        )
+        self.assertIn(
+            "#intuitive-preview-panel { order: 1; min-width: 55% !important; }",
+            _APP_CSS,
+        )
+        self.assertIn(
+            "#intuitive-transcript-panel { order: 2; min-width: 40% !important; }",
+            _APP_CSS,
+        )
+        self.assertIn("order: 3;", _APP_CSS)
         # A-1 regression: 前へ/後ろへ must look disabled (not just fail
         # server-side) once no boundary is selected, matching apply-time's
         # existing visual-disable convention -- otherwise the button looks
@@ -3441,7 +3484,7 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn(".intuitive-control-group-start::before", _APP_CSS)
         self.assertIn("height: 1rem; overflow: visible", _APP_CSS)
         intuitive_fns = {
-            "load_intuitive_editor", "do_intuitive_search",
+            "load_intuitive_editor",
             "handle_intuitive_command", "preview_intuitive_editor",
             "return_intuitive_source", "save_intuitive_editor",
         }
@@ -3449,6 +3492,13 @@ class ClipPlanTest(unittest.TestCase):
         self.assertTrue(routed)
         self.assertTrue(all(fn.concurrency_id == "intuitive-editor-state" for fn in routed))
         self.assertTrue(all(fn.concurrency_limit == 1 for fn in routed))
+        staged_search = [
+            fn for fn in demo.fns.values()
+            if fn.name == "do_intuitive_search_staged"
+        ]
+        self.assertEqual(len(staged_search), 2)
+        self.assertTrue(all(fn.concurrency_id == "intuitive-search" for fn in staged_search))
+        self.assertTrue(all(fn.concurrency_limit == 2 for fn in staged_search))
         video_select_id = components_by_elem_id["intuitive-video-select"]["id"]
         auto_preview = [
             dependency for dependency in config["dependencies"]

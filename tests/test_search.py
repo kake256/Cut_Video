@@ -9,6 +9,7 @@ from moment_retrieval.search import (
     normalize_kana_search_text,
     normalize_search_text,
     search_chunks,
+    search_semantic_chunks,
 )
 from moment_retrieval.vector_index import VectorIndex
 
@@ -20,17 +21,17 @@ class SearchTest(unittest.TestCase):
         self.conn.execute(
             "CREATE TABLE text_chunks ("
             "chunk_id INTEGER PRIMARY KEY, video_id TEXT, start_sec REAL, "
-            "end_sec REAL, text TEXT)"
+            "end_sec REAL, text TEXT, transcript_revision TEXT)"
         )
         self.index = VectorIndex(2)
 
     def tearDown(self):
         self.conn.close()
 
-    def add_chunk(self, chunk_id, video_id, text, vector):
+    def add_chunk(self, chunk_id, video_id, text, vector, revision="revision-1"):
         self.conn.execute(
-            "INSERT INTO text_chunks VALUES (?, ?, ?, ?, ?)",
-            (chunk_id, video_id, float(chunk_id), float(chunk_id + 1), text),
+            "INSERT INTO text_chunks VALUES (?, ?, ?, ?, ?, ?)",
+            (chunk_id, video_id, float(chunk_id), float(chunk_id + 1), text, revision),
         )
         self.index.add(
             np.asarray([chunk_id], dtype="int64"),
@@ -115,6 +116,39 @@ class SearchTest(unittest.TestCase):
 
         self.assertEqual([result["chunk_id"] for result in results], [1])
         self.assertEqual(results[0]["match_type"], MATCH_SEMANTIC)
+
+    def test_pure_semantic_quota_is_not_consumed_by_text_matches(self):
+        self.add_chunk(1, "video-a", "needle appears here", [0.0, 1.0])
+        self.add_chunk(2, "video-a", "semantic winner", [1.0, 0.0])
+
+        results = search_semantic_chunks(
+            self.conn,
+            self.index,
+            "needle",
+            np.asarray([[1.0, 0.0]], dtype="float32"),
+            top_k=1,
+            min_score=0.55,
+            video_id="video-a",
+        )
+
+        self.assertEqual([result["chunk_id"] for result in results], [2])
+        self.assertEqual(results[0]["match_type"], MATCH_SEMANTIC)
+
+    def test_pure_semantic_ranking_excludes_unpublished_revisions(self):
+        self.add_chunk(1, "video-a", "stale winner", [1.0, 0.0], "revision-old")
+        self.add_chunk(2, "video-a", "published candidate", [0.8, 0.2], "revision-new")
+
+        results = search_semantic_chunks(
+            self.conn,
+            self.index,
+            "semantic query",
+            np.asarray([[1.0, 0.0]], dtype="float32"),
+            top_k=1,
+            min_score=0.55,
+            allowed_revisions=frozenset({"revision-new"}),
+        )
+
+        self.assertEqual([result["chunk_id"] for result in results], [2])
 
     def test_text_and_semantic_duplicate_is_returned_once(self):
         self.add_chunk(1, "video-a", "命令について話す", [0.90, 0.10])

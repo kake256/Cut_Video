@@ -2,8 +2,24 @@ import os
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("CUT_VIDEO_DATA_DIR", "data"))
-DB_PATH = DATA_DIR / "index.db"
-TEXT_INDEX_PATH = DATA_DIR / "text.index"
+# Phase 1 storage roles.  Defaults preserve the current on-disk layout while
+# allowing the frequently accessed library/search/cache roots to live on SSD.
+LIBRARY_ROOT = Path(os.environ.get("CUT_VIDEO_LIBRARY_ROOT", str(DATA_DIR)))
+SEARCH_ROOT = Path(os.environ.get("CUT_VIDEO_SEARCH_ROOT", str(DATA_DIR)))
+CACHE_ROOT = Path(os.environ.get("CUT_VIDEO_CACHE_ROOT", str(DATA_DIR)))
+SOURCE_ROOTS = tuple(
+    Path(item) for item in os.environ.get("CUT_VIDEO_SOURCE_ROOTS", "video").split(os.pathsep)
+    if item
+)
+ARTIFACT_ROOT = Path(os.environ.get("CUT_VIDEO_ARTIFACT_ROOT", "clips"))
+DB_PATH = LIBRARY_ROOT / "index.db"
+TEXT_INDEX_PATH = SEARCH_ROOT / "text.index"
+SEARCH_GENERATIONS_DIR = SEARCH_ROOT / "generations"
+
+
+def search_generations_dir() -> Path:
+    override = os.environ.get("CUT_VIDEO_SEARCH_GENERATIONS_DIR")
+    return Path(override) if override else Path(TEXT_INDEX_PATH).parent / "generations"
 
 # チャンク分割 (検索単位は短め、前後オーバーラップで文脈を確保)
 CHUNK_SEC = 15.0
@@ -28,3 +44,4 @@ ASR_COMPUTE_TYPE = "float16"
 
 # テキスト埋め込み (BGE-M3)
 EMBED_MODEL_NAME = "BAAI/bge-m3"
+EMBED_VECTOR_DIM = 1024

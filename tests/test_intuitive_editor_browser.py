@@ -13,6 +13,10 @@ import unittest
 import urllib.request
 from pathlib import Path
 
+import numpy as np
+
+from moment_retrieval.vector_index import VectorIndex
+
 
 def _free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -28,6 +32,8 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         super().setUpClass()
         if shutil.which("ffmpeg") is None:
             raise unittest.SkipTest("browser E2E skipped: ffmpeg is not installed")
+        if shutil.which("ffprobe") is None:
+            raise unittest.SkipTest("browser E2E skipped: ffprobe is not installed")
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -59,6 +65,7 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             )
 
         cls._create_isolated_database()
+        cls._create_isolated_vector_index()
         cls._playwright = sync_playwright().start()
         cls.addClassCleanup(cls._playwright.stop)
         try:
@@ -82,7 +89,11 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         })
         repo_root = Path(__file__).resolve().parents[1]
         launch_code = (
-            "import os, app; "
+            "import os, numpy as np, app; "
+            "app._embedder = type('SyntheticE2EEmbedder', (), {"
+            "'encode': lambda self, texts: np.tile("
+            "np.asarray([[1.0, 0.0]], dtype='float32'), (len(texts), 1))"
+            "})(); "
             "app._enable_crash_log(); "
             "app._initialize_preview_cache(); "
             "app.demo.launch(server_name='127.0.0.1', "
@@ -142,18 +153,28 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
                 "INSERT INTO asr_segments(video_id, start_sec, end_sec, text, words_json) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (
-                    "synthetic-video", 0.2, 2.35,
+                    "synthetic-video", 0.0, 2.8,
                     "alpha beta gamma delta", json.dumps(words),
                 ),
             )
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO text_chunks(video_id, start_sec, end_sec, text) "
                 "VALUES (?, ?, ?, ?)",
                 ("synthetic-video", 0.2, 2.35, "alpha beta gamma delta"),
             )
+            cls.chunk_id = int(cursor.lastrowid)
             conn.commit()
         finally:
             conn.close()
+
+    @classmethod
+    def _create_isolated_vector_index(cls):
+        index = VectorIndex(2)
+        index.add(
+            np.asarray([cls.chunk_id], dtype="int64"),
+            np.asarray([[1.0, 0.0]], dtype="float32"),
+        )
+        index.save(cls.data_dir / "text.index")
 
     @classmethod
     def _wait_for_server(cls):
@@ -181,7 +202,7 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             cls.server.wait(timeout=5)
 
     def test_intuitive_editor_browser_workflow(self):
-        context = self.browser.new_context()
+        context = self.browser.new_context(viewport={"width": 1440, "height": 900})
         self.addCleanup(context.close)
         page = context.new_page()
         page.set_default_timeout(30_000)
@@ -202,17 +223,313 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         card.click()
         root = page.locator("#intuitive-toolbox [data-intuitive-root]")
         root.wait_for(state="visible")
-        search_accordion = page.get_by_text(
-            "検索して候補区間から編集を始める", exact=True
+        page.get_by_text("2. 文字クエリー検索", exact=True).wait_for(
+            state="visible"
         )
-        search_accordion.click()
         search_target_input = page.locator("#intuitive-search-target input")
         search_target_input.wait_for(state="visible")
         self.assertIn("synthetic_fixture.mp4", search_target_input.input_value())
-        search_accordion.click()
+
+        # Exercise the real search callback without loading a model or touching
+        # a user's index.  The server owns a two-dimensional synthetic FAISS
+        # index and a deterministic in-process embedder for this test only.
+        loaded_nonce = root.get_attribute("data-nonce")
+        page.locator(
+            "#intuitive-search-query textarea, #intuitive-search-query input"
+        ).fill("alpha")
+        page.locator(
+            "button#intuitive-search-button, #intuitive-search-button button"
+        ).click()
+        page.wait_for_function(
+            "([selector, nonce]) => { const root = document.querySelector(selector); "
+            "return root && root.dataset.nonce !== nonce "
+            "&& root.dataset.editDirty === 'false'; }",
+            arg=["#intuitive-toolbox [data-intuitive-root]", loaded_nonce],
+        )
+        search_results = page.locator("#intuitive-search-results")
+        search_results.wait_for(state="visible")
+        search_result_text = search_results.inner_text()
+        self.assertIn("alpha beta gamma delta", search_result_text)
+        self.assertIn("● 1", search_result_text)
+        self.assertIn("synthetic_fixture.mp4", search_target_input.input_value())
+        self.assertEqual(root.get_attribute("data-edit-dirty"), "false")
+        self.assertEqual(root.get_attribute("data-can-undo"), "false")
+        self.assertEqual(root.get_attribute("data-can-redo"), "false")
+        overall_timeline_tab = page.get_by_role(
+            "tab", name="① 全体を決める", exact=True
+        )
+        detail_timeline_tab = page.get_by_role(
+            "tab", name="② 詳細編集（任意）", exact=True
+        )
+        self.assertEqual(overall_timeline_tab.get_attribute("aria-selected"), "true")
+        detail_timeline_tab.click()
+        self.assertEqual(detail_timeline_tab.get_attribute("aria-selected"), "true")
+        zoom = page.locator("[data-intuitive-zoom]")
+        self.assertAlmostEqual(
+            float(zoom.get_attribute("data-overall-start")), 0.0, delta=0.001
+        )
+        self.assertAlmostEqual(
+            float(zoom.get_attribute("data-overall-end")), 2.8, delta=0.001
+        )
         page.locator("#intuitive-transcript-words").get_by_text(
             "alpha", exact=True
         ).wait_for(state="visible")
+        page.wait_for_function(
+            """() => {
+              const zoom = document.querySelector('#intuitive-zoom-timeline');
+              const bars = Array.from(document.querySelectorAll('#intuitive-save-bar'));
+              const save = bars.find((node) => getComputedStyle(node).position === 'fixed'
+                && node.getClientRects().length);
+              return zoom && save
+                && zoom.getBoundingClientRect().bottom
+                  <= save.getBoundingClientRect().top - 8;
+            }"""
+        )
+        layout = page.evaluate("""() => {
+          const selectors = ['#intuitive-header', '#intuitive-workspace-row',
+            '#intuitive-preview-panel', '#intuitive-search-panel',
+            '#intuitive-search-panel .intuitive-panel-heading',
+            '#intuitive-search-panel .intuitive-search-primary',
+            '#intuitive-search-panel .intuitive-search-options',
+            '#intuitive-search-results',
+            '#intuitive-search-results .table-wrap',
+            '#intuitive-transcript-panel', '#intuitive-toolbox',
+            '#intuitive-transcript-words', '#intuitive-edit-controls-row',
+            '#intuitive-boundary-controls', '#intuitive-exclusion-panel',
+            '#intuitive-overview-timeline', '#intuitive-zoom-timeline',
+            '#intuitive-save-bar'];
+          return Object.fromEntries(selectors.map((selector) => {
+            const nodes = Array.from(document.querySelectorAll(selector));
+            const node = nodes.find((item) => item.getClientRects().length
+              && getComputedStyle(item).display !== 'none');
+            if (!node) return [selector, null];
+            const r = node.getBoundingClientRect();
+            return [selector, {x: Math.round(r.x), y: Math.round(r.y),
+              w: Math.round(r.width), h: Math.round(r.height),
+              bottom: Math.round(r.bottom)}];
+          }));
+        }""")
+        self.assertGreaterEqual(layout["#intuitive-preview-panel"]["w"], 480)
+        self.assertGreaterEqual(layout["#intuitive-transcript-panel"]["w"], 400)
+        self.assertGreaterEqual(
+            layout["#intuitive-search-results .table-wrap"]["h"], 140
+        )
+        self.assertLessEqual(
+            layout["#intuitive-zoom-timeline"]["bottom"],
+            layout["#intuitive-save-bar"]["y"] - 8,
+        )
+        self.assertLessEqual(layout["#intuitive-save-bar"]["bottom"], 900)
+
+        def run_editor_command(action):
+            revision = int(root.get_attribute("data-revision"))
+            action()
+            page.wait_for_function(
+                "([selector, revision]) => { const root = document.querySelector(selector); "
+                "return Number(root.dataset.revision) > revision "
+                "&& root.dataset.lastCommandStatus === 'success'; }",
+                arg=["#intuitive-toolbox [data-intuitive-root]", revision],
+            )
+
+        def choose_tool(tool):
+            run_editor_command(
+                lambda: page.locator(
+                    f"#intuitive-toolbox [data-intuitive-tool='{tool}']"
+                ).click()
+            )
+
+        def choose_word(start):
+            run_editor_command(
+                lambda: page.locator(
+                    "#intuitive-transcript-words "
+                    f".intuitive-word[data-start='{start:.3f}']"
+                ).click()
+            )
+
+        # Two overlapping cut gestures must collapse into one canonical range.
+        # Each completed gesture is a single history entry even though its
+        # start and end are chosen by separate browser commands.
+        choose_tool("exclude_start")
+        choose_word(0.70)
+        self.assertEqual(root.get_attribute("data-active-tool"), "exclude_end")
+        choose_word(1.25)
+        first_cut = page.locator(
+            "[data-intuitive-zoom] .intuitive-cut-zone"
+        )
+        self.assertEqual(first_cut.count(), 1)
+        self.assertAlmostEqual(
+            float(first_cut.locator("[data-boundary-kind='exclusion_start']")
+                  .get_attribute("data-boundary-time")),
+            0.70,
+            delta=0.001,
+        )
+        self.assertAlmostEqual(
+            float(first_cut.locator("[data-boundary-kind='exclusion_end']")
+                  .get_attribute("data-boundary-time")),
+            1.65,
+            delta=0.001,
+        )
+
+        choose_tool("exclude_start")
+        choose_word(1.25)
+        choose_word(1.90)
+        merged_cut = page.locator(
+            "[data-intuitive-zoom] .intuitive-cut-zone"
+        )
+        self.assertEqual(merged_cut.count(), 1)
+        self.assertAlmostEqual(
+            float(merged_cut.locator("[data-boundary-kind='exclusion_start']")
+                  .get_attribute("data-boundary-time")),
+            0.70,
+            delta=0.001,
+        )
+        self.assertAlmostEqual(
+            float(merged_cut.locator("[data-boundary-kind='exclusion_end']")
+                  .get_attribute("data-boundary-time")),
+            2.35,
+            delta=0.001,
+        )
+        self.assertIn(
+            "途中カット一覧（1箇所）",
+            page.locator("#intuitive-exclusion-list").inner_text(),
+        )
+
+        run_editor_command(
+            lambda: page.locator("[data-intuitive-history='undo']").click()
+        )
+        undone_cut = page.locator("[data-intuitive-zoom] .intuitive-cut-zone")
+        self.assertEqual(undone_cut.count(), 1)
+        self.assertAlmostEqual(
+            float(undone_cut.locator("[data-boundary-kind='exclusion_end']")
+                  .get_attribute("data-boundary-time")),
+            1.65,
+            delta=0.001,
+        )
+        run_editor_command(
+            lambda: page.locator("[data-intuitive-history='redo']").click()
+        )
+        redone_cut = page.locator("[data-intuitive-zoom] .intuitive-cut-zone")
+        self.assertEqual(redone_cut.count(), 1)
+        self.assertAlmostEqual(
+            float(redone_cut.locator("[data-boundary-kind='exclusion_end']")
+                  .get_attribute("data-boundary-time")),
+            2.35,
+            delta=0.001,
+        )
+
+        # Synchronize a non-zero source playhead through the regular command
+        # bridge, then verify result preview and source restoration preserve it.
+        page.wait_for_function(
+            "() => { const video = document.querySelector("
+            "'#intuitive-preview-video video'); return video "
+            "&& video.readyState >= 1 && Number.isFinite(video.duration); }"
+        )
+        page.evaluate(
+            """async () => {
+              const video = document.querySelector('#intuitive-preview-video video');
+              video.currentTime = 2.6;
+              video.dispatchEvent(new Event('seeking', {bubbles: true}));
+              await new Promise(requestAnimationFrame);
+              await new Promise(requestAnimationFrame);
+            }"""
+        )
+        choose_tool("overall_end")
+        source_playhead_left = float(page.locator(
+            "[data-intuitive-zoom] .intuitive-playhead"
+        ).evaluate("node => parseFloat(node.style.left)"))
+        source_video_src = page.locator(
+            "#intuitive-preview-video video"
+        ).get_attribute("src")
+
+        page.locator(
+            "button#intuitive-preview-result, #intuitive-preview-result button"
+        ).click()
+        page.wait_for_function(
+            "() => { const root = document.querySelector("
+            "'#intuitive-toolbox [data-intuitive-root]'); const video = "
+            "document.querySelector('#intuitive-preview-video video'); "
+            "return root.dataset.previewMode === 'result' && video "
+            "&& video.readyState >= 1 && Number.isFinite(video.duration); }"
+        )
+        self.assertNotEqual(
+            page.locator("#intuitive-preview-video video").get_attribute("src"),
+            source_video_src,
+        )
+        result_duration = float(
+            page.locator("#intuitive-preview-video video").evaluate(
+                "video => video.duration"
+            )
+        )
+        self.assertAlmostEqual(result_duration, 1.15, delta=0.35)
+        page.locator(
+            "button#intuitive-return-source, #intuitive-return-source button"
+        ).click()
+        page.wait_for_function(
+            "() => document.querySelector("
+            "'#intuitive-toolbox [data-intuitive-root]').dataset.previewMode === 'source'"
+        )
+        restored_playhead_left = float(page.locator(
+            "[data-intuitive-zoom] .intuitive-playhead"
+        ).evaluate("node => parseFloat(node.style.left)"))
+        # Result currentTime=0 maps through TimelineMap to the first kept
+        # Source boundary, rather than reusing the stale pre-preview playhead.
+        self.assertAlmostEqual(restored_playhead_left, 0.0, delta=0.5)
+
+        # Finish the full user path with a real ffmpeg save into the isolated
+        # E2E root.  Save establishes the current plan as the clean baseline.
+        save_dir = self.root / "saved-clips"
+        save_bar = page.locator("#intuitive-save-bar:visible").first
+        save_bar.wait_for(state="visible")
+        out_dir_input = save_bar.locator(
+            "#intuitive-out-dir textarea, #intuitive-out-dir input"
+        )
+        filename_input = save_bar.locator(
+            "#intuitive-filename textarea, #intuitive-filename input"
+        )
+        saved_path_input = save_bar.locator(
+            "#intuitive-saved-path textarea, #intuitive-saved-path input"
+        )
+        out_dir_input.fill(str(save_dir))
+        filename_input.fill("phase0_browser_e2e")
+        save_bar.get_by_text("SRT字幕も保存", exact=True).click()
+        save_bar.get_by_role("button", name="保存", exact=True).click()
+        page.wait_for_function(
+            "() => { const input = Array.from(document.querySelectorAll("
+            "'#intuitive-saved-path textarea, #intuitive-saved-path input'))"
+            ".find(node => node.offsetParent !== null); "
+            "return input && input.value.endsWith('.mp4'); }",
+        )
+        page.wait_for_function(
+            "() => document.querySelector("
+            "'#intuitive-toolbox [data-intuitive-root]').dataset.editDirty === 'false'"
+        )
+        saved_path = Path(saved_path_input.input_value())
+        self.assertEqual(saved_path, (save_dir / "phase0_browser_e2e.mp4").resolve())
+        self.assertTrue(saved_path.is_file())
+        self.assertGreater(saved_path.stat().st_size, 0)
+        self.assertTrue(saved_path.with_suffix(".srt").is_file())
+        self.assertTrue(saved_path.with_suffix(".mp4.manifest.json").is_file())
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(saved_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertAlmostEqual(float(probe.stdout.strip()), 1.15, delta=0.35)
+
+        # Saving changes only the clean reference. Existing history remains
+        # usable, and redoing the saved semantic plan becomes clean again.
+        run_editor_command(
+            lambda: page.locator("[data-intuitive-history='undo']").click()
+        )
+        self.assertEqual(root.get_attribute("data-edit-dirty"), "true")
+        run_editor_command(
+            lambda: page.locator("[data-intuitive-history='redo']").click()
+        )
+        self.assertEqual(root.get_attribute("data-edit-dirty"), "false")
 
         # A temporary Gradio rerender can remove the hidden command bridge.
         # The queued command must stay at the head and be submitted once after
@@ -418,6 +735,23 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             delta=0.01,
         )
 
+        # Switching timeline views is presentation-only: the same canonical
+        # state and history remain active while the overview is manipulated.
+        state_before_tab_switch = {
+            name: root.get_attribute(name)
+            for name in (
+                "data-active-tool", "data-has-selected-boundary",
+                "data-can-undo", "data-can-redo", "data-edit-dirty",
+            )
+        }
+        revision_before_tab_switch = int(root.get_attribute("data-revision"))
+        overall_timeline_tab.click()
+        self.assertEqual(
+            int(root.get_attribute("data-revision")), revision_before_tab_switch
+        )
+        for name, value in state_before_tab_switch.items():
+            self.assertEqual(root.get_attribute(name), value)
+
         viewport_revision = int(root.get_attribute("data-revision"))
         viewport_move = page.locator(
             "[data-intuitive-overview] [data-viewport-drag='move'][role='slider']"
@@ -429,6 +763,7 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             ".dataset.revision) > revision",
             arg=["#intuitive-toolbox [data-intuitive-root]", viewport_revision],
         )
+        detail_timeline_tab.click()
         revision = root.get_attribute("data-revision")
 
         page.locator(
@@ -450,9 +785,6 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         self.assertEqual(len(dialogs), before_dialogs + 1)
         self.assertEqual(root.get_attribute("data-revision"), revision)
 
-        page.get_by_text(
-            "検索して候補区間から編集を始める", exact=True
-        ).click()
         page.locator("#intuitive-search-results").wait_for(state="visible")
         before_dialogs = len(dialogs)
         canceled = page.evaluate(
@@ -520,6 +852,29 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         self.assertGreater(second_left, first_left + 20)
         self.assertEqual(root.get_attribute("data-preview-mode"), "source")
 
+        # Labels and legends are informative only.  A click outside the actual
+        # zoom track must neither seek nor enqueue an edit command.
+        page.wait_for_timeout(350)
+        passive_revision = int(root.get_attribute("data-revision"))
+        passive_left = float(page.locator(
+            "[data-intuitive-zoom] .intuitive-playhead"
+        ).evaluate("node => parseFloat(node.style.left)"))
+        page.locator(
+            "[data-intuitive-zoom] .intuitive-timeline-scale"
+        ).click()
+        page.locator(
+            "[data-intuitive-zoom] .intuitive-timeline-legend"
+        ).click()
+        page.wait_for_timeout(150)
+        self.assertEqual(int(root.get_attribute("data-revision")), passive_revision)
+        self.assertAlmostEqual(
+            float(page.locator(
+                "[data-intuitive-zoom] .intuitive-playhead"
+            ).evaluate("node => parseFloat(node.style.left)")),
+            passive_left,
+            delta=0.01,
+        )
+
         # Any server-rendering edit command must carry the browser's current
         # source playhead so the canonical redraw does not jump backwards.
         redraw_revision = int(root.get_attribute("data-revision"))
@@ -536,6 +891,36 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             "'[data-intuitive-zoom] .intuitive-playhead').style.left)"
         )
         self.assertAlmostEqual(redrawn_left, second_left, delta=5.0)
+
+        # Global keyboard handlers and the fixed save bar belong only to the
+        # visible intuitive tab.  Visiting another tab must not undo the
+        # hidden document.
+        hidden_revision = int(root.get_attribute("data-revision"))
+        hidden_dirty = root.get_attribute("data-edit-dirty")
+        page.get_by_role("tab", name="検索・切り抜き").click()
+        self.assertEqual(page.locator("#intuitive-save-bar:visible").count(), 0)
+        page.keyboard.press("Control+Z")
+        page.wait_for_timeout(150)
+        page.get_by_role("tab", name="直感編集（試作）").click()
+        self.assertEqual(int(root.get_attribute("data-revision")), hidden_revision)
+        self.assertEqual(root.get_attribute("data-edit-dirty"), hidden_dirty)
+
+        self.assertIsNone(self.server.poll())
+        server_log = (self.root / "server.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        self.assertNotIn("Traceback (most recent call last)", server_log)
+        self.assertNotIn("access violation", server_log.casefold())
+        leftovers = [
+            path.relative_to(self.root).as_posix()
+            for path in self.root.rglob("*")
+            if path.is_file()
+            and (
+                path.name.lower().endswith((".tmp", ".tmp.mp4", ".part"))
+                or path.name.lower() == "concat.txt"
+            )
+        ]
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

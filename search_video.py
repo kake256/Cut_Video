@@ -11,7 +11,12 @@ from pathlib import Path
 
 from moment_retrieval import config, db, utils
 from moment_retrieval.embedder import TextEmbedder
-from moment_retrieval.search import search_chunks
+from moment_retrieval.search_service import (
+    SearchService,
+    SEMANTIC_PENDING,
+    retrieve_semantic_hits,
+    semantic_error_code,
+)
 from moment_retrieval.vector_index import VectorIndex
 
 
@@ -54,10 +59,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if not config.TEXT_INDEX_PATH.exists():
-        print("インデックスが見つかりません。先に index_video.py を実行してください。", file=sys.stderr)
-        sys.exit(1)
-
     range_specified = args.start_sec is not None or args.end_sec is not None
     if range_specified and not args.video_id:
         print("--start-sec/--end-secは--video-idと併用してください。", file=sys.stderr)
@@ -81,23 +82,35 @@ def main():
             print("--end-secは--start-secより後の値にしてください。", file=sys.stderr)
             sys.exit(1)
 
-    embedder = TextEmbedder()
-    query_vec = embedder.encode([args.query])
-    dim = query_vec.shape[1]
+    def semantic_retriever(query, public_id, limit, threshold):
+        return retrieve_semantic_hits(
+            conn,
+            service.publication_snapshot,
+            query,
+            public_id,
+            limit,
+            threshold,
+            legacy_index_path=config.TEXT_INDEX_PATH,
+            generations_dir=config.search_generations_dir(),
+            encode_query=lambda value: TextEmbedder().encode([value]),
+            index_loader=VectorIndex.load,
+            start_sec=start_sec,
+            end_sec=end_sec,
+        )
 
-    vindex = VectorIndex.load(config.TEXT_INDEX_PATH, dim)
-
-    results = search_chunks(
-        conn,
-        vindex,
-        args.query,
-        query_vec,
-        top_k=args.top_k,
-        min_score=args.min_score,
-        video_id=args.video_id,
-        start_sec=start_sec,
-        end_sec=end_sec,
+    service = SearchService(conn, semantic_retriever)
+    text_hits, semantic_hits = service.search(
+        args.query, public_video_id=args.video_id, text_limit=args.top_k,
+        semantic_limit=args.top_k, min_score=args.min_score,
+        start_ms=round(start_sec * 1000) if start_sec is not None else None,
+        end_ms=round(end_sec * 1000) if end_sec is not None else None,
     )
+    results = [hit.to_legacy_dict() for hit in (*text_hits, *semantic_hits)]
+    semantic_status = semantic_error_code(service.semantic_error)
+    if semantic_status == SEMANTIC_PENDING:
+        print("意味検索は準備中です。文字一致のみ表示します。", file=sys.stderr)
+    elif semantic_status:
+        print("意味検索を利用できません。文字一致のみ表示します。", file=sys.stderr)
 
     if not results:
         print(
@@ -111,9 +124,10 @@ def main():
     for rank, result in enumerate(results, start=1):
         start_ts = utils.format_timestamp(result["start"])
         end_ts = utils.format_timestamp(result["end"])
+        score_label = f"{result['score']:.3f}" if result.get("score") is not None else "—"
         print(
             f"{rank}. [{result['video_id']}] {start_ts} - {end_ts} "
-            f"({result['match_type']}, score={result['score']:.3f})"
+            f"({result['match_type']}, score={score_label})"
         )
         preview = result["text"][:80] + ("..." if len(result["text"]) > 80 else "")
         print(f"   {preview}")

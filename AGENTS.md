@@ -24,3 +24,10 @@ This repository uses model-routed subagents to keep the main thread focused and 
 - Use `venv\Scripts\python.exe` for Python commands.
 - Never inspect, upload, commit, or send `data/`, `video/`, `clips/`, `exports/`, `.env`, credentials, or private transcripts to external services.
 - Do not commit, push, delete user data, change authentication, or make billing-related changes without explicit user authorization.
+
+## Canonical product documents
+
+- Read `docs/PRODUCT_SPECIFICATION.md` before changing user-visible behavior. It defines the intended search, editing, preview, export, privacy, and error semantics.
+- Read `docs/ARCHITECTURE_IMPLEMENTATION_PLAN.md` before refactoring boundaries or selecting roadmap work. It defines the migration order and dependency rules.
+- Treat `docs/INTUITIVE_EDITOR_ROADMAP.md` as historical integration context, not the current source of truth.
+- If implementation and the product specification differ, record whether the difference is a bug, an intentional migration, or a deferred requirement before changing code.

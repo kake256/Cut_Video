@@ -21,6 +21,8 @@ exports/
 *.pem
 *.key
 credentials*.json
+*.vindex.zip
+benchmark-results/
 
 # OS
 Thumbs.db

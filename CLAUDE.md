@@ -36,3 +36,10 @@
 - `moment_retrieval/`: コアモジュール (asr, chunker, embedder, vector_index, refine, db, config, utils)
 - 実行は `venv\Scripts\python.exe` を使う (システムPythonには依存パッケージがない)
 - `data/` (SQLite+FAISS), `clips/`, `video/` はgit管理外
+
+## 正式な仕様・設計文書
+
+- 利用者から見た正しい動作: `docs/PRODUCT_SPECIFICATION.md`
+- 責務境界と実施順序: `docs/ARCHITECTURE_IMPLEMENTATION_PLAN.md`
+- `docs/INTUITIVE_EDITOR_ROADMAP.md` は過去の統合経緯であり、今後の判断では上記2文書を優先する。
+- 現行実装と仕様が異なる場合は、バグ修正・意図的な仕様移行・保留要件のどれかを明記してから実装する。

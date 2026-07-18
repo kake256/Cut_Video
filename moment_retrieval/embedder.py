@@ -22,6 +22,12 @@ class TextEmbedder:
     def encode(self, texts: List[str], batch_size: int = 12) -> np.ndarray:
         output = self.model.encode(texts, batch_size=batch_size, max_length=512)
         vectors = np.asarray(output["dense_vecs"], dtype="float32")
+        if vectors.ndim != 2 or vectors.shape[1] != config.EMBED_VECTOR_DIM:
+            raise ValueError(
+                "embedding modelの出力次元が設定と一致しません: "
+                f"expected={config.EMBED_VECTOR_DIM}, actual="
+                f"{vectors.shape[1] if vectors.ndim == 2 else 'invalid'}"
+            )
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return vectors / norms

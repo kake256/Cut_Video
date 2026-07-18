@@ -134,7 +134,7 @@ class ClipPlanTest(unittest.TestCase):
 
         video = {
             "video_id": "opaque-internal-id",
-            "path": r"F:\videos\20260705_130555_wIhYikXPQbs.mp4",
+            "path": r"F:\videos\synthetic_library_clip.mp4",
             "duration": 125.0,
         }
         with (
@@ -146,7 +146,7 @@ class ClipPlanTest(unittest.TestCase):
 
         self.assertEqual(choices[0], ("すべての動画", "__all_videos__"))
         self.assertEqual(choices[1][1], "opaque-internal-id")
-        self.assertTrue(choices[1][0].startswith("20260705_130555_wIhYikXPQbs.mp4"))
+        self.assertTrue(choices[1][0].startswith("synthetic_library_clip.mp4"))
         self.assertNotIn("opaque-internal-id", choices[1][0])
         self.assertEqual(parse_video_choice(choices[1][1]), "opaque-internal-id")
 
@@ -929,14 +929,16 @@ class ClipPlanTest(unittest.TestCase):
             self._intuitive_command(state, "undo")
         self.assertEqual(state, before)
 
-    def test_timeline_edit_mode_defaults_off_and_toggles_via_fifo(self):
+    def test_timeline_drag_edit_lock_defaults_off_and_toggles_via_fifo(self):
         state = self._intuitive_state()
         self.assertFalse(state["timeline_edit_mode"])
 
         zoom_off = render_intuitive_state_zoom(state)
         self.assertIn('data-timeline-edit-mode="false"', zoom_off)
         self.assertIn('data-intuitive-toggle-edit-mode', zoom_off)
-        self.assertIn('編集モード: OFF', zoom_off)
+        self.assertIn('ドラッグ編集: OFF', zoom_off)
+        self.assertIn('aria-pressed="false"', zoom_off)
+        self.assertIn('ドラッグをロックしています', zoom_off)
         self.assertNotIn('is-on', zoom_off)
         toolbar_off = render_intuitive_toolbar(state)
         self.assertIn('data-timeline-edit-mode="false"', toolbar_off)
@@ -945,14 +947,18 @@ class ClipPlanTest(unittest.TestCase):
         self.assertTrue(state["timeline_edit_mode"])
         zoom_on = render_intuitive_state_zoom(state)
         self.assertIn('data-timeline-edit-mode="true"', zoom_on)
-        self.assertIn('編集モード: ON', zoom_on)
+        self.assertIn('ドラッグ編集: ON', zoom_on)
+        self.assertIn('aria-pressed="true"', zoom_on)
         self.assertIn('intuitive-edit-mode-toggle is-on', zoom_on)
 
         state = self._intuitive_command(state, "set_timeline_edit_mode", enabled=False)
         self.assertFalse(state["timeline_edit_mode"])
 
-    def test_timeline_edit_mode_off_clears_armed_tool_and_pending_cut(self):
+    def test_disabling_drag_edit_preserves_armed_tool_and_pending_cut(self):
         state = self._intuitive_state()
+        state = self._intuitive_command(
+            state, "set_timeline_edit_mode", enabled=True
+        )
         state = self._intuitive_command(state, "set_tool", tool="exclude_start")
         state = self._intuitive_command(
             state, "set_from_word", start=40.0, end=40.5
@@ -964,15 +970,13 @@ class ClipPlanTest(unittest.TestCase):
             state, "set_timeline_edit_mode", enabled=False
         )
         self.assertFalse(state["timeline_edit_mode"])
-        self.assertIsNone(state["active_tool"])
-        self.assertIsNone(state["pending_cut_start"])
+        self.assertEqual(state["active_tool"], "exclude_end")
+        self.assertIsNotNone(state["pending_cut_start"])
 
-    def test_set_tool_from_the_timeline_toolbox_auto_enables_edit_mode(self):
-        """Bug 1 regression: pressing a tool button that lives inside the
-        zoom timeline's own toolbox is itself the "I want to edit" gesture,
-        so it must also flip timeline_edit_mode on in the same round trip --
-        otherwise the very next click (to place the boundary) silently falls
-        back to a seek instead of setting it."""
+    def test_tool_selection_never_changes_the_drag_edit_lock(self):
+        """Both visual toolboxes own the same active_tool, while the drag-edit
+        lock remains independent even for an old payload carrying the removed
+        compatibility flag."""
         state = self._intuitive_state()
         self.assertFalse(state["timeline_edit_mode"])
 
@@ -980,38 +984,37 @@ class ClipPlanTest(unittest.TestCase):
             state, "set_tool", tool="overall_start",
             enable_timeline_edit_mode=True,
         )
-        self.assertTrue(state["timeline_edit_mode"])
+        self.assertFalse(state["timeline_edit_mode"])
         self.assertEqual(state["active_tool"], "overall_start")
 
-        # A plain set_tool (e.g. from the transcript panel's own toolbox,
-        # which never sends this flag) must not touch edit mode either way.
-        state["timeline_edit_mode"] = False
+        state = self._intuitive_command(
+            state, "set_timeline_edit_mode", enabled=True
+        )
         state = self._intuitive_command(state, "set_tool", tool="overall_end")
-        self.assertFalse(state["timeline_edit_mode"])
+        self.assertTrue(state["timeline_edit_mode"])
+        self.assertEqual(state["active_tool"], "overall_end")
 
-    def test_timeline_tool_buttons_stay_clickable_and_hint_when_edit_mode_off(self):
-        """Bug 1: unlike handles/cut-drag, the timeline toolbox's tool
-        buttons must never get `pointer-events: none` -- that is what made
-        them look clickable but do nothing when edit mode was off."""
+    def test_tool_buttons_are_available_and_expose_pressed_state_while_drag_locked(self):
         state = self._intuitive_state()
         zoom_off = render_intuitive_state_zoom(state)
         self.assertIn(
-            "クリックで編集モードをONにして選択します。", zoom_off
+            'data-intuitive-tool="overall_start" aria-pressed="false"',
+            zoom_off,
         )
-        # Only the dim opacity rule may apply to tool buttons while off;
-        # pointer-events:none must be reserved for handles/cut-handles.
-        off_rule = (
-            '[data-intuitive-zoom][data-timeline-edit-mode="false"] '
-            '.intuitive-timeline-toolbox .intuitive-tool-button {\n'
-            '  opacity: .65;\n}'
-        )
-        self.assertIn(off_rule, _APP_CSS)
-
-        state["timeline_edit_mode"] = True
-        zoom_on = render_intuitive_state_zoom(state)
+        self.assertIn("全体開始にする位置を選びます", zoom_off)
         self.assertNotIn(
-            "クリックで編集モードをONにして選択します。", zoom_on
+            '.intuitive-timeline-toolbox .intuitive-tool-button {\n  opacity: .65;',
+            _APP_CSS,
         )
+
+        state = self._intuitive_command(state, "set_tool", tool="overall_start")
+        for rendered in (
+            render_intuitive_state_zoom(state), render_intuitive_toolbar(state),
+        ):
+            self.assertIn(
+                'data-intuitive-tool="overall_start" aria-pressed="true"',
+                rendered,
+            )
 
     def test_overview_label_clarifies_viewport_does_not_change_save_range(self):
         state = self._intuitive_state()
@@ -1055,12 +1058,10 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual((state["overall_start"], state["overall_end"]), (10.0, 100.0))
 
-        state = self._intuitive_command(
-            state, "fit_overall_to_viewport", enable_timeline_edit_mode=True,
-        )
+        state = self._intuitive_command(state, "fit_overall_to_viewport")
 
         self.assertEqual((state["overall_start"], state["overall_end"]), (30.0, 70.0))
-        self.assertTrue(state["timeline_edit_mode"])
+        self.assertFalse(state["timeline_edit_mode"])
 
     def test_fit_overall_to_viewport_clamps_to_duration_bounds(self):
         state = self._intuitive_state()  # duration=200.0
@@ -1120,7 +1121,6 @@ class ClipPlanTest(unittest.TestCase):
         original = copy.deepcopy(state)
         command = {
             "type": "fit_overall_to_viewport",
-            "enable_timeline_edit_mode": True,
             "revision": state["revision"],
             "nonce": state["nonce"],
         }
@@ -1219,7 +1219,7 @@ class ClipPlanTest(unittest.TestCase):
         state = self._intuitive_state()
 
         state = self._intuitive_command(
-            state, "set_tool", tool="overall_start", enable_timeline_edit_mode=True
+            state, "set_tool", tool="overall_start"
         )
         state = self._intuitive_command(state, "set_from_word", start=20.0, end=20.5)
         state = self._intuitive_command(state, "adjust_selected", delta=1.0)
@@ -1416,7 +1416,7 @@ class ClipPlanTest(unittest.TestCase):
 
         self.assertIn('data-active-tool="overall_end"', toolbar)
         self.assertIn('data-edit-dirty="false"', toolbar)
-        self.assertIn("境界ツール（文字・タイムライン共通）", toolbar)
+        self.assertIn("3. 文字起こし編集", toolbar)
         self.assertNotIn('data-intuitive-preview-action', toolbar)
         self.assertIn("intuitive-timeline-toolbox", zoom)
         self.assertIn("共通境界ツール", zoom)
@@ -2018,10 +2018,23 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual((state["overall_start"], state["overall_end"]), (20.0, 30.0))
         self.assertEqual((state["viewport_start"], state["viewport_end"]), (10.0, 40.0))
         self.assertEqual(output[1]["value"], "search.mp4")
+        self.assertEqual(
+            state["baseline_plan"],
+            {"overall_start": 20.0, "overall_end": 30.0, "exclusions": []},
+        )
+        self.assertFalse(state["edit_dirty"])
+
+        # Selecting a tool changes only view/session state and must not make a
+        # freshly opened search result dirty.
+        after_display_only_command = self._intuitive_command(
+            state, "set_tool", tool="overall_start"
+        )
+        self.assertFalse(after_display_only_command["edit_dirty"])
+        self.assertEqual(after_display_only_command["undo_stack"], [])
 
     def test_intuitive_search_selection_and_bounds_are_robust(self):
         with (
-            patch("app._build_table", return_value=[["table"]]),
+            patch("app._build_intuitive_table", return_value=[["table"]]),
             patch("app._load_intuitive_search_result", return_value=("loaded",)) as load,
         ):
             tuple_output = on_intuitive_search_select(
@@ -2972,6 +2985,63 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-preview-result",
             "intuitive-return-source",
         }.issubset(elem_ids))
+
+        # The two timeline tabs are only alternate views over the same
+        # canonical intuitive_state.  Keeping them free of callbacks is what
+        # preserves playhead/tool/boundary/revision/history on tab switches.
+        components_by_elem_id = {
+            component.get("props", {}).get("elem_id"): component
+            for component in components
+            if component.get("props", {}).get("elem_id")
+        }
+        overall_tab = components_by_elem_id["intuitive-overall-range-tab"]
+        detail_tab = components_by_elem_id["intuitive-detail-edit-tab"]
+        self.assertEqual(overall_tab["props"].get("label"), "① 全体を決める")
+        self.assertEqual(detail_tab["props"].get("label"), "② 詳細編集（任意）")
+
+        def find_layout_node(node, component_id):
+            if node.get("id") == component_id:
+                return node
+            for child in node.get("children", []):
+                found = find_layout_node(child, component_id)
+                if found is not None:
+                    return found
+            return None
+
+        def descendant_ids(node):
+            ids = set()
+            for child in node.get("children", []):
+                ids.add(child["id"])
+                ids.update(descendant_ids(child))
+            return ids
+
+        overall_descendants = descendant_ids(
+            find_layout_node(config["layout"], overall_tab["id"])
+        )
+        detail_descendants = descendant_ids(
+            find_layout_node(config["layout"], detail_tab["id"])
+        )
+        self.assertIn(
+            components_by_elem_id["intuitive-overview-timeline"]["id"],
+            overall_descendants,
+        )
+        for elem_id in (
+            "intuitive-zoom-timeline",
+            "intuitive-boundary-controls",
+            "intuitive-exclusion-list",
+        ):
+            self.assertIn(components_by_elem_id[elem_id]["id"], detail_descendants)
+        self.assertIn(
+            components_by_elem_id["intuitive-overall-range-actions"]["id"],
+            overall_descendants,
+        )
+        tab_ids = {overall_tab["id"], detail_tab["id"]}
+        self.assertFalse(any(
+            target[0] in tab_ids
+            for dependency in config["dependencies"]
+            for target in dependency.get("targets", [])
+        ))
+
         app_source = pathlib.Path(app_module.__file__).read_text(encoding="utf-8")
         command_binding = app_source.split(
             "intuitive_command_submit.click(", 1
@@ -3000,6 +3070,14 @@ class ClipPlanTest(unittest.TestCase):
             for component in components
             if component.get("type") == "html"
         )
+        self.assertIn(
+            "data-intuitive-fit-overall>表示範囲を保存範囲として適用",
+            html_values,
+        )
+        self.assertIn(
+            "intuitive-detail-minimap",
+            render_intuitive_state_zoom(self._intuitive_state()),
+        )
         self.assertNotIn("data-intuitive-tool=\"normal\"", html_values)
         for label in ("全体開始", "全体終了", "除外開始", "除外終了"):
             self.assertIn(label, html_values)
@@ -3024,7 +3102,7 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             components_by_elem_id["intuitive-preview-video"]["props"]["height"],
-            310,
+            320,
         )
         self.assertEqual(
             components_by_elem_id["intuitive-transcript-panel"]["props"].get("min_width"),
@@ -3097,10 +3175,19 @@ class ClipPlanTest(unittest.TestCase):
             'button#intuitive-adjust-after',
             _APP_CSS,
         )
-        # B: zoom timeline edit-mode toggle -- FIFO command + gated handlers.
+        # The drag-edit toggle gates only handle/empty-track drags.  Tool
+        # selection and click-to-place share active_tool across both toolboxes.
         self.assertIn("data-intuitive-toggle-edit-mode", _INTUITIVE_EDITOR_JS)
         self.assertIn("type: 'set_timeline_edit_mode'", _INTUITIVE_EDITOR_JS)
         self.assertIn("meta.timelineEditMode", _INTUITIVE_EDITOR_JS)
+        self.assertNotIn("enable_timeline_edit_mode", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "meta.previewMode !== 'result' && meta.activeTool)",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertNotIn(
+            "meta.activeTool && meta.timelineEditMode", _INTUITIVE_EDITOR_JS,
+        )
         self.assertIn(
             "root.dataset.timelineEditMode !== 'true'", _INTUITIVE_EDITOR_JS
         )
@@ -3425,7 +3512,7 @@ class ClipPlanTest(unittest.TestCase):
             if "intuitive-video-picker" in str(dependency.get("js") or "")
             and dependency.get("trigger_only_on_success")
         ]
-        self.assertEqual(len(collapse_dependencies), 3)
+        self.assertEqual(len(collapse_dependencies), 6)
         folder_id = components_by_elem_id["intuitive-folder-browse"]["id"]
         out_dir_components = [
             component for component in components
@@ -3497,6 +3584,44 @@ class ClipPlanTest(unittest.TestCase):
 
         with self.assertRaises(gr.Error):
             exclude_clip_range(0.0, 60.0, 0.0, 60.0, plan)
+
+    def test_share_export_requires_explicit_privacy_confirmation(self):
+        with (
+            patch("app.parse_video_choice", return_value="synthetic-video"),
+            patch("app.export_index") as export,
+        ):
+            with self.assertRaises(gr.Error):
+                app_module.do_export("synthetic choice", False)
+        export.assert_not_called()
+
+    def test_share_export_passes_confirmation_to_safe_serializer(self):
+        out_path = pathlib.Path("exports") / "shared-index-synthetic.vindex.zip"
+        with (
+            patch("app.parse_video_choice", return_value="synthetic-video"),
+            patch("app.export_index", return_value=out_path) as export,
+            patch("app.gr.Info"),
+        ):
+            result = app_module.do_export("synthetic choice", True)
+
+        export.assert_called_once_with("synthetic-video", confirm_sensitive=True)
+        self.assertEqual(result, (str(out_path), f"保存先: {out_path}"))
+
+    def test_library_index_events_share_one_serial_writer_lane(self):
+        functions = {
+            getattr(block.fn, "__name__", ""): block
+            for block in demo.fns.values()
+        }
+        for function_name in ("do_index", "do_export", "do_import"):
+            with self.subTest(function_name=function_name):
+                self.assertEqual(
+                    functions[function_name].concurrency_id,
+                    "library-index-io",
+                )
+                self.assertEqual(functions[function_name].concurrency_limit, 1)
+        self.assertNotEqual(
+            functions["stop_indexing"].concurrency_id,
+            "library-index-io",
+        )
 
 
 if __name__ == "__main__":

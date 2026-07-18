@@ -16,7 +16,7 @@
 |---|---|
 | Python 3.12 | winget で自動インストール (未導入の場合) |
 | ffmpeg | winget で自動インストール (未導入の場合) |
-| PyTorch (CUDA) ・依存パッケージ | 仮想環境に自動インストール (約2.5GB) |
+| PyTorch 2.6以上 (CUDA) ・依存パッケージ | 仮想環境に自動インストール (約2.5GB) |
 | Whisper large-v3 / BGE-M3 モデル | 初回の文字起こし/検索時に自動ダウンロード (約5GB) |
 
 2回目以降は数秒でアプリが起動し、ブラウザ (http://127.0.0.1:7860) が自動で開きます。
@@ -67,7 +67,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1 -Cpu   # CPUのみ
 ./setup.sh --cpu    # CPUのみ
 ```
 
-仮想環境の作成、PyTorch (CUDA 12.4ビルド)、依存パッケージのインストールまで自動で行います。
+仮想環境の作成、PyTorch 2.6以上 (CUDA 12.4ビルド)、依存パッケージのインストールまで自動で行います。
 初回の文字起こし/検索時にWhisper large-v3 (約3GB) とBGE-M3 (約2GB) がHugging Faceから
 自動ダウンロードされます。
 
@@ -95,6 +95,21 @@ python search_video.py --query "..." --cut           # 上位候補を自動切�
 python cut_clip.py --video input.mp4 --start 123.4 --end 156.7 --output clip.mp4
 ```
 
+自動化ではversion付きJSONを返す統合CLIを推奨します。
+
+```powershell
+venv\Scripts\python.exe video_tool.py search --query "命令" --video-id vid_xxx
+venv\Scripts\python.exe video_tool.py clip --video-id vid_xxx --plan edit-plan.json --output clips\result.mp4 --precise --srt
+```
+
+`edit-plan.json`は整数ミリ秒です。
+
+```json
+{"source_duration_ms":60000,"overall":[10000,50000],"exclusions":[[20000,25000]]}
+```
+
+従来のCLIは互換wrapperとして残しています。
+
 主なオプション: `--min-score`(該当なし判定の閾値、既定0.55)、`--gap`(話の切れ目とみなす
 無音秒数、既定1.0)、`--no-expand`(境界拡張の無効化)、`--precise`(フレーム精度の再エンコード)、
 `--asr-model medium`(高速・低精度なモデルへの変更)。
@@ -110,6 +125,19 @@ python cut_clip.py --video input.mp4 --start 123.4 --end 156.7 --output clip.mp4
 | `clips/` | 保存したクリップ (既定) |
 
 いずれも `.gitignore` 済みで、リポジトリには含まれません。
+
+## コミット前のプライバシー確認
+
+既定ではステージ済みの追加行だけを検査します。手動確認では`--working-tree`を付けると、
+tracked working tree全体の追加行と未追跡source fileも検査できます。
+
+```powershell
+.\venv\Scripts\python.exe scripts\check_privacy.py
+.\venv\Scripts\python.exe scripts\check_privacy.py --working-tree
+```
+
+pre-commit hookから使う場合は、`.git/hooks/pre-commit`から引数なしのコマンドを呼び出し、
+終了コードが0以外ならcommitを中止してください。
 
 ## 既知の制約
 

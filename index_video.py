@@ -50,7 +50,8 @@ def _extract_audio_tail(video: Path, start_sec: float) -> Path:
 
 def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
                               asr_model: str, device: str, compute_type: str,
-                              language: str, batch_size: Optional[int] = None) -> Iterator[str]:
+                              language: str, batch_size: Optional[int] = None,
+                              finalize_asr: bool = True) -> Iterator[str]:
     """ストリーミング文字起こし。進捗をyieldし、定期的にDBへ途中保存する。
 
     途中失敗しても保存済み区間は再利用され、次回は続きから再開される。
@@ -126,7 +127,8 @@ def _transcribe_with_progress(conn, video_id: str, video: Path, duration: float,
     if saved_total == 0:
         raise IndexError_("文字起こし結果が空でした(無音動画の可能性があります)。")
 
-    db.mark_asr_complete(conn, video_id)
+    if finalize_asr:
+        db.mark_asr_complete(conn, video_id)
     yield f"  文字起こし完了 (セグメント数: {saved_total})"
 
 
@@ -155,10 +157,24 @@ def run_indexing(
     if not video.exists():
         raise IndexError_(f"動画が見つかりません: {video}")
 
-    video_id = video_id or utils.make_video_id(video)
-
     conn = db.get_conn()
     db.init_db(conn)
+    from moment_retrieval.publication import (
+        PublicationError, private_source_fingerprint, publish_current_generation,
+        publish_text_snapshot,
+    )
+    expected_row = conn.execute(
+        "SELECT current_publication_id FROM library_state WHERE singleton = 1"
+    ).fetchone()
+    expected_publication = str(expected_row[0]) if expected_row and expected_row[0] else None
+    source_fingerprint = private_source_fingerprint(video)
+
+    if video_id is None:
+        existing_at_path = db.find_video_by_path(conn, str(video.resolve()))
+        video_id = (
+            existing_at_path["video_id"] if existing_at_path
+            else db.new_public_video_id()
+        )
 
     existing_chunk_ids = db.get_chunk_ids(conn, video_id)
     if existing_chunk_ids and not force:
@@ -183,8 +199,16 @@ def run_indexing(
     else:
         yield from _transcribe_with_progress(
             conn, video_id, video, duration, asr_model, device, compute_type, language,
-            batch_size=batch_size,
+            batch_size=batch_size, finalize_asr=False,
         )
+        if private_source_fingerprint(video) != source_fingerprint:
+            raise IndexError_("文字起こし中に元動画が変更されたため、結果を公開しませんでした。")
+        db.mark_asr_complete(conn, video_id)
+        try:
+            text_snapshot = publish_text_snapshot(conn, expected_publication)
+            expected_publication = text_snapshot.publication_id
+        except PublicationError as exc:
+            raise IndexError_(f"文字起こし公開に失敗しました: {exc}") from exc
 
     from moment_retrieval.asr import Segment
 
@@ -213,6 +237,21 @@ def run_indexing(
     vindex.save(config.TEXT_INDEX_PATH)
 
     conn.commit()
+    if private_source_fingerprint(video) != source_fingerprint:
+        raise IndexError_("埋め込み中に元動画が変更されたため、検索世代を公開しませんでした。")
+    video_record = db.get_video(conn, video_id)
+    if video_record:
+        conn.execute(
+            "UPDATE sources SET private_fingerprint = ?, status = 'available' "
+            "WHERE source_generation = ?",
+            (source_fingerprint, video_record["source_generation"]),
+        )
+        conn.commit()
+    try:
+        snapshot = publish_current_generation(conn, expected_publication)
+    except PublicationError as exc:
+        raise IndexError_(f"検索世代の公開に失敗しました: {exc}") from exc
+    yield f"  検索世代を公開しました: {snapshot.generation_id}"
     conn.close()
     yield f"完了: video_id='{video_id}' / チャンク {len(chunks)} 件を登録しました。"
 

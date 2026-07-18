@@ -3,6 +3,7 @@
 import argparse
 import math
 import subprocess
+import threading
 import tempfile
 import time
 from pathlib import Path
@@ -94,6 +95,7 @@ def cut_clip(
     precise: bool = False,
     duration: Optional[float] = None,
     timeout_sec: Optional[float] = None,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     s = max(0.0, start - pad)
     e = end + pad
@@ -127,7 +129,7 @@ def cut_clip(
             str(output_path),
         ]
 
-    subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_sec)
+    _run_ffmpeg(cmd, timeout_sec, cancel_event)
     return output_path
 
 
@@ -139,6 +141,7 @@ def cut_clips(
     duration: Optional[float] = None,
     pad: float = 0.0,
     timeout_sec: Optional[float] = None,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """複数の保持区間を切り出し、時系列順に1本の動画へ連結する。
 
@@ -158,16 +161,13 @@ def cut_clips(
 
     if len(checked_ranges) == 1:
         start, end = checked_ranges[0]
-        return cut_clip(
-            video_path,
-            start,
-            end,
-            output_path,
-            pad=0.0,
-            precise=precise,
-            duration=normalized_duration,
+        kwargs = dict(
+            pad=0.0, precise=precise, duration=normalized_duration,
             timeout_sec=_remaining_timeout(deadline),
         )
+        if cancel_event is not None:
+            kwargs["cancel_event"] = cancel_event
+        return cut_clip(video_path, start, end, output_path, **kwargs)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -177,16 +177,13 @@ def cut_clips(
         segment_paths: list[Path] = []
         for index, (start, end) in enumerate(checked_ranges):
             segment_path = temp_dir / f"segment_{index:04d}.mp4"
-            cut_clip(
-                video_path,
-                start,
-                end,
-                segment_path,
-                pad=0.0,
-                precise=precise,
-                duration=normalized_duration,
+            kwargs = dict(
+                pad=0.0, precise=precise, duration=normalized_duration,
                 timeout_sec=_remaining_timeout(deadline),
             )
+            if cancel_event is not None:
+                kwargs["cancel_event"] = cancel_event
+            cut_clip(video_path, start, end, segment_path, **kwargs)
             segment_paths.append(segment_path)
 
         concat_list = temp_dir / "concat.txt"
@@ -203,13 +200,43 @@ def cut_clips(
             "-c", "copy",
             str(staged_output),
         ]
-        subprocess.run(
-            cmd, check=True, capture_output=True,
-            timeout=_remaining_timeout(deadline),
-        )
+        _run_ffmpeg(cmd, _remaining_timeout(deadline), cancel_event)
         staged_output.replace(output_path)
 
     return output_path
+
+
+def _run_ffmpeg(
+    cmd: list[str], timeout_sec: Optional[float], cancel_event: threading.Event | None
+) -> None:
+    if cancel_event is None:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=timeout_sec)
+        return
+    started = time.monotonic()
+    # Do not leave PIPEs unread while polling: ffmpeg can fill stderr and block.
+    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        while process.poll() is None:
+            if cancel_event.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise RuntimeError("ffmpeg job was cancelled")
+            if timeout_sec is not None and time.monotonic() - started > timeout_sec:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(cmd, timeout_sec)
+            time.sleep(0.05)
+        process.wait()
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, cmd)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def main():

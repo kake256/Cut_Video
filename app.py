@@ -3625,6 +3625,24 @@ def list_llm_result_video_choices() -> list[tuple[str, str]]:
         conn.close()
 
 
+def build_llm_video_gallery(
+    filter_text: str = "", selected_video_id: str = ""
+):
+    """Build an individual-video thumbnail picker for the LLM workspace."""
+    items, video_ids = _video_gallery_data(filter_text, include_all=False)
+    selected_video_id = parse_video_choice(selected_video_id)
+    try:
+        selected_index = video_ids.index(selected_video_id)
+    except ValueError:
+        selected_index = None
+    return gr.update(value=items, selected_index=selected_index), video_ids
+
+
+def select_llm_video_from_gallery(video_ids: list[str], evt: gr.SelectData):
+    index = _selected_gallery_index(video_ids, evt)
+    return video_ids[index], gr.update(selected_index=index)
+
+
 def load_llm_target_preview(video_choice: str):
     """Show the selected source video and its reusable analysis state."""
     video_id = parse_video_choice(video_choice)
@@ -3657,10 +3675,31 @@ def load_llm_target_preview(video_choice: str):
     return gr.update(value=str(source.resolve())), detail
 
 
-def sync_llm_video_selection(video_choice: str):
+def sync_llm_video_selection(
+    video_choice: str,
+    summary_gallery_ids: list[str] | None = None,
+    highlight_gallery_ids: list[str] | None = None,
+):
     """Keep both LLM work tabs on one video and refresh both previews."""
     preview, detail = load_llm_target_preview(video_choice)
-    return gr.update(value=video_choice), preview, detail, preview, detail
+    video_id = parse_video_choice(video_choice)
+
+    def gallery_update(video_ids: list[str] | None):
+        try:
+            selected_index = list(video_ids or []).index(video_id)
+        except ValueError:
+            selected_index = None
+        return gr.update(selected_index=selected_index)
+
+    return (
+        gr.update(value=video_choice),
+        preview,
+        detail,
+        preview,
+        detail,
+        gallery_update(summary_gallery_ids),
+        gallery_update(highlight_gallery_ids),
+    )
 
 
 def load_summary_highlight_workspace(video_choice: str):
@@ -5870,6 +5909,32 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         scale=1,
                     )
                     llm_result_reload = gr.Button("動画一覧を更新", scale=1)
+                llm_summary_gallery_ids = gr.State([])
+                with gr.Accordion(
+                    "サムネイルから対象動画を選ぶ",
+                    open=False,
+                ) as llm_summary_video_picker:
+                    with gr.Row():
+                        llm_summary_video_filter = gr.Textbox(
+                            label="ファイル名で絞り込み",
+                            placeholder="ファイル名の一部を入力",
+                            scale=4,
+                        )
+                        llm_summary_video_filter_btn = gr.Button(
+                            "絞り込む", scale=1
+                        )
+                        llm_summary_gallery_reload = gr.Button(
+                            "一覧更新", scale=1
+                        )
+                    llm_summary_video_gallery = gr.Gallery(
+                        label="動画一覧",
+                        columns=4,
+                        height=360,
+                        allow_preview=False,
+                        object_fit="cover",
+                        selected_index=None,
+                        elem_id="llm-summary-video-gallery",
+                    )
                 with gr.Row(equal_height=True):
                     llm_summary_source_preview = gr.Video(
                         label="対象動画のプレビュー",
@@ -5916,6 +5981,32 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         scale=1,
                     )
                     llm_highlight_reload = gr.Button("動画一覧を更新", scale=1)
+                llm_highlight_gallery_ids = gr.State([])
+                with gr.Accordion(
+                    "サムネイルから対象動画を選ぶ",
+                    open=False,
+                ) as llm_highlight_video_picker:
+                    with gr.Row():
+                        llm_highlight_video_filter = gr.Textbox(
+                            label="ファイル名で絞り込み",
+                            placeholder="ファイル名の一部を入力",
+                            scale=4,
+                        )
+                        llm_highlight_video_filter_btn = gr.Button(
+                            "絞り込む", scale=1
+                        )
+                        llm_highlight_gallery_reload = gr.Button(
+                            "一覧更新", scale=1
+                        )
+                    llm_highlight_video_gallery = gr.Gallery(
+                        label="動画一覧",
+                        columns=4,
+                        height=360,
+                        allow_preview=False,
+                        object_fit="cover",
+                        selected_index=None,
+                        elem_id="llm-highlight-video-gallery",
+                    )
                 with gr.Row(equal_height=True):
                     llm_highlight_source_preview = gr.Video(
                         label="対象動画のプレビュー",
@@ -6053,15 +6144,143 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 ),
                 outputs=[llm_result_video, llm_highlight_video],
             )
-            llm_result_video.input(
+            summary_gallery_inputs = [
+                llm_summary_video_filter,
+                llm_result_video,
+            ]
+            summary_gallery_outputs = [
+                llm_summary_video_gallery,
+                llm_summary_gallery_ids,
+            ]
+            llm_summary_video_picker.expand(
+                build_llm_video_gallery,
+                inputs=summary_gallery_inputs,
+                outputs=summary_gallery_outputs,
+            )
+            llm_summary_video_filter_btn.click(
+                build_llm_video_gallery,
+                inputs=summary_gallery_inputs,
+                outputs=summary_gallery_outputs,
+            )
+            llm_summary_video_filter.submit(
+                build_llm_video_gallery,
+                inputs=summary_gallery_inputs,
+                outputs=summary_gallery_outputs,
+            )
+            llm_summary_gallery_reload.click(
+                build_llm_video_gallery,
+                inputs=summary_gallery_inputs,
+                outputs=summary_gallery_outputs,
+            )
+            highlight_gallery_inputs = [
+                llm_highlight_video_filter,
+                llm_highlight_video,
+            ]
+            highlight_gallery_outputs = [
+                llm_highlight_video_gallery,
+                llm_highlight_gallery_ids,
+            ]
+            llm_highlight_video_picker.expand(
+                build_llm_video_gallery,
+                inputs=highlight_gallery_inputs,
+                outputs=highlight_gallery_outputs,
+            )
+            llm_highlight_video_filter_btn.click(
+                build_llm_video_gallery,
+                inputs=highlight_gallery_inputs,
+                outputs=highlight_gallery_outputs,
+            )
+            llm_highlight_video_filter.submit(
+                build_llm_video_gallery,
+                inputs=highlight_gallery_inputs,
+                outputs=highlight_gallery_outputs,
+            )
+            llm_highlight_gallery_reload.click(
+                build_llm_video_gallery,
+                inputs=highlight_gallery_inputs,
+                outputs=highlight_gallery_outputs,
+            )
+            llm_summary_video_gallery.select(
+                select_llm_video_from_gallery,
+                inputs=[llm_summary_gallery_ids],
+                outputs=[llm_result_video, llm_summary_video_gallery],
+            ).then(
                 sync_llm_video_selection,
-                inputs=[llm_result_video],
+                inputs=[
+                    llm_result_video,
+                    llm_summary_gallery_ids,
+                    llm_highlight_gallery_ids,
+                ],
                 outputs=[
                     llm_highlight_video,
                     llm_summary_source_preview,
                     llm_summary_source_detail,
                     llm_highlight_source_preview,
                     llm_highlight_source_detail,
+                    llm_summary_video_gallery,
+                    llm_highlight_video_gallery,
+                ],
+                show_progress="minimal",
+            ).then(
+                load_summary_highlight_workspace,
+                inputs=[llm_result_video],
+                outputs=[
+                    llm_result_markdown,
+                    highlight_source_status,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                    highlight_result_generate,
+                ],
+                show_progress="minimal",
+            )
+            llm_highlight_video_gallery.select(
+                select_llm_video_from_gallery,
+                inputs=[llm_highlight_gallery_ids],
+                outputs=[llm_highlight_video, llm_highlight_video_gallery],
+            ).then(
+                sync_llm_video_selection,
+                inputs=[
+                    llm_highlight_video,
+                    llm_summary_gallery_ids,
+                    llm_highlight_gallery_ids,
+                ],
+                outputs=[
+                    llm_result_video,
+                    llm_summary_source_preview,
+                    llm_summary_source_detail,
+                    llm_highlight_source_preview,
+                    llm_highlight_source_detail,
+                    llm_summary_video_gallery,
+                    llm_highlight_video_gallery,
+                ],
+                show_progress="minimal",
+            ).then(
+                load_summary_highlight_workspace,
+                inputs=[llm_highlight_video],
+                outputs=[
+                    llm_result_markdown,
+                    highlight_source_status,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                    highlight_result_generate,
+                ],
+                show_progress="minimal",
+            )
+            llm_result_video.input(
+                sync_llm_video_selection,
+                inputs=[
+                    llm_result_video,
+                    llm_summary_gallery_ids,
+                    llm_highlight_gallery_ids,
+                ],
+                outputs=[
+                    llm_highlight_video,
+                    llm_summary_source_preview,
+                    llm_summary_source_detail,
+                    llm_highlight_source_preview,
+                    llm_highlight_source_detail,
+                    llm_summary_video_gallery,
+                    llm_highlight_video_gallery,
                 ],
                 show_progress="minimal",
             ).then(
@@ -6078,13 +6297,19 @@ with gr.Blocks(title="動画シーン検索") as demo:
             )
             llm_highlight_video.input(
                 sync_llm_video_selection,
-                inputs=[llm_highlight_video],
+                inputs=[
+                    llm_highlight_video,
+                    llm_summary_gallery_ids,
+                    llm_highlight_gallery_ids,
+                ],
                 outputs=[
                     llm_result_video,
                     llm_summary_source_preview,
                     llm_summary_source_detail,
                     llm_highlight_source_preview,
                     llm_highlight_source_detail,
+                    llm_summary_video_gallery,
+                    llm_highlight_video_gallery,
                 ],
                 show_progress="minimal",
             ).then(

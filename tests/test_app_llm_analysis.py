@@ -205,6 +205,12 @@ class AppLlmAnalysisTest(unittest.TestCase):
         ]
         self.assertEqual(len(target_dropdowns), 2)
         self.assertEqual(len(target_previews), 2)
+        component_ids = {
+            (component.get("props") or {}).get("elem_id")
+            for component in components
+        }
+        self.assertIn("llm-summary-video-gallery", component_ids)
+        self.assertIn("llm-highlight-video-gallery", component_ids)
 
     def test_llm_target_preview_shows_video_and_reusable_state(self):
         with tempfile.TemporaryDirectory() as temporary:

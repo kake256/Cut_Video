@@ -5439,16 +5439,28 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         stop_btn.click(stop_indexing)
 
-        with gr.Accordion("LLM解析結果（実験）", open=False):
+    with gr.Tab("LLM要約・見どころ"):
+        gr.Markdown(
+            "## LLM要約・見どころ\n"
+            "文字起こし済み動画の要約を作成・確認し、その保存済み要約から"
+            "見どころ候補を作成します。処理はローカルOllamaだけを使用します。"
+        )
+        with gr.Accordion("1. LLM要約を作る・確認する", open=True):
             gr.Markdown(
                 "保存済みの要約・タグ・時間付き章を確認できます。"
-                "既存動画の解析も別プロセスで実行します。"
+                "要約がない動画は、この画面から別プロセスで作成できます。"
             )
             with gr.Row():
                 llm_result_video = gr.Dropdown(
                     choices=list_llm_result_video_choices(),
-                    label="解析結果を確認する動画",
+                    label="要約を作成・確認する動画",
                     scale=3,
+                )
+                llm_workspace_model_box = gr.Textbox(
+                    value=config.LLM_ANALYSIS_MODEL,
+                    label="Ollamaモデル",
+                    placeholder="例: qwen3:8b",
+                    scale=1,
                 )
                 llm_result_reload = gr.Button("動画一覧を更新", scale=1)
             with gr.Row():
@@ -5465,7 +5477,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             llm_result_markdown = gr.Markdown(
                 "動画を選択して保存済み結果を表示してください。"
             )
-            with gr.Accordion("見どころ候補（実験）", open=False):
+            with gr.Accordion("2. 保存済み要約から見どころを作る", open=True):
                 gr.Markdown(
                     "保存済みの章から候補章を選び、選んだ章の元文字起こしへ戻って"
                     "内容が収まる範囲を作ります。映像・表情・音の盛り上がりは評価しません。"
@@ -5555,7 +5567,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             )
             llm_analysis_event = llm_result_analyze.click(
                 do_existing_llm_analysis,
-                inputs=[llm_result_video, llm_model_box],
+                inputs=[llm_result_video, llm_workspace_model_box],
                 outputs=[llm_result_log, llm_result_markdown],
                 concurrency_id="library-index-io",
                 concurrency_limit=1,
@@ -5580,7 +5592,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 do_existing_highlight_analysis,
                 inputs=[
                     llm_result_video,
-                    llm_model_box,
+                    llm_workspace_model_box,
                     highlight_count,
                     highlight_min_duration,
                     highlight_max_duration,

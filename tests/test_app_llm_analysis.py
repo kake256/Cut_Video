@@ -18,6 +18,24 @@ class _Connection:
 
 
 class AppLlmAnalysisTest(unittest.TestCase):
+    def test_llm_summary_and_highlights_have_a_dedicated_ordered_tab(self):
+        tab_labels = [
+            (component.get("props") or {}).get("label")
+            for component in app.demo.config.get("components", [])
+            if component.get("type") == "tabitem"
+        ]
+        accordion_labels = [
+            (component.get("props") or {}).get("label")
+            for component in app.demo.config.get("components", [])
+            if component.get("type") == "accordion"
+        ]
+        self.assertIn("LLM要約・見どころ", tab_labels)
+        summary_index = accordion_labels.index("1. LLM要約を作る・確認する")
+        highlight_index = accordion_labels.index(
+            "2. 保存済み要約から見どころを作る"
+        )
+        self.assertLess(summary_index, highlight_index)
+
     def test_saved_summary_enables_highlight_generation_without_reanalysis(self):
         with (
             patch.object(

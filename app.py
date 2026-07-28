@@ -3625,6 +3625,44 @@ def list_llm_result_video_choices() -> list[tuple[str, str]]:
         conn.close()
 
 
+def load_llm_target_preview(video_choice: str):
+    """Show the selected source video and its reusable analysis state."""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        return gr.update(value=None), "**対象動画:** 未選択"
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        video = db.get_video(conn, video_id)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        ready = (
+            db.get_latest_ready_analysis_run(conn, video_id, revision)
+            if revision is not None else None
+        )
+    finally:
+        conn.close()
+    if not video:
+        return gr.update(value=None), "対象動画の情報を取得できませんでした。"
+    source = Path(video["path"])
+    if not source.is_file():
+        return gr.update(value=None), "対象動画の元ファイルが見つかりません。"
+    name = html.escape(str(video.get("display_name") or source.name))
+    duration = utils.format_timestamp(float(video.get("duration") or 0.0))
+    transcript_status = "文字起こし済み" if revision is not None else "文字起こしなし"
+    summary_status = "要約済み" if ready is not None else "未要約"
+    detail = (
+        f"**対象動画:** {name}  \n"
+        f"**長さ:** {duration}　｜　{transcript_status}　｜　{summary_status}"
+    )
+    return gr.update(value=str(source.resolve())), detail
+
+
+def sync_llm_video_selection(video_choice: str):
+    """Keep both LLM work tabs on one video and refresh both previews."""
+    preview, detail = load_llm_target_preview(video_choice)
+    return gr.update(value=video_choice), preview, detail, preview, detail
+
+
 def load_summary_highlight_workspace(video_choice: str):
     """Load one saved summary and expose highlight generation when reusable."""
     summary = format_latest_llm_analysis(video_choice)
@@ -5813,25 +5851,38 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "文字起こし済み動画の要約を作成・確認し、その保存済み要約から"
             "見どころ候補を作成します。処理はローカルOllamaだけを使用します。"
         )
-        with gr.Row():
-            llm_result_video = gr.Dropdown(
-                choices=list_llm_result_video_choices(),
-                label="対象動画（要約・見どころ共通）",
-                scale=3,
-            )
-            llm_workspace_model_box = gr.Textbox(
-                value=config.LLM_ANALYSIS_MODEL,
-                label="Ollamaモデル",
-                placeholder="例: qwen3:8b",
-                scale=1,
-            )
-            llm_result_reload = gr.Button("動画一覧を更新", scale=1)
         with gr.Tabs(elem_id="llm-workspace-tabs"):
             with gr.Tab("① 要約を作る・確認する"):
                 gr.Markdown(
                     "保存済みの要約・タグ・時間付き章を確認できます。"
                     "要約がない動画は、この画面から別プロセスで作成できます。"
                 )
+                with gr.Row():
+                    llm_result_video = gr.Dropdown(
+                        choices=list_llm_result_video_choices(),
+                        label="対象動画",
+                        scale=3,
+                    )
+                    llm_workspace_model_box = gr.Textbox(
+                        value=config.LLM_ANALYSIS_MODEL,
+                        label="要約に使うOllamaモデル",
+                        placeholder="例: qwen3:8b",
+                        scale=1,
+                    )
+                    llm_result_reload = gr.Button("動画一覧を更新", scale=1)
+                with gr.Row(equal_height=True):
+                    llm_summary_source_preview = gr.Video(
+                        label="対象動画のプレビュー",
+                        autoplay=False,
+                        interactive=False,
+                        height=280,
+                        scale=3,
+                    )
+                    llm_summary_source_detail = gr.Markdown(
+                        "**対象動画:** 未選択",
+                        container=True,
+                        scale=2,
+                    )
                 with gr.Row():
                     llm_result_show = gr.Button("保存済み結果を表示")
                     llm_result_analyze = gr.Button(
@@ -5852,6 +5903,32 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "内容が収まる範囲を作ります。映像・表情・音の盛り上がりは評価しません。"
                     "候補はプレビュー・編集でき、確認後に選択候補または全候補をまとめて保存できます。"
                 )
+                with gr.Row():
+                    llm_highlight_video = gr.Dropdown(
+                        choices=list_llm_result_video_choices(),
+                        label="対象動画",
+                        scale=3,
+                    )
+                    llm_highlight_model_box = gr.Textbox(
+                        value=config.LLM_HIGHLIGHT_MODEL,
+                        label="候補生成に使うOllamaモデル",
+                        placeholder="例: qwen3:8b",
+                        scale=1,
+                    )
+                    llm_highlight_reload = gr.Button("動画一覧を更新", scale=1)
+                with gr.Row(equal_height=True):
+                    llm_highlight_source_preview = gr.Video(
+                        label="対象動画のプレビュー",
+                        autoplay=False,
+                        interactive=False,
+                        height=280,
+                        scale=3,
+                    )
+                    llm_highlight_source_detail = gr.Markdown(
+                        "**対象動画:** 未選択",
+                        container=True,
+                        scale=2,
+                    )
                 highlight_source_status = gr.Markdown(
                     "要約生成済みの動画を上で選ぶと、保存済み要約を再利用できます。"
                 )
@@ -5963,12 +6040,56 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         interactive=False,
                     )
             llm_result_reload.click(
-                lambda: gr.update(choices=list_llm_result_video_choices()),
-                outputs=[llm_result_video],
+                lambda: (
+                    gr.update(choices=list_llm_result_video_choices()),
+                    gr.update(choices=list_llm_result_video_choices()),
+                ),
+                outputs=[llm_result_video, llm_highlight_video],
+            )
+            llm_highlight_reload.click(
+                lambda: (
+                    gr.update(choices=list_llm_result_video_choices()),
+                    gr.update(choices=list_llm_result_video_choices()),
+                ),
+                outputs=[llm_result_video, llm_highlight_video],
             )
             llm_result_video.input(
+                sync_llm_video_selection,
+                inputs=[llm_result_video],
+                outputs=[
+                    llm_highlight_video,
+                    llm_summary_source_preview,
+                    llm_summary_source_detail,
+                    llm_highlight_source_preview,
+                    llm_highlight_source_detail,
+                ],
+                show_progress="minimal",
+            ).then(
                 load_summary_highlight_workspace,
                 inputs=[llm_result_video],
+                outputs=[
+                    llm_result_markdown,
+                    highlight_source_status,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                    highlight_result_generate,
+                ],
+                show_progress="minimal",
+            )
+            llm_highlight_video.input(
+                sync_llm_video_selection,
+                inputs=[llm_highlight_video],
+                outputs=[
+                    llm_result_video,
+                    llm_summary_source_preview,
+                    llm_summary_source_detail,
+                    llm_highlight_source_preview,
+                    llm_highlight_source_detail,
+                ],
+                show_progress="minimal",
+            ).then(
+                load_summary_highlight_workspace,
+                inputs=[llm_highlight_video],
                 outputs=[
                     llm_result_markdown,
                     highlight_source_status,
@@ -6009,7 +6130,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             )
             highlight_result_show.click(
                 load_latest_highlight_view,
-                inputs=[llm_result_video],
+                inputs=[llm_highlight_video],
                 outputs=[highlight_result_markdown, highlight_candidate_select],
             )
             highlight_generation_mode.change(
@@ -6021,8 +6142,8 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 do_highlight_generation,
                 inputs=[
                     highlight_generation_mode,
-                    llm_result_video,
-                    llm_workspace_model_box,
+                    llm_highlight_video,
+                    llm_highlight_model_box,
                     highlight_query,
                     highlight_count,
                     highlight_min_duration,
@@ -6038,14 +6159,14 @@ with gr.Blocks(title="動画シーン検索") as demo:
             )
             highlight_preview_btn.click(
                 preview_highlight_candidate,
-                inputs=[llm_result_video, highlight_candidate_select],
+                inputs=[llm_highlight_video, highlight_candidate_select],
                 outputs=[highlight_preview, highlight_preview_detail],
                 concurrency_id="highlight-preview-io",
                 concurrency_limit=1,
             )
             highlight_edit_btn.click(
                 load_highlight_candidate_into_editor,
-                inputs=[llm_result_video, highlight_candidate_select],
+                inputs=[llm_highlight_video, highlight_candidate_select],
                 outputs=[
                     intuitive_video_select,
                     *intuitive_load_and_search_outputs,
@@ -6056,7 +6177,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             highlight_export_btn.click(
                 export_highlight_candidates,
                 inputs=[
-                    llm_result_video,
+                    llm_highlight_video,
                     highlight_candidate_select,
                     highlight_export_scope,
                     highlight_export_dir,

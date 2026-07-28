@@ -189,6 +189,58 @@ class AppLlmAnalysisTest(unittest.TestCase):
         highlight_index = tab_labels.index("② 要約から見どころを作る・切り抜く")
         self.assertLess(summary_index, highlight_index)
 
+        components = app.demo.config.get("components", [])
+        target_dropdowns = [
+            component
+            for component in components
+            if component.get("type") == "dropdown"
+            and (component.get("props") or {}).get("label") == "対象動画"
+        ]
+        target_previews = [
+            component
+            for component in components
+            if component.get("type") == "video"
+            and (component.get("props") or {}).get("label")
+            == "対象動画のプレビュー"
+        ]
+        self.assertEqual(len(target_dropdowns), 2)
+        self.assertEqual(len(target_previews), 2)
+
+    def test_llm_target_preview_shows_video_and_reusable_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.mp4"
+            source.write_bytes(b"video")
+            with (
+                patch.object(app, "parse_video_choice", return_value="vid_synthetic"),
+                patch.object(app.db, "get_conn", return_value=_Connection()),
+                patch.object(app.db, "init_db"),
+                patch.object(
+                    app.db,
+                    "get_video",
+                    return_value={
+                        "path": str(source),
+                        "display_name": "<source>.mp4",
+                        "duration": 65.0,
+                    },
+                ),
+                patch.object(
+                    app.db,
+                    "get_active_transcript_revision",
+                    return_value="revision-1",
+                ),
+                patch.object(
+                    app.db,
+                    "get_latest_ready_analysis_run",
+                    return_value={"analysis_run_id": "analysis-1"},
+                ),
+            ):
+                preview, detail = app.load_llm_target_preview("synthetic")
+
+        self.assertEqual(preview["value"], str(source.resolve()))
+        self.assertIn("&lt;source&gt;.mp4", detail)
+        self.assertIn("文字起こし済み", detail)
+        self.assertIn("要約済み", detail)
+
     def test_saved_summary_enables_highlight_generation_without_reanalysis(self):
         with (
             patch.object(

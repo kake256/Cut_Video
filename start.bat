@@ -2,6 +2,15 @@
 cd /d "%~dp0"
 title Auto_Cut - video scene search
 
+REM Optional only: qwen3:8b is a multi-GiB download used solely by the
+REM experimental local LLM transcript analysis feature. Normal startup never
+REM downloads or starts Ollama. Double-click setup_ollama.bat, or run:
+REM   start.bat --setup-ollama
+if /I "%~1"=="--setup-ollama" (
+    call "%~dp0setup_ollama.bat"
+    exit /b %ERRORLEVEL%
+)
+
 REM ---- check Python (try winget install if missing) ----
 where python >nul 2>nul
 if errorlevel 1 (

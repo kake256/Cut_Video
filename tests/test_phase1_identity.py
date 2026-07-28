@@ -30,6 +30,29 @@ class Phase1IdentityTest(unittest.TestCase):
             self.assertTrue(backup and backup.exists())
             self.assertNotIn("video_id", db.get_public_video(conn, public_id))
             self.assertNotIn("legacy", repr(db.get_public_video(conn, public_id)))
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                db.SCHEMA_VERSION,
+            )
+            indexes = {
+                row[1] for row in conn.execute("PRAGMA index_list(asr_segments)")
+            }
+            self.assertIn("idx_segments_revision_range", indexes)
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN SELECT segment_id FROM asr_segments "
+                "WHERE video_id = ? AND transcript_revision = ? "
+                "AND end_sec > ? AND start_sec < ? ORDER BY start_sec, segment_id",
+                (
+                    "legacy-path-derived",
+                    db.get_active_transcript_revision(conn, public_id),
+                    0.0,
+                    60.0,
+                ),
+            ).fetchall()
+            self.assertIn(
+                "idx_segments_revision_range",
+                " ".join(str(row[3]) for row in plan),
+            )
             conn.close()
 
     def test_public_id_is_stable_when_source_path_changes(self):

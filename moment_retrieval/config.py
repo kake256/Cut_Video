@@ -1,6 +1,14 @@
 import os
 from pathlib import Path
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
 DATA_DIR = Path(os.environ.get("CUT_VIDEO_DATA_DIR", "data"))
 # Phase 1 storage roles.  Defaults preserve the current on-disk layout while
 # allowing the frequently accessed library/search/cache roots to live on SSD.
@@ -12,6 +20,7 @@ SOURCE_ROOTS = tuple(
     if item
 )
 ARTIFACT_ROOT = Path(os.environ.get("CUT_VIDEO_ARTIFACT_ROOT", "clips"))
+ENABLE_LEGACY_UI = _env_flag("CUT_VIDEO_ENABLE_LEGACY_UI")
 DB_PATH = LIBRARY_ROOT / "index.db"
 TEXT_INDEX_PATH = SEARCH_ROOT / "text.index"
 SEARCH_GENERATIONS_DIR = SEARCH_ROOT / "generations"
@@ -58,3 +67,25 @@ ASR_COMPUTE_TYPE = "float16"
 # テキスト埋め込み (BGE-M3)
 EMBED_MODEL_NAME = "BAAI/bge-m3"
 EMBED_VECTOR_DIM = 1024
+
+# Experimental transcript analysis.  It is opt-in and talks only to a
+# user-controlled local Ollama endpoint; the indexing path never enables it
+# implicitly.
+LLM_ANALYSIS_PROVIDER = os.environ.get(
+    "CUT_VIDEO_LLM_ANALYSIS_PROVIDER", "ollama"
+)
+LLM_ANALYSIS_MODEL = os.environ.get(
+    "CUT_VIDEO_LLM_ANALYSIS_MODEL", "qwen3:8b"
+)
+LLM_ANALYSIS_ENDPOINT = os.environ.get(
+    "CUT_VIDEO_LLM_ANALYSIS_ENDPOINT", "http://127.0.0.1:11434"
+)
+LLM_ANALYSIS_TIMEOUT_SEC = float(
+    os.environ.get("CUT_VIDEO_LLM_ANALYSIS_TIMEOUT_SEC", "180")
+)
+LLM_ANALYSIS_CONTEXT_LENGTH = int(
+    os.environ.get("CUT_VIDEO_LLM_ANALYSIS_CONTEXT_LENGTH", "32768")
+)
+LLM_ANALYSIS_MAX_WINDOW_CHARS = int(
+    os.environ.get("CUT_VIDEO_LLM_ANALYSIS_MAX_WINDOW_CHARS", "24000")
+)

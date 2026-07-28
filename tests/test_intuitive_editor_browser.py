@@ -1,6 +1,7 @@
 """Browser E2E for the intuitive editor using synthetic, isolated data only."""
 
 import json
+import math
 import os
 import shutil
 import socket
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 import urllib.request
+import statistics
 from pathlib import Path
 
 import numpy as np
@@ -214,7 +216,9 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
 
         page.on("dialog", dismiss_dialog)
         page.goto(self.base_url, wait_until="domcontentloaded")
-        page.get_by_role("tab", name="直感編集（試作）").click()
+        main_tab = page.get_by_role("tab", name="検索・編集・切り抜き")
+        main_tab.wait_for(state="visible")
+        self.assertEqual(main_tab.get_attribute("aria-selected"), "true")
 
         card = page.locator(
             "#intuitive-video-card-grid .intuitive-video-card"
@@ -223,8 +227,19 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         card.click()
         root = page.locator("#intuitive-toolbox [data-intuitive-root]")
         root.wait_for(state="visible")
-        page.get_by_text("3. 文字クエリー検索", exact=True).wait_for(
+        page.get_by_text("2. 文字クエリー検索", exact=True).wait_for(
             state="visible"
+        )
+        page.get_by_text("3. 文字起こし編集", exact=True).wait_for(
+            state="visible"
+        )
+        self.assertEqual(
+            root.get_attribute("data-transcript-start"),
+            root.get_attribute("data-viewport-start"),
+        )
+        self.assertEqual(
+            root.get_attribute("data-transcript-end"),
+            root.get_attribute("data-viewport-end"),
         )
         search_target_input = page.locator("#intuitive-search-target input")
         search_target_input.wait_for(state="visible")
@@ -251,7 +266,78 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         self.assertEqual(root.get_attribute("data-nonce"), loaded_nonce)
         # Search and editor mutations use separate lanes. Results are inert
         # until the user explicitly selects a row.
-        search_results.locator(".body-cell").first.click()
+        text_marker = page.locator(
+            "[data-intuitive-search-marker-layer] "
+            ".intuitive-search-marker[data-marker-kind='text']"
+        ).first
+        semantic_marker = page.locator(
+            "[data-intuitive-search-marker-layer] "
+            ".intuitive-search-marker[data-marker-kind='semantic']"
+        ).first
+        text_marker.wait_for(state="visible")
+        semantic_marker.wait_for(state="visible")
+        self.assertTrue(
+            page.locator("[data-intuitive-search-marker-legend]").is_visible()
+        )
+        self.assertEqual(text_marker.get_attribute("aria-current"), "false")
+
+        # Reproduce the transport race explicitly: after a newer query has
+        # rendered, force the older request projection to arrive in the DOM.
+        # The bounded rejected-ID set must clear it instead of reactivating it.
+        projection_source = page.locator(
+            "#intuitive-search-marker-projection "
+            "[data-intuitive-search-marker-projection]"
+        )
+        old_projection = projection_source.get_attribute("data-search-markers")
+        old_request_id = json.loads(old_projection)["request_id"]
+        page.locator(
+            "#intuitive-search-query textarea, #intuitive-search-query input"
+        ).fill("beta")
+        page.locator(
+            "button#intuitive-search-button, #intuitive-search-button button"
+        ).click()
+        page.wait_for_function(
+            "([selector, oldRequestId]) => { const source = "
+            "document.querySelector(selector); if (!source) return false; "
+            "try { return JSON.parse(source.dataset.searchMarkers).request_id "
+            "!== oldRequestId; } catch (_) { return false; } }",
+            arg=[
+                "#intuitive-search-marker-projection "
+                "[data-intuitive-search-marker-projection]",
+                old_request_id,
+            ],
+        )
+        semantic_marker.wait_for(state="visible")
+        new_projection = projection_source.get_attribute("data-search-markers")
+        page.evaluate(
+            "([selector, projection]) => { document.querySelector(selector)"
+            ".dataset.searchMarkers = projection; }",
+            arg=[
+                "#intuitive-search-marker-projection "
+                "[data-intuitive-search-marker-projection]",
+                old_projection,
+            ],
+        )
+        page.wait_for_function(
+            "() => document.querySelectorAll("
+            "'[data-intuitive-search-marker-layer] .intuitive-search-marker'"
+            ").length === 0"
+        )
+        self.assertEqual(root.get_attribute("data-nonce"), loaded_nonce)
+        page.evaluate(
+            "([selector, projection]) => { document.querySelector(selector)"
+            ".dataset.searchMarkers = projection; }",
+            arg=[
+                "#intuitive-search-marker-projection "
+                "[data-intuitive-search-marker-projection]",
+                new_projection,
+            ],
+        )
+        text_marker.wait_for(state="visible")
+        semantic_marker.wait_for(state="visible")
+        # Marker activation resolves its stable hit ID through the exact same
+        # server selection helper as a Dataframe row.
+        text_marker.click()
         page.wait_for_function(
             "([selector, nonce]) => { const root = document.querySelector(selector); "
             "return root && root.dataset.nonce !== nonce "
@@ -259,6 +345,38 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             arg=["#intuitive-toolbox [data-intuitive-root]", loaded_nonce],
         )
         self.assertIn("● 1", search_results.inner_text())
+        page.wait_for_function(
+            "() => { const marker = document.querySelector("
+            "'[data-intuitive-search-marker-layer] .intuitive-search-marker'); "
+            "return marker && marker.getAttribute('aria-current') === 'true'; }"
+        )
+        # Simulate a late table repaint that restores the server's unselected
+        # ○ prefix. The request-scoped selected hit must project ● back without
+        # reopening or mutating the editor document.
+        page.evaluate(
+            """() => {
+              const cell = document.querySelector(
+                '#intuitive-search-results .body-cell, '
+                + '#intuitive-search-results tbody td'
+              );
+              if (cell) {
+                const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+                let node = walker.nextNode();
+                while (node) {
+                  if (/●\s*1/.test(node.nodeValue || '')) {
+                    node.nodeValue = (node.nodeValue || '').replace('●', '○');
+                    break;
+                  }
+                  node = walker.nextNode();
+                }
+              }
+              document.dispatchEvent(new CustomEvent('cut-video:sync-search-markers'));
+            }"""
+        )
+        page.wait_for_function(
+            "() => document.querySelector('#intuitive-search-results')"
+            ".innerText.includes('● 1')"
+        )
         self.assertIn("synthetic_fixture.mp4", search_target_input.input_value())
         self.assertEqual(root.get_attribute("data-edit-dirty"), "false")
         self.assertEqual(root.get_attribute("data-can-undo"), "false")
@@ -331,7 +449,16 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
           }));
         }""")
         self.assertGreaterEqual(layout["#intuitive-preview-panel"]["w"], 480)
-        self.assertGreaterEqual(layout["#intuitive-transcript-panel"]["w"], 400)
+        self.assertGreaterEqual(layout["#intuitive-search-panel"]["w"], 400)
+        self.assertGreaterEqual(layout["#intuitive-transcript-panel"]["w"], 280)
+        self.assertLess(
+            layout["#intuitive-preview-panel"]["x"],
+            layout["#intuitive-search-panel"]["x"],
+        )
+        self.assertLess(
+            layout["#intuitive-search-panel"]["x"],
+            layout["#intuitive-transcript-panel"]["x"],
+        )
         self.assertGreaterEqual(
             layout["#intuitive-search-results .table-wrap"]["h"], 140
         )
@@ -366,12 +493,92 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
                 ).click()
             )
 
+        # The overview tab exposes the same canonical boundary adjustment
+        # commands as detail editing, without restoring the removed guide.
+        overall_timeline_tab.click()
+        self.assertEqual(
+            page.locator("#intuitive-overall-range-guide").count(), 0
+        )
+        overall_step = page.locator(
+            "[data-intuitive-overall-step][value='0.1']"
+        )
+        overall_step.check()
+        overall_start_button = page.locator(
+            "[data-intuitive-select-overall-boundary='overall_start']"
+        )
+        overall_end_button = page.locator(
+            "[data-intuitive-select-overall-boundary='overall_end']"
+        )
+        adjust_before = page.locator("[data-intuitive-overall-adjust='-1']")
+        adjust_after = page.locator("[data-intuitive-overall-adjust='1']")
+
+        run_editor_command(overall_start_button.click)
+        page.wait_for_function(
+            "(selector) => document.querySelector(selector)"
+            ".getAttribute('aria-pressed') === 'true'",
+            arg="[data-intuitive-select-overall-boundary='overall_start']",
+        )
+        self.assertEqual(overall_start_button.get_attribute("aria-pressed"), "true")
+        run_editor_command(adjust_after.click)
+        self.assertAlmostEqual(
+            float(zoom.get_attribute("data-overall-start")), 0.1, delta=0.001
+        )
+        run_editor_command(adjust_before.click)
+        self.assertAlmostEqual(
+            float(zoom.get_attribute("data-overall-start")), 0.0, delta=0.001
+        )
+
+        run_editor_command(overall_end_button.click)
+        page.wait_for_function(
+            "(selector) => document.querySelector(selector)"
+            ".getAttribute('aria-pressed') === 'true'",
+            arg="[data-intuitive-select-overall-boundary='overall_end']",
+        )
+        self.assertEqual(overall_end_button.get_attribute("aria-pressed"), "true")
+        run_editor_command(adjust_before.click)
+        self.assertAlmostEqual(
+            float(zoom.get_attribute("data-overall-end")), 2.7, delta=0.001
+        )
+        run_editor_command(adjust_after.click)
+        self.assertAlmostEqual(
+            float(zoom.get_attribute("data-overall-end")), 2.8, delta=0.001
+        )
+        detail_timeline_tab.click()
+        self.assertEqual(detail_timeline_tab.get_attribute("aria-selected"), "true")
+
+        # Ordinary boundary/cut commands must retain the transcript DOM.  The
+        # toolbar carries a compact canonical projection and JavaScript only
+        # updates word decoration classes instead of replacing all words.
+        transcript_dom_token = "persist-through-boundary-command"
+        page.locator("#intuitive-transcript-words").evaluate(
+            "(node, token) => node.dataset.domToken = token",
+            transcript_dom_token,
+        )
+
         # Two overlapping cut gestures must collapse into one canonical range.
         # Each completed gesture is a single history entry even though its
         # start and end are chosen by separate browser commands.
         choose_tool("exclude_start")
         choose_word(0.70)
         self.assertEqual(root.get_attribute("data-active-tool"), "exclude_end")
+        self.assertEqual(
+            page.locator("#intuitive-transcript-words").get_attribute(
+                "data-dom-token"
+            ),
+            transcript_dom_token,
+        )
+        page.wait_for_function(
+            '''() => document.querySelector(
+              "#intuitive-transcript-words .intuitive-word[data-start='0.700']"
+            ).classList.contains("marks-pending-cut")'''
+        )
+        self.assertIn(
+            "marks-pending-cut",
+            page.locator(
+                "#intuitive-transcript-words "
+                ".intuitive-word[data-start='0.700']"
+            ).get_attribute("class"),
+        )
         choose_word(1.25)
         first_cut = page.locator(
             "[data-intuitive-zoom] .intuitive-cut-zone"
@@ -388,6 +595,18 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
                   .get_attribute("data-boundary-time")),
             1.65,
             delta=0.001,
+        )
+        page.wait_for_function(
+            '''() => document.querySelector(
+              "#intuitive-transcript-words .intuitive-word[data-start='0.700']"
+            ).classList.contains("is-excluded-word")'''
+        )
+        self.assertIn(
+            "is-excluded-word",
+            page.locator(
+                "#intuitive-transcript-words "
+                ".intuitive-word[data-start='0.700']"
+            ).get_attribute("class"),
         )
 
         choose_tool("exclude_start")
@@ -809,6 +1028,16 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         detail_timeline_tab.click()
         revision = root.get_attribute("data-revision")
 
+        # A search refresh is transient and must not warn about losing a dirty
+        # edit. Only selecting a result/marker replaces the edit document.
+        before_dialogs = len(dialogs)
+        page.locator(
+            "button#intuitive-search-button, #intuitive-search-button button"
+        ).click()
+        page.wait_for_timeout(250)
+        self.assertEqual(len(dialogs), before_dialogs)
+        self.assertEqual(root.get_attribute("data-revision"), revision)
+
         page.locator(
             "button#intuitive-reselect-video, #intuitive-reselect-video button"
         ).click()
@@ -940,11 +1169,11 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         # hidden document.
         hidden_revision = int(root.get_attribute("data-revision"))
         hidden_dirty = root.get_attribute("data-edit-dirty")
-        page.get_by_role("tab", name="検索・切り抜き").click()
+        page.get_by_role("tab", name="動画の追加").click()
         self.assertEqual(page.locator("#intuitive-save-bar:visible").count(), 0)
         page.keyboard.press("Control+Z")
         page.wait_for_timeout(150)
-        page.get_by_role("tab", name="直感編集（試作）").click()
+        page.get_by_role("tab", name="検索・編集・切り抜き").click()
         self.assertEqual(int(root.get_attribute("data-revision")), hidden_revision)
         self.assertEqual(root.get_attribute("data-edit-dirty"), hidden_dirty)
 
@@ -965,6 +1194,161 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         ]
         self.assertEqual(leftovers, [])
 
+    @unittest.skipUnless(
+        os.environ.get("CUT_VIDEO_RUN_BROWSER_PERF") == "1",
+        "600-second browser performance measurement is opt-in",
+    )
+    def test_transcript_projection_600_second_performance(self):
+        """Measure dense synthetic transcript DOM render and production projection."""
+        previous_data_dir = os.environ.get("CUT_VIDEO_DATA_DIR")
+        os.environ["CUT_VIDEO_DATA_DIR"] = str(self.data_dir)
+        try:
+            import app as app_module
+        finally:
+            if previous_data_dir is None:
+                os.environ.pop("CUT_VIDEO_DATA_DIR", None)
+            else:
+                os.environ["CUT_VIDEO_DATA_DIR"] = previous_data_dir
+
+        segments = []
+        for second in range(600):
+            words = []
+            for index in range(5):
+                start = second + 0.04 + index * 0.18
+                words.append({
+                    "word": f"w{second:03d}_{index}",
+                    "start": start,
+                    "end": start + 0.14,
+                })
+            segments.append({
+                "start_sec": float(second),
+                "end_sec": second + 0.95,
+                "text": " ".join(word["word"] for word in words),
+                "words_json": json.dumps(words, separators=(",", ":")),
+            })
+
+        state_a = {
+            "overall_start": 20.0,
+            "overall_end": 580.0,
+            "viewport_start": 0.0,
+            "viewport_end": 600.0,
+            "exclusions": [
+                {"id": "cut-a", "start": 80.0, "end": 90.0},
+                {"id": "cut-b", "start": 200.0, "end": 215.0},
+                {"id": "cut-c", "start": 330.0, "end": 345.0},
+                {"id": "cut-d", "start": 500.0, "end": 510.0},
+            ],
+            "selected_word": {"start": 321.04, "end": 321.18},
+            "pending_cut_start": 420.22,
+        }
+        state_b = {
+            **state_a,
+            "overall_start": 25.0,
+            "overall_end": 575.0,
+            "selected_word": {"start": 322.22, "end": 322.36},
+            "pending_cut_start": 421.40,
+        }
+        transcript_html = app_module.render_intuitive_transcript(segments, state_a)
+        projections = [
+            json.loads(app_module._intuitive_transcript_projection(state_a)),
+            json.loads(app_module._intuitive_transcript_projection(state_b)),
+        ]
+
+        context = self.browser.new_context(viewport={"width": 1440, "height": 900})
+        self.addCleanup(context.close)
+        page = context.new_page()
+        page.set_default_timeout(30_000)
+        page.goto(self.base_url, wait_until="domcontentloaded")
+        page.locator("#intuitive-transcript-words").wait_for(state="visible")
+        page.wait_for_function(
+            "() => typeof globalThis.__cutVideoDiagnostics"
+            ".applyTranscriptProjection === 'function'"
+        )
+        browser_metrics = page.evaluate(
+            """async ({html, projections, warmups, samples}) => {
+              const host = document.getElementById('intuitive-transcript-words');
+              const renderOnce = () => {
+                host.replaceChildren();
+                const started = performance.now();
+                host.innerHTML = html;
+                void host.scrollHeight;
+                return performance.now() - started;
+              };
+              await new Promise(requestAnimationFrame);
+              const coldRenderMs = renderOnce();
+              for (let index = 0; index < warmups; index += 1) renderOnce();
+              const renderSamplesMs = [];
+              for (let index = 0; index < samples; index += 1) {
+                renderSamplesMs.push(renderOnce());
+              }
+              for (let index = 0; index < warmups; index += 1) {
+                globalThis.__cutVideoDiagnostics.applyTranscriptProjection(
+                  projections[index % projections.length]
+                );
+                void host.offsetHeight;
+              }
+              const projectionSamplesMs = [];
+              for (let index = 0; index < samples; index += 1) {
+                const started = performance.now();
+                globalThis.__cutVideoDiagnostics.applyTranscriptProjection(
+                  projections[index % projections.length]
+                );
+                void host.offsetHeight;
+                projectionSamplesMs.push(performance.now() - started);
+              }
+              return {
+                coldRenderMs,
+                renderSamplesMs,
+                projectionSamplesMs,
+                wordCount: host.querySelectorAll('.intuitive-word').length,
+                userAgent: navigator.userAgent
+              };
+            }""",
+            arg={
+                "html": transcript_html,
+                "projections": projections,
+                "warmups": 5,
+                "samples": 20,
+            },
+        )
+
+        def percentile_95(values):
+            ordered = sorted(float(value) for value in values)
+            return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+
+        metrics = {
+            "duration_sec": 600,
+            "word_count": browser_metrics["wordCount"],
+            "html_utf8_bytes": len(transcript_html.encode("utf-8")),
+            "cold_render_ms": round(float(browser_metrics["coldRenderMs"]), 3),
+            "warm_render_median_ms": round(
+                statistics.median(browser_metrics["renderSamplesMs"]), 3
+            ),
+            "warm_render_p95_ms": round(
+                percentile_95(browser_metrics["renderSamplesMs"]), 3
+            ),
+            "projection_median_ms": round(
+                statistics.median(browser_metrics["projectionSamplesMs"]), 3
+            ),
+            "projection_p95_ms": round(
+                percentile_95(browser_metrics["projectionSamplesMs"]), 3
+            ),
+            "render_samples_ms": [
+                round(float(value), 3) for value in browser_metrics["renderSamplesMs"]
+            ],
+            "projection_samples_ms": [
+                round(float(value), 3)
+                for value in browser_metrics["projectionSamplesMs"]
+            ],
+            "user_agent": browser_metrics["userAgent"],
+        }
+        self.assertEqual(metrics["word_count"], 3000)
+        self.assertEqual(len(metrics["render_samples_ms"]), 20)
+        self.assertEqual(len(metrics["projection_samples_ms"]), 20)
+        self.assertTrue(all(value >= 0 for value in metrics["render_samples_ms"]))
+        self.assertTrue(all(value >= 0 for value in metrics["projection_samples_ms"]))
+        print("TRANSCRIPT_PERF_JSON=" + json.dumps(metrics, ensure_ascii=False))
+
     def test_responsive_layout_has_no_horizontal_overflow(self):
         for width, height in ((1024, 768), (760, 900)):
             with self.subTest(viewport=(width, height)):
@@ -975,7 +1359,7 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
                     page = context.new_page()
                     page.set_default_timeout(30_000)
                     page.goto(self.base_url, wait_until="domcontentloaded")
-                    page.get_by_role("tab", name="直感編集（試作）").click()
+                    page.get_by_role("tab", name="検索・編集・切り抜き").click()
                     page.locator(
                         "#intuitive-video-card-grid .intuitive-video-card"
                     ).first.click()
@@ -1029,22 +1413,22 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
 
                     if width == 1024:
                         self.assertAlmostEqual(
-                            layout["preview"]["y"], layout["transcript"]["y"],
+                            layout["preview"]["y"], layout["search"]["y"],
                             delta=3,
                         )
                         self.assertGreaterEqual(
-                            layout["search"]["y"],
+                            layout["transcript"]["y"],
                             max(layout["preview"]["bottom"],
-                                layout["transcript"]["bottom"]) - 2,
+                                layout["search"]["bottom"]) - 2,
                         )
                     else:
                         self.assertGreaterEqual(
-                            layout["transcript"]["y"],
+                            layout["search"]["y"],
                             layout["preview"]["bottom"] - 2,
                         )
                         self.assertGreaterEqual(
-                            layout["search"]["y"],
-                            layout["transcript"]["bottom"] - 2,
+                            layout["transcript"]["y"],
+                            layout["search"]["bottom"] - 2,
                         )
                 finally:
                     context.close()

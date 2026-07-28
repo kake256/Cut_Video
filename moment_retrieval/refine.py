@@ -24,11 +24,12 @@ def expand_to_speech_boundary(
     back_max = back_max if back_max is not None else config.EXTEND_BACK_MAX_SEC
     fwd_max = fwd_max if fwd_max is not None else config.EXTEND_FWD_MAX_SEC
 
-    storage_id = db.storage_video_id(conn, video_id) or video_id
-    rows = conn.execute(
-        "SELECT start_sec, end_sec FROM asr_segments WHERE video_id = ? ORDER BY start_sec",
-        (storage_id,),
-    ).fetchall()
+    rows = db.get_segments_in_range(
+        conn,
+        video_id,
+        max(0.0, start_sec - back_max - gap_sec),
+        end_sec + fwd_max + gap_sec,
+    )
     if not rows:
         return start_sec, end_sec
 

@@ -115,6 +115,34 @@ class IndexJobControlCharacterizationTests(unittest.TestCase):
         self.assertIsNone(app_module._index_state["proc"])
         self._assert_index_lock_released()
 
+    def test_optional_local_llm_analysis_is_forwarded_to_index_subprocess(self):
+        proc = _ControllableProcess()
+        proc.stdout.finish()
+        proc.returncode = 0
+
+        with (
+            patch.object(app_module, "INDEX_JOB_PIDFILE", self.pidfile),
+            patch("subprocess.Popen", return_value=proc) as popen,
+            patch.object(app_module, "list_video_choices", return_value=[]),
+            patch.object(app_module.gr, "Info"),
+        ):
+            list(
+                app_module.do_index(
+                    str(Path(self._temp.name) / "synthetic.mp4"),
+                    "tiny",
+                    False,
+                    llm_analysis=True,
+                    llm_model="synthetic-local-model",
+                )
+            )
+
+        command = popen.call_args.args[0]
+        self.assertIn("--llm-analysis", command)
+        self.assertEqual(
+            command[command.index("--llm-model") + 1],
+            "synthetic-local-model",
+        )
+
     def test_registered_index_process_can_be_stopped_and_reports_resume(self):
         proc = _ControllableProcess()
         proc.stdout.push("  文字起こし中... 10.0%")
@@ -173,6 +201,63 @@ class IndexJobControlCharacterizationTests(unittest.TestCase):
     def test_stop_without_a_live_index_process_is_a_validation_error(self):
         with self.assertRaises(gr.Error):
             app_module.stop_indexing()
+
+    def test_existing_llm_analysis_uses_shared_stop_and_lock(self):
+        proc = _ControllableProcess(pid=43211)
+        proc.stdout.push("synthetic local analysis")
+        outputs = []
+        errors = []
+
+        def fake_run(command, **kwargs):
+            if command and command[0] == "taskkill":
+                proc.returncode = 1
+                proc.stdout.finish()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def consume():
+            try:
+                outputs.extend(
+                    app_module.do_existing_llm_analysis(
+                        "synthetic video choice",
+                        "synthetic-local-model",
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch.object(app_module, "INDEX_JOB_PIDFILE", self.pidfile),
+            patch.object(app_module, "parse_video_choice", return_value="vid_synthetic"),
+            patch("subprocess.Popen", return_value=proc) as popen,
+            patch("subprocess.run", side_effect=fake_run) as run,
+            patch.object(app_module.gr, "Info"),
+        ):
+            worker = threading.Thread(target=consume, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 3
+            while app_module._index_state["proc"] is not proc:
+                if time.monotonic() >= deadline:
+                    self.fail("synthetic LLM process was not registered")
+                time.sleep(0.01)
+
+            self.assertTrue(self.pidfile.exists())
+            app_module.stop_indexing()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            popen.call_args.args[0][:2],
+            [sys.executable, "analyze_transcript.py"],
+        )
+        self.assertEqual(
+            run.call_args.args[0],
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+        )
+        self.assertTrue(any("LLM解析を停止しました" in item[0] for item in outputs))
+        self.assertFalse(self.pidfile.exists())
+        self.assertIsNone(app_module._index_state["proc"])
+        self._assert_index_lock_released()
 
     def test_url_download_phase_has_no_registered_index_process_yet(self):
         """Temporary migration characterization, not the desired stop contract.

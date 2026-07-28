@@ -1,4 +1,10 @@
 
+#intuitive-editor-tab {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-optical-sizing: auto;
+  text-rendering: optimizeLegibility;
+}
+
 .reverse-fill-slider input[type=range]::-webkit-slider-runnable-track {
   background: linear-gradient(
     to right,
@@ -38,12 +44,6 @@
 .clip-timeline-cut { position: absolute; inset-block: 0; }
 .clip-timeline-hatch-key { padding: .05rem .35rem; border-radius: .2rem; color: #fff; }
 .clip-timeline-empty { color: var(--body-text-color-subdued); font-size: .9rem; }
-.intuitive-prototype-note {
-  border-left: .3rem solid var(--primary-500); padding: .25rem .6rem;
-  margin: 0 0 .2rem !important;
-  background: var(--background-fill-secondary); border-radius: .35rem;
-}
-.intuitive-prototype-note .prose, .intuitive-prototype-note p { margin: 0 !important; }
 #intuitive-video-picker { margin: 0 0 .2rem !important; }
 #intuitive-video-picker > button { min-height: 2rem !important; padding-block: .25rem !important; }
 body:has(#intuitive-toolbox [data-intuitive-root])
@@ -51,13 +51,6 @@ body:has(#intuitive-toolbox [data-intuitive-root])
   display: none !important;
 }
 .intuitive-fallback-picker { margin-top: .2rem !important; }
-/* The real Gallery only exists to keep the original selection/nonce/FIFO
-   wiring intact; the card grid above it is what the user actually sees. */
-.intuitive-gallery-proxy {
-  position: absolute !important; height: 0 !important; min-height: 0 !important;
-  margin: 0 !important; padding: 0 !important; border: 0 !important;
-  overflow: hidden !important; opacity: 0; pointer-events: none;
-}
 .intuitive-video-card-empty {
   padding: .6rem; color: var(--body-text-color-subdued); font-size: .9rem;
 }
@@ -221,6 +214,8 @@ button#intuitive-preview-result, #intuitive-preview-result button {
 }
 .intuitive-tool-button.is-selected {
   background: var(--primary-500); color: #fff; border-color: var(--primary-500);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary-500) 24%, transparent);
+  font-weight: 700;
 }
 .intuitive-tool-button:disabled { opacity: .55; cursor: not-allowed; }
 .intuitive-tool-status {
@@ -328,17 +323,21 @@ button#intuitive-preview-result, #intuitive-preview-result button {
   border: 1px solid var(--border-color-primary);
 }
 .intuitive-stat strong { white-space: nowrap; }
-#intuitive-editor-prototype-tab > div > #intuitive-save-bar {
+#intuitive-editor-tab > div > #intuitive-save-bar {
   display: none !important; position: fixed; left: 50%; bottom: .35rem;
-  transform: translateX(-50%); z-index: 2147483000 !important;
+  transform: translateX(-50%); z-index: 60 !important;
   isolation: isolate; width: min(1216px, calc(100vw - 2rem));
   background: var(--background-fill-primary);
-  border: 1px solid var(--border-color-primary); border-radius: .5rem;
-  box-shadow: 0 -.2rem .65rem rgba(0, 0, 0, .18);
+  background: color-mix(in srgb, var(--background-fill-primary) 84%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  backdrop-filter: blur(18px) saturate(145%);
+  border: 1px solid color-mix(in srgb, var(--border-color-primary) 72%, #fff 28%);
+  border-radius: .7rem;
+  box-shadow: 0 -.15rem 1rem rgba(0, 0, 0, .14), inset 0 1px rgba(255,255,255,.38);
   padding: .3rem .5rem; margin: 0 !important; max-height: 82px;
 }
 body:has(#intuitive-toolbox [data-intuitive-root])
-  #intuitive-editor-prototype-tab > div > #intuitive-save-bar {
+  #intuitive-editor-tab > div > #intuitive-save-bar {
   display: flex !important;
 }
 #intuitive-save-bar #intuitive-save-bar {
@@ -364,7 +363,7 @@ body:has(#intuitive-toolbox [data-intuitive-root])
 #intuitive-saved-path textarea, #intuitive-saved-path input {
   min-height: 1.55rem !important; height: 1.55rem !important;
 }
-#intuitive-editor-prototype-tab { padding-bottom: 5.4rem !important; }
+#intuitive-editor-tab { padding-bottom: 5.4rem !important; }
 .intuitive-exclusion-list {
   margin: .25rem 0 .35rem; border: 1px solid var(--border-color-primary);
   border-radius: .45rem; background: var(--background-fill-primary);
@@ -436,11 +435,20 @@ body:has(#intuitive-toolbox [data-intuitive-root])
   margin: -.35rem 0 0 !important; min-height: 0 !important;
 }
 #intuitive-timeline-tabs > .tab-nav {
-  margin-bottom: .2rem !important;
+  gap: .2rem; margin-bottom: .2rem !important; padding: .18rem !important;
+  border: 1px solid var(--border-color-primary); border-radius: .55rem;
+  background: var(--background-fill-secondary);
 }
 #intuitive-timeline-tabs > .tab-nav button {
   min-height: 2.25rem !important; padding: .35rem .85rem !important;
-  font-weight: 650;
+  border: 1px solid transparent !important; border-radius: .4rem !important;
+  font-weight: 650; color: var(--body-text-color-subdued);
+}
+#intuitive-timeline-tabs > .tab-nav button[aria-selected=true],
+#intuitive-timeline-tabs > .tab-nav button.selected {
+  color: var(--body-text-color); background: var(--background-fill-primary) !important;
+  border-color: var(--border-color-primary) !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .1);
 }
 .intuitive-timeline-tab-guide {
   margin: 0 0 .15rem !important; min-height: 0 !important;
@@ -461,6 +469,48 @@ body:has(#intuitive-toolbox [data-intuitive-root])
 .intuitive-overall-range-actions .intuitive-fit-overall-button {
   min-height: 2rem; font-weight: 650;
 }
+.intuitive-overall-adjust-controls {
+  display: flex; align-items: center; gap: .45rem; margin: 0 0 .18rem;
+  padding: .22rem .3rem; border: 1px solid var(--border-color-primary);
+  border-radius: .45rem; background: var(--background-fill-secondary);
+  font-size: .78rem;
+}
+.intuitive-overall-boundary-picker,
+.intuitive-overall-adjust-actions {
+  display: flex; align-items: center; gap: .25rem; flex: 0 0 auto;
+}
+.intuitive-overall-boundary-picker > span {
+  color: var(--body-text-color-subdued); white-space: nowrap;
+}
+.intuitive-overall-adjust-controls button {
+  min-height: 1.9rem; padding: .18rem .55rem;
+  border: 1px solid var(--border-color-primary); border-radius: .35rem;
+  background: var(--button-secondary-background-fill); color: var(--body-text-color);
+  font-size: .78rem; font-weight: 650; cursor: pointer;
+}
+.intuitive-overall-adjust-controls button.is-selected {
+  border-color: var(--primary-500); color: var(--primary-500);
+  background: color-mix(in srgb, var(--primary-500) 10%, transparent);
+  box-shadow: 0 0 0 1px var(--primary-500);
+}
+.intuitive-overall-adjust-controls button:disabled {
+  cursor: default; opacity: .5;
+}
+.intuitive-overall-adjust-steps {
+  display: flex; align-items: center; gap: .18rem; min-width: 0;
+  margin: 0; padding: 0; border: 0;
+}
+.intuitive-overall-adjust-steps legend {
+  float: left; margin: 0 .15rem 0 0; padding: 0;
+  color: var(--body-text-color-subdued); white-space: nowrap;
+}
+.intuitive-overall-adjust-steps label {
+  display: inline-flex; align-items: center; gap: .12rem; min-height: 1.8rem;
+  padding: 0 .2rem; border-radius: .3rem; white-space: nowrap; cursor: pointer;
+}
+.intuitive-overall-adjust-steps input { margin: 0; accent-color: var(--primary-500); }
+.intuitive-overall-adjust-actions { margin-left: auto; }
+.intuitive-overall-adjust-actions button { min-width: 4.5rem; }
 #intuitive-overview-timeline, #intuitive-zoom-timeline { margin-top: 0 !important; }
 .intuitive-timeline { margin: .05rem 0 .2rem; }
 .intuitive-inline-section-title {
@@ -533,6 +583,51 @@ body:has(#intuitive-toolbox [data-active-tool]:not([data-active-tool=""]))
   border-radius: .45rem; background: var(--neutral-200);
 }
 .intuitive-overview-track { height: 1rem; overflow: visible; }
+.intuitive-search-marker-layer {
+  position: absolute; inset: 0; z-index: 7; pointer-events: none;
+}
+.intuitive-search-marker {
+  position: absolute; top: -1.05rem; width: 1.25rem; height: 1.35rem;
+  padding: 0; border: 0; background: transparent; cursor: pointer;
+  transform: translateX(-50%); pointer-events: auto;
+}
+.intuitive-search-marker::before {
+  content: ""; position: absolute; left: 50%; top: .42rem;
+  transform: translate(-50%, -50%); filter: drop-shadow(0 1px 1px rgba(0,0,0,.4));
+}
+.intuitive-search-marker[data-marker-kind="text"]::before {
+  width: .55rem; height: .55rem; border: 2px solid #fff;
+  background: #1565c0; transform: translate(-50%, -50%) rotate(45deg);
+}
+.intuitive-search-marker[data-marker-kind="semantic"]::before {
+  width: 0; height: 0; border-left: .36rem solid transparent;
+  border-right: .36rem solid transparent; border-bottom: .7rem solid #7b1fa2;
+}
+.intuitive-search-marker[aria-current="true"] {
+  outline: 2px solid var(--body-text-color); outline-offset: -1px;
+  border-radius: .25rem;
+}
+.intuitive-search-marker:focus-visible {
+  outline: 3px solid var(--primary-500); outline-offset: 1px;
+  border-radius: .25rem;
+}
+.intuitive-search-marker-legend {
+  display: inline-flex; align-items: center; gap: .7rem;
+  color: var(--body-text-color); white-space: nowrap;
+}
+.intuitive-search-marker-legend > span {
+  display: inline-flex; align-items: center; gap: .3rem;
+}
+.intuitive-search-marker-legend i { display: inline-block; flex: 0 0 auto; }
+.intuitive-search-marker-legend i.text {
+  width: .48rem; height: .48rem; border: 1px solid #fff;
+  background: #1565c0; transform: rotate(45deg);
+}
+.intuitive-search-marker-legend i.semantic {
+  width: 0; height: 0; border-left: .3rem solid transparent;
+  border-right: .3rem solid transparent; border-bottom: .58rem solid #7b1fa2;
+}
+.intuitive-search-marker-legend[hidden] { display: none !important; }
 .intuitive-overview-window {
   position: absolute; left: 28%; width: 44%; inset-block: .1rem;
   border: 2px solid var(--primary-500); background: color-mix(in srgb, var(--primary-500) 22%, transparent);
@@ -614,7 +709,10 @@ body:has(#intuitive-toolbox [data-active-tool]:not([data-active-tool=""]))
 .intuitive-legend-position { color: #e53935; }
 .intuitive-legend-transcript { color: #7e57c2; }
 #intuitive-command-json, #intuitive-command-submit,
-#intuitive-sync-token, #intuitive-sync-submit, #intuitive-sync-ack {
+#intuitive-sync-token, #intuitive-sync-submit, #intuitive-sync-ack,
+#intuitive-video-card-command, #intuitive-video-card-submit,
+#intuitive-search-marker-projection, #intuitive-search-marker-command,
+#intuitive-search-marker-submit {
   display: none !important;
 }
 body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-before,
@@ -634,11 +732,112 @@ body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-apply-time,
 body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-apply-time {
   pointer-events: none !important; opacity: .5 !important;
 }
+/* Immediate feedback for discrete controls. Precision timeline handles are
+   excluded: they track 1:1 and never receive momentum or bounce. */
+:is(.intuitive-video-card, .intuitive-tool-button,
+  .intuitive-history-actions button, .intuitive-edit-mode-toggle,
+  .intuitive-fit-overall-button, .intuitive-overall-adjust-controls button,
+  #intuitive-timeline-tabs > .tab-nav button,
+  button#intuitive-preview-result, #intuitive-preview-result button,
+  button#intuitive-return-source, #intuitive-return-source button,
+  button#intuitive-save-button, #intuitive-save-button button) {
+  transition: transform 90ms ease-out, box-shadow 120ms ease-out,
+    border-color 120ms ease-out, background-color 120ms ease-out;
+  transform-origin: center;
+}
+:is(.intuitive-video-card, .intuitive-tool-button,
+  .intuitive-history-actions button, .intuitive-edit-mode-toggle,
+  .intuitive-fit-overall-button, .intuitive-overall-adjust-controls button,
+  #intuitive-timeline-tabs > .tab-nav button,
+  button#intuitive-preview-result, #intuitive-preview-result button,
+  button#intuitive-return-source, #intuitive-return-source button,
+  button#intuitive-save-button, #intuitive-save-button button):not(:disabled):active {
+  transform: scale(.975); filter: brightness(.97);
+}
+.intuitive-video-card:not(:disabled):active { transform: scale(.99); }
+:is(.intuitive-video-card, .intuitive-tool-button,
+  .intuitive-history-actions button, .intuitive-edit-mode-toggle,
+  .intuitive-fit-overall-button, .intuitive-overall-adjust-controls button,
+  #intuitive-timeline-tabs > .tab-nav button,
+  button#intuitive-preview-result, #intuitive-preview-result button,
+  button#intuitive-return-source, #intuitive-return-source button,
+  button#intuitive-save-button, #intuitive-save-button button,
+  [data-boundary-kind][role=slider], [data-viewport-drag][role=slider]):focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--primary-500) 72%, #fff 28%);
+  outline-offset: 2px;
+}
+
+/* Pending acknowledgement is shown immediately in the existing status line;
+   the separate recovery notice still appears after 15 seconds. */
+#intuitive-editor-tab.is-command-pending .intuitive-tool-status::after,
+.intuitive-toolbox.is-command-pending .intuitive-tool-status::after {
+  content: "適用中"; display: inline-block; margin-left: .4rem;
+  padding: .08rem .3rem; border-radius: 999px;
+  color: var(--primary-500); background: color-mix(in srgb, var(--primary-500) 10%, transparent);
+  font-size: .68rem; font-weight: 700;
+}
+
+.intuitive-timeline.is-intuitive-dragging {
+  user-select: none; cursor: grabbing;
+}
+[data-viewport-drag], [data-boundary-kind], .intuitive-zoom-track {
+  touch-action: none;
+}
+[data-viewport-drag].is-intuitive-dragging,
+[data-boundary-kind].is-intuitive-dragging {
+  filter: brightness(1.08);
+  outline: 3px solid color-mix(in srgb, var(--primary-500) 45%, transparent);
+  outline-offset: 1px;
+}
+.intuitive-zoom-track.is-intuitive-dragging {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--primary-500) 55%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :is(.intuitive-video-card, .intuitive-tool-button,
+    .intuitive-history-actions button, .intuitive-edit-mode-toggle,
+    .intuitive-fit-overall-button, .intuitive-overall-adjust-controls button,
+    #intuitive-timeline-tabs > .tab-nav button,
+    button#intuitive-preview-result, #intuitive-preview-result button,
+    button#intuitive-return-source, #intuitive-return-source button,
+    button#intuitive-save-button, #intuitive-save-button button) {
+    transition: background-color 60ms linear, border-color 60ms linear !important;
+  }
+  :is(.intuitive-video-card, .intuitive-tool-button,
+    .intuitive-history-actions button, .intuitive-edit-mode-toggle,
+    .intuitive-fit-overall-button, .intuitive-overall-adjust-controls button,
+    #intuitive-timeline-tabs > .tab-nav button,
+    button#intuitive-preview-result, #intuitive-preview-result button,
+    button#intuitive-return-source, #intuitive-return-source button,
+    button#intuitive-save-button, #intuitive-save-button button):active {
+    transform: none !important; filter: none !important;
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  #intuitive-editor-tab > div > #intuitive-save-bar {
+    background: var(--background-fill-primary) !important;
+    -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+  }
+}
+@media (prefers-contrast: more) {
+  #intuitive-editor-tab > div > #intuitive-save-bar,
+  #intuitive-timeline-tabs > .tab-nav,
+  .intuitive-timeline-toolbox {
+    background: var(--background-fill-primary) !important;
+    border: 2px solid var(--body-text-color) !important;
+    -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+  }
+  .intuitive-tool-button.is-selected,
+  #intuitive-timeline-tabs > .tab-nav button[aria-selected=true] {
+    outline: 2px solid var(--body-text-color); outline-offset: 1px;
+  }
+}
+
 @media (max-width: 1180px) {
   #intuitive-workspace-row { flex-wrap: wrap !important; }
   #intuitive-preview-panel { order: 1; min-width: 55% !important; }
-  #intuitive-transcript-panel { order: 2; min-width: 40% !important; }
-  #intuitive-search-panel {
+  #intuitive-search-panel { order: 2; min-width: 40% !important; }
+  #intuitive-transcript-panel {
     order: 3;
     min-width: 100% !important; min-height: 280px !important; height: 280px;
   }
@@ -647,7 +846,8 @@ body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-app
   #intuitive-mode-row,
   #intuitive-boundary-controls,
   #intuitive-save-bar .intuitive-compact-row,
-  .intuitive-timeline-toolbox {
+  .intuitive-timeline-toolbox,
+  .intuitive-overall-adjust-controls {
     flex-wrap: wrap !important; overflow-x: visible !important;
   }
   #intuitive-video-info, #intuitive-edit-summary {
@@ -656,15 +856,16 @@ body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-app
   .intuitive-timeline-toolbox .intuitive-tool-buttons {
     flex: 1 1 100%; min-width: 0;
   }
+  .intuitive-overall-adjust-actions { margin-left: 0; }
   #intuitive-adjust-step {
     flex: 1 1 360px !important; max-width: 100% !important;
   }
-  #intuitive-editor-prototype-tab > div > #intuitive-save-bar {
+  #intuitive-editor-tab > div > #intuitive-save-bar {
     position: static; transform: none; width: 100%; max-height: none;
     box-sizing: border-box;
     margin-top: .35rem !important;
   }
-  #intuitive-editor-prototype-tab { padding-bottom: 0 !important; }
+  #intuitive-editor-tab { padding-bottom: 0 !important; }
 }
 @media (max-width: 760px) {
   #intuitive-preview-panel, #intuitive-transcript-panel, #intuitive-search-panel {
@@ -675,6 +876,7 @@ body:has(#intuitive-toolbox [data-has-selected-boundary="false"]) #intuitive-app
   }
   #intuitive-adjust-step { flex-basis: 100% !important; }
   .intuitive-timeline-toolbox { align-items: stretch; flex-direction: column; }
+  .intuitive-overall-adjust-steps { flex-wrap: wrap; }
   #intuitive-mode-row, #intuitive-save-bar .intuitive-compact-row {
     flex-wrap: wrap !important; overflow-x: visible;
   }

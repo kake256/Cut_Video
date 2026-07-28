@@ -10,6 +10,7 @@ import numpy as np
 
 from moment_retrieval import config, db
 from moment_retrieval import publication as publication_module
+from moment_retrieval.refine import expand_to_speech_boundary
 from moment_retrieval.publication import (
     LeaseManager, PublicationError, build_vector_index_draft, cleanup_orphan_generations,
     publish_current_generation, release_snapshot, resolve_snapshot,
@@ -206,6 +207,62 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(
             [row["text"] for row in db.get_segments(self.conn, public_id)],
             ["draft"],
+        )
+
+    def test_range_and_boundary_queries_ignore_inactive_transcript_revisions(self):
+        public_id = "vid_" + "1" * 32
+        active_revision = db.get_active_transcript_revision(self.conn, public_id)
+        draft = db.begin_transcript_revision(
+            self.conn,
+            public_id,
+            asr_config={"model": "inactive-synthetic"},
+            reuse_draft=False,
+        )
+        inactive = SimpleNamespace(
+            start=2.1, end=8.0, text="inactive extension", words=[]
+        )
+        db.insert_segment(
+            self.conn, public_id, inactive, transcript_revision=draft
+        )
+        db.complete_transcript_revision(self.conn, draft)
+
+        self.assertEqual(
+            [row["text"] for row in db.get_segments_in_range(
+                self.conn, public_id, 0.0, 10.0
+            )],
+            ["alpha"],
+        )
+        self.assertEqual(
+            db.get_first_text_segment(self.conn, public_id)["text"],
+            "alpha",
+        )
+        self.assertEqual(
+            [row["text"] for row in db.get_segments_in_range(
+                self.conn,
+                public_id,
+                0.0,
+                10.0,
+                transcript_revision=draft,
+            )],
+            ["inactive extension"],
+        )
+        # If the inactive row leaked into refinement, its 0.1-second gap would
+        # incorrectly extend the result end from 2.0 to 8.0.
+        self.assertEqual(
+            expand_to_speech_boundary(
+                self.conn,
+                public_id,
+                1.2,
+                1.8,
+                gap_sec=0.5,
+                back_max=1.0,
+                fwd_max=10.0,
+            ),
+            (1.0, 2.0),
+        )
+        self.assertEqual(
+            db.get_active_transcript_revision(self.conn, public_id),
+            active_revision,
         )
 
     def test_database_connection_policy_is_enabled(self):

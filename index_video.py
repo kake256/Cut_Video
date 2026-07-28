@@ -9,6 +9,7 @@ ASR結果は完了時点でDBに保存されるため、後段(埋め込み等)�
 再実行時に文字起こしをやり直さずに再開できる。
 """
 import argparse
+import gc
 import os
 import sys
 from pathlib import Path
@@ -188,6 +189,62 @@ def _build_verified_index_draft(
     return draft_path, chunk_ids
 
 
+def _run_optional_llm_analysis(
+    conn,
+    video_id: str,
+    revision: str,
+    model: str,
+) -> Iterator[str]:
+    """Run retryable derived analysis without changing indexing success."""
+    yield (
+        "[任意] ローカルLLMで要約・タグ・章を生成中... "
+        f"(provider=Ollama, model={model})"
+    )
+    try:
+        # Release Python references and CUDA cache left by embedding before
+        # the separate Ollama server loads its model.
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except (ImportError, RuntimeError):
+            pass
+        from moment_retrieval.llm_analysis import (
+            OllamaProvider,
+            run_transcript_analysis,
+        )
+
+        endpoint = config.LLM_ANALYSIS_ENDPOINT.rstrip("/")
+        if not endpoint.endswith("/api/generate"):
+            endpoint += "/api/generate"
+        result = run_transcript_analysis(
+            conn,
+            video_id,
+            revision,
+            OllamaProvider(
+                endpoint=endpoint,
+                timeout_sec=config.LLM_ANALYSIS_TIMEOUT_SEC,
+                context_length=config.LLM_ANALYSIS_CONTEXT_LENGTH,
+            ),
+            model,
+            max_window_chars=config.LLM_ANALYSIS_MAX_WINDOW_CHARS,
+        )
+        yield (
+            "  LLM解析完了: "
+            f"タグ{len(result['tags'])}件 / 章{len(result['chapters'])}件 / "
+            f"文字起こし網羅率{result.get('segment_coverage_ratio', 0.0) * 100:.1f}%"
+        )
+    except Exception as exc:
+        # Analysis is derived and retryable. Search publication and immutable
+        # ASR remain successful even if provider/configuration is unavailable.
+        yield (
+            "  注意: LLM解析に失敗しました。動画・文字起こし・検索は利用できます。"
+            f" 後から再実行できます: {exc}"
+        )
+
+
 def run_indexing(
     video: Path,
     video_id: Optional[str] = None,
@@ -199,6 +256,8 @@ def run_indexing(
     device: str = None,
     compute_type: str = None,
     batch_size: Optional[int] = None,
+    llm_analysis: bool = False,
+    llm_model: str | None = None,
 ) -> Iterator[str]:
     """Build a draft revision and switch the current publication only after CAS."""
     chunk_sec = chunk_sec if chunk_sec is not None else config.CHUNK_SEC
@@ -397,6 +456,14 @@ def run_indexing(
                 f"チャンク {len(chunk_ids)} 件を登録しました。"
             )
         yield from post_messages
+        if llm_analysis:
+            selected_model = (llm_model or config.LLM_ANALYSIS_MODEL).strip()
+            if not selected_model:
+                yield "  注意: LLM解析をスキップしました（Ollamaモデル名が空です）。"
+            else:
+                yield from _run_optional_llm_analysis(
+                    conn, video_id, revision, selected_model
+                )
     except PublicationError as exc:
         raise IndexError_(f"別のライブラリ更新処理が実行中です: {exc}") from exc
     finally:
@@ -420,6 +487,16 @@ def main():
         "--batch-size", type=int, default=None,
         help="バッチ推論のバッチサイズ。1で逐次(バッチ無効)。省略時は空きVRAMから自動決定",
     )
+    parser.add_argument(
+        "--llm-analysis",
+        action="store_true",
+        help="公開後の文字起こしをローカルOllamaで要約・タグ・章に解析する",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=config.LLM_ANALYSIS_MODEL,
+        help="LLM解析に使うローカルOllamaモデル名",
+    )
     args = parser.parse_args()
 
     try:
@@ -434,6 +511,8 @@ def main():
             device=args.device,
             compute_type=args.compute_type,
             batch_size=args.batch_size,
+            llm_analysis=args.llm_analysis,
+            llm_model=args.llm_model,
         ):
             print(msg)
     except IndexError_ as e:

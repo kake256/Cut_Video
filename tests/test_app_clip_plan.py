@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import pathlib
 import subprocess
@@ -8,6 +9,7 @@ import threading
 import time
 import unittest
 from types import SimpleNamespace
+from html.parser import HTMLParser
 from unittest.mock import patch
 
 # app builds its Gradio choices at import time.  Always isolate those reads and
@@ -24,10 +26,10 @@ from app import (
     _APP_CSS,
     _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS,
     _INTUITIVE_EDITOR_JS,
-    _INTUITIVE_INITIAL_VIDEO_IDS,
     _QUIT_JS,
     _clip_plan_exclusions,
     _clip_plan_ranges,
+    _intuitive_transcript_projection,
     _intuitive_preview_path,
     _multi_preview_path,
     _preview_path,
@@ -37,9 +39,10 @@ from app import (
     adjust_exclusion_time_with_step,
     always_refresh,
     build_video_gallery,
-    build_intuitive_video_gallery,
+    build_intuitive_video_cards,
     do_search,
     dispatch_intuitive_command,
+    do_intuitive_search_staged,
     handle_intuitive_command,
     exclude_clip_range,
     list_video_choices,
@@ -47,6 +50,7 @@ from app import (
     make_preview,
     intuitive_state_to_clip_plan,
     on_intuitive_search_select,
+    on_intuitive_search_marker,
     parse_video_choice,
     preview_intuitive_editor,
     preview_clip_plan,
@@ -59,11 +63,12 @@ from app import (
     render_intuitive_video_cards,
     render_intuitive_state_overview,
     render_intuitive_state_zoom,
+    render_intuitive_search_marker_projection,
     refresh_intuitive_video_picker,
     reset_clip_plan,
     reset_clip_plan_after_range_change,
     select_clip_exclusion,
-    select_intuitive_video_from_gallery,
+    select_intuitive_video_from_card,
     select_video_from_gallery,
     sync_exclusion_controls,
     selected_video_info,
@@ -117,6 +122,33 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual(pathlib.Path(overridden.stdout.strip()), isolated)
         self.assertFalse(isolated.exists())
+
+    def test_legacy_ui_requires_an_explicit_truthy_environment_flag(self):
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        command = [
+            sys.executable,
+            "-c",
+            "from moment_retrieval import config; print(config.ENABLE_LEGACY_UI)",
+        ]
+        clean_env = os.environ.copy()
+        clean_env.pop("CUT_VIDEO_ENABLE_LEGACY_UI", None)
+        disabled = subprocess.run(
+            command, cwd=repo_root, env=clean_env,
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(disabled.stdout.strip(), "False")
+
+        for value in ("1", "true", "YES", "on"):
+            with self.subTest(value=value):
+                enabled = subprocess.run(
+                    command,
+                    cwd=repo_root,
+                    env={**clean_env, "CUT_VIDEO_ENABLE_LEGACY_UI": value},
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(enabled.stdout.strip(), "True")
 
     @staticmethod
     def _intuitive_command(state, command_type, **values):
@@ -208,7 +240,7 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(detail, "video detail")
         self.assertEqual(gallery_update["selected_index"], 1)
 
-    def test_intuitive_video_gallery_excludes_all_and_filters_caption(self):
+    def test_intuitive_video_cards_exclude_all_and_filter_caption(self):
         class FakeConnection:
             def close(self):
                 pass
@@ -225,20 +257,50 @@ class ClipPlanTest(unittest.TestCase):
             patch("app._make_video_thumbnail", return_value="thumb.jpg") as thumbnail,
             patch("app._thumbnail_servable_url", return_value="thumb-url"),
         ):
-            gallery_update, ids, cards_html = build_intuitive_video_gallery(
-                "beta", "video-b"
-            )
+            cards_html = build_intuitive_video_cards("beta", "video-b")
 
-        self.assertEqual(ids, ["video-b"])
-        self.assertNotIn("__all_videos__", ids)
-        self.assertEqual(gallery_update["selected_index"], 0)
-        self.assertIn("beta.mp4", gallery_update["value"][0][1])
-        self.assertIn("00:01:30", gallery_update["value"][0][1])
+        self.assertNotIn("__all_videos__", cards_html)
         thumbnail.assert_called_once_with(videos[1])
         self.assertIn("beta.mp4", cards_html)
+        self.assertIn("00:01:30", cards_html)
+        self.assertIn('data-video-id="video-b"', cards_html)
+        self.assertIn("is-selected", cards_html)
         self.assertNotIn("alpha.mp4", cards_html)
         self.assertIn("索引あり", cards_html)
         self.assertNotIn("文字起こし済み", cards_html)
+
+    def test_initial_card_data_does_not_generate_uncached_thumbnails(self):
+        class FakeConnection:
+            def close(self):
+                pass
+
+        video = {
+            "video_id": "video-a",
+            "path": r"F:\videos\uncached.mp4",
+            "duration": 60.0,
+        }
+        missing_thumbnail = pathlib.Path(_TEST_DATA_DIR.name) / "missing-thumb.jpg"
+        with (
+            patch("app.db.get_conn", return_value=FakeConnection()),
+            patch("app.db.init_db"),
+            patch("app.db.list_videos", return_value=[video]),
+            patch("app.db.get_indexed_video_ids", return_value=set()),
+            patch("app._thumbnail_path", return_value=missing_thumbnail),
+            patch("app._make_video_thumbnail") as make_thumbnail,
+        ):
+            cards = app_module._intuitive_video_cards_data(
+                "", generate_thumbnails=False
+            )
+
+        make_thumbnail.assert_not_called()
+        self.assertEqual(cards[0]["thumbnail_path"], None)
+        source = pathlib.Path(app_module.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            '_INTUITIVE_INITIAL_CARDS = _intuitive_video_cards_data(\n'
+            '            "", generate_thumbnails=False\n'
+            '        )',
+            source,
+        )
 
     def test_render_intuitive_video_cards_shows_badges_only_when_judgable(self):
         cards = [
@@ -265,8 +327,8 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(rendered.count('class="intuitive-video-badge"'), 2)
         self.assertEqual(rendered.count("文字起こし済み"), 1)
         self.assertEqual(rendered.count("索引あり"), 1)
-        self.assertIn('data-index="0"', rendered)
-        self.assertIn('data-index="1"', rendered)
+        self.assertIn('data-video-id="dummy-1"', rendered)
+        self.assertIn('data-video-id="dummy-2"', rendered)
         self.assertIn(utils.format_timestamp(75.0), rendered)
 
     def test_render_intuitive_video_cards_escapes_name_and_marks_selection(self):
@@ -290,33 +352,34 @@ class ClipPlanTest(unittest.TestCase):
             "該当する動画がありません", render_intuitive_video_cards([])
         )
 
-    def test_intuitive_gallery_selection_loads_video_with_single_output_tuple(self):
-        event = gr.SelectData(None, {"index": 1, "value": None, "selected": True})
-        load_outputs = tuple(f"load-{index}" for index in range(10))
+    def test_intuitive_card_command_loads_video_with_single_output_tuple(self):
+        load_outputs = tuple(f"load-{index}" for index in range(11))
         with (
-            patch("app.load_intuitive_editor", return_value=load_outputs) as load,
             patch(
-                "app.build_intuitive_video_gallery",
-                return_value=(gr.update(), ["video-a", "video-b"], "<div>cards</div>"),
-            ) as build_gallery,
+                "app.load_intuitive_editor_with_search_target",
+                return_value=load_outputs,
+            ) as load,
+            patch(
+                "app.build_intuitive_video_cards",
+                return_value="<div>cards</div>",
+            ) as build_cards,
         ):
-            output = select_intuitive_video_from_gallery(
-                ["video-a", "video-b"], "", event
+            output = select_intuitive_video_from_card(
+                '{"video_id":"video-b","request_id":"card-1"}', "needle"
             )
 
-        self.assertEqual(len(output), 14)
-        self.assertEqual(output[0]["selected_index"], 1)
-        self.assertEqual(output[1], "video-b")
-        self.assertEqual(output[2], "<div>cards</div>")
-        self.assertEqual(output[3:13], load_outputs)
-        self.assertEqual(output[13]["value"], "video-b")
+        self.assertEqual(len(output), 13)
+        self.assertEqual(output[0], "video-b")
+        self.assertEqual(output[1], "<div>cards</div>")
+        self.assertEqual(output[2:], load_outputs)
         load.assert_called_once_with("video-b")
-        build_gallery.assert_called_once_with("", "video-b")
+        build_cards.assert_called_once_with(
+            "needle", "video-b", generate_thumbnails=False
+        )
 
-        with self.assertRaises(gr.Error):
-            select_intuitive_video_from_gallery(["__all_videos__"], "", gr.SelectData(
-                None, {"index": 0, "value": None, "selected": True}
-            ))
+        for invalid in ("", "not-json", '{"video_id":"__all_videos__"}'):
+            with self.subTest(invalid=invalid), self.assertRaises(gr.Error):
+                select_intuitive_video_from_card(invalid, "")
 
     def test_intuitive_load_wrapper_synchronizes_search_target_after_success(self):
         load_outputs = tuple(f"load-{index}" for index in range(10))
@@ -330,29 +393,31 @@ class ClipPlanTest(unittest.TestCase):
         load.assert_called_once_with("video-a")
 
     def test_intuitive_picker_refresh_keeps_all_only_in_search_target(self):
-        gallery = gr.update(
-            value=[("thumb.jpg", "sample.mp4\n00:01:00")], selected_index=0
-        )
-        with patch(
-            "app.build_intuitive_video_gallery",
-            return_value=(gallery, ["video-a"], "<div>cards</div>"),
+        cards = [{
+            "video_id": "video-a", "name": "sample.mp4", "duration": 60.0,
+            "thumbnail_path": "thumb.jpg", "asr_complete": True,
+            "indexed": False,
+        }]
+        with (
+            patch("app._intuitive_video_cards_data", return_value=cards),
+            patch("app._thumbnail_servable_url", return_value="thumb-url"),
         ):
             output = refresh_intuitive_video_picker("sample", "video-a")
 
-        self.assertEqual(output[2], "<div>cards</div>")
-        fallback_choices = output[3]["choices"]
-        search_choices = output[4]["choices"]
-        self.assertEqual(fallback_choices, [("sample.mp4  —  00:01:00", "video-a")])
+        self.assertIn('data-video-id="video-a"', output[0])
+        self.assertIn("is-selected", output[0])
+        fallback_choices = output[1]["choices"]
+        search_choices = output[2]["choices"]
+        self.assertEqual(
+            fallback_choices,
+            [(f"sample.mp4  —  {utils.format_timestamp(60.0)}", "video-a")],
+        )
         self.assertEqual(search_choices[0], ("すべての動画", "__all_videos__"))
         self.assertEqual(search_choices[1:], fallback_choices)
 
     def test_intuitive_picker_refresh_preserves_explicit_search_target(self):
-        gallery = gr.update(value=[], selected_index=None)
         with (
-            patch(
-                "app.build_intuitive_video_gallery",
-                return_value=(gallery, [], "<div>empty filter</div>"),
-            ),
+            patch("app._intuitive_video_cards_data", return_value=[]),
             patch(
                 "app.list_video_choices",
                 return_value=[
@@ -365,7 +430,8 @@ class ClipPlanTest(unittest.TestCase):
                 "no-match", "video-a", "video-kept"
             )
 
-        search_update = output[4]
+        self.assertIn("該当する動画がありません", output[0])
+        search_update = output[2]
         self.assertEqual(search_update["value"], "video-kept")
         self.assertIn(
             ("kept.mp4  —  00:01:00", "video-kept"),
@@ -654,6 +720,116 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn('data-overall-start="20.000"', zoom)
         self.assertIn('data-overall-end="30.000"', zoom)
         self.assertIn("全体範囲内をドラッグ", zoom)
+
+    def test_server_transcript_classes_match_browser_projection_rules(self):
+        """Full HTML and the small JS projection must decorate every word alike."""
+        decoration_classes = {
+            "is-selected-word",
+            "is-outside-overall",
+            "is-excluded-word",
+            "marks-overall-start",
+            "marks-overall-end",
+            "marks-pending-cut",
+            "marks-exclusion-start",
+            "marks-exclusion-end",
+        }
+
+        class WordClassParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.words = []
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                classes = set(attributes.get("class", "").split())
+                if tag != "span" or "intuitive-word" not in classes:
+                    return
+                self.words.append((
+                    float(attributes["data-start"]),
+                    float(attributes["data-end"]),
+                    classes & decoration_classes,
+                ))
+
+        state = self._intuitive_state()
+        state.update({
+            # This sub-millisecond edge used to disagree: the server compared
+            # the raw ASR value while JS compared the 3-decimal DOM value.
+            "overall_start": 20.1002,
+            "overall_end": 27.0,
+            "selected_word": {"start": 22.0, "end": 23.0},
+            "pending_cut_start": 25.2,
+            "exclusions": [{"id": "cut-1", "start": 24.2, "end": 26.4}],
+        })
+        words = [
+            {"word": "before", "start": 19.0, "end": 20.0},
+            {"word": "rounded-edge", "start": 20.0004, "end": 20.1004},
+            {"word": "overall-start", "start": 20.1, "end": 21.0},
+            {"word": "selected", "start": 22.0, "end": 23.0},
+            {"word": "cut-start", "start": 24.0, "end": 25.0},
+            {"word": "pending", "start": 25.0, "end": 26.0},
+            {"word": "cut-and-overall-end", "start": 26.0, "end": 27.0},
+            {"word": "after", "start": 27.0, "end": 28.0},
+        ]
+        rendered = render_intuitive_transcript([{
+            "start_sec": 19.0,
+            "end_sec": 28.0,
+            "text": "",
+            "words_json": json.dumps(words),
+        }], state)
+        parser = WordClassParser()
+        parser.feed(rendered)
+
+        projection = json.loads(_intuitive_transcript_projection(state))
+        exclusions = [tuple(map(float, item)) for item in projection["exclusions"]]
+        selected = projection["selected_word"]
+        pending = projection["pending_cut_start"]
+
+        def contains_start(start, end, value):
+            return (
+                value is not None
+                and (start <= value < end or (
+                    start == end and abs(value - start) < 0.002
+                ))
+            )
+
+        def contains_end(start, end, value):
+            return (
+                value is not None
+                and (start < value <= end or (
+                    start == end and abs(value - start) < 0.002
+                ))
+            )
+
+        projected = []
+        for start, end, _server_classes in parser.words:
+            classes = set()
+            if (
+                selected
+                and abs(float(selected[0]) - start) < 0.002
+                and abs(float(selected[1]) - end) < 0.002
+            ):
+                classes.add("is-selected-word")
+            if end <= projection["overall_start"] or start >= projection["overall_end"]:
+                classes.add("is-outside-overall")
+            if any(end > cut_start and start < cut_end for cut_start, cut_end in exclusions):
+                classes.add("is-excluded-word")
+            if contains_start(start, end, projection["overall_start"]):
+                classes.add("marks-overall-start")
+            if contains_end(start, end, projection["overall_end"]):
+                classes.add("marks-overall-end")
+            if contains_start(start, end, pending):
+                classes.add("marks-pending-cut")
+            if any(contains_start(start, end, cut_start) for cut_start, _ in exclusions):
+                classes.add("marks-exclusion-start")
+            if any(contains_end(start, end, cut_end) for _, cut_end in exclusions):
+                classes.add("marks-exclusion-end")
+            projected.append((start, end, classes))
+
+        self.assertEqual(parser.words, projected)
+        self.assertEqual(
+            set().union(*(classes for _, _, classes in projected)),
+            decoration_classes,
+        )
 
     def test_intuitive_reducer_word_tools_adjustment_and_plan(self):
         state = self._intuitive_state()
@@ -1312,15 +1488,44 @@ class ClipPlanTest(unittest.TestCase):
             "revision": state["revision"], "nonce": state["nonce"],
         }
         with (
-            patch("app._render_intuitive_transcript_for_state", return_value="transcript"),
+            patch(
+                "app._render_intuitive_transcript_for_state",
+                return_value="transcript",
+            ) as transcript_renderer,
             patch("app.make_intuitive_preview") as preview,
         ):
             output = handle_intuitive_command(command, state)
 
         preview.assert_not_called()
+        transcript_renderer.assert_not_called()
+        self.assertEqual(output[5], {"__type__": "update"})
         self.assertEqual(output[0]["exclusions"], [])
         self.assertIn("途中カット</strong> 0箇所 / 0.0秒", output[7])
         self.assertIn("途中カット一覧（0箇所）", output[8])
+
+    def test_boundary_command_updates_projection_without_rerendering_words(self):
+        state = self._intuitive_state()
+        command = {
+            "type": "set_boundary",
+            "kind": "overall_start",
+            "time": 20.0,
+            "revision": state["revision"],
+            "nonce": state["nonce"],
+        }
+        with (
+            patch("app._render_intuitive_transcript_for_state") as renderer,
+            patch("app.make_intuitive_preview") as preview,
+        ):
+            output = handle_intuitive_command(command, state)
+
+        renderer.assert_not_called()
+        preview.assert_not_called()
+        self.assertEqual(output[5], {"__type__": "update"})
+        self.assertEqual(output[0]["overall_start"], 20.0)
+        self.assertIn(
+            "&quot;overall_start&quot;:20.0",
+            output[1],
+        )
 
     def test_intuitive_current_position_and_direct_time_use_existing_constraints(self):
         unarmed = self._intuitive_state()
@@ -1416,7 +1621,7 @@ class ClipPlanTest(unittest.TestCase):
 
         self.assertIn('data-active-tool="overall_end"', toolbar)
         self.assertIn('data-edit-dirty="false"', toolbar)
-        self.assertIn("2. 文字起こし編集", toolbar)
+        self.assertIn("3. 文字起こし編集", toolbar)
         self.assertNotIn('data-intuitive-preview-action', toolbar)
         self.assertIn("intuitive-timeline-toolbox", zoom)
         self.assertIn("共通境界ツール", zoom)
@@ -1440,6 +1645,7 @@ class ClipPlanTest(unittest.TestCase):
         state = self._intuitive_state()
         toolbar = render_intuitive_toolbar(state)
         self.assertIn('intuitive-selected-boundary-chip is-empty">未選択', toolbar)
+        self.assertIn('data-selected-boundary-kind=""', toolbar)
 
         state = self._intuitive_command(state, "set_tool", tool="overall_start")
         state = self._intuitive_command(
@@ -1447,8 +1653,29 @@ class ClipPlanTest(unittest.TestCase):
         )
         toolbar = render_intuitive_toolbar(state)
         self.assertIn("intuitive-selected-boundary-chip\">選択中: 全体開始", toolbar)
+        self.assertIn('data-selected-boundary-kind="overall_start"', toolbar)
         self.assertIn("00:00:20", toolbar)
         self.assertNotIn("is-empty", toolbar)
+
+    def test_toolbar_carries_a_small_transcript_decoration_projection(self):
+        state = self._intuitive_state()
+        state["exclusions"] = [
+            {"id": "cut-1", "start": 20.0, "end": 25.0},
+        ]
+        state["pending_cut_start"] = 30.0
+        state["selected_word"] = {"start": 40.0, "end": 41.0}
+
+        toolbar = render_intuitive_toolbar(state)
+
+        self.assertIn("data-transcript-projection=", toolbar)
+        for fragment in (
+            "&quot;overall_start&quot;:10.0",
+            "&quot;overall_end&quot;:100.0",
+            "&quot;exclusions&quot;:[[20.0,25.0]]",
+            "&quot;pending_cut_start&quot;:30.0",
+            "&quot;selected_word&quot;:[40.0,41.0]",
+        ):
+            self.assertIn(fragment, toolbar)
 
     def test_intuitive_tools_can_be_repeated_without_stale_selection(self):
         state = self._intuitive_state()
@@ -1826,7 +2053,7 @@ class ClipPlanTest(unittest.TestCase):
         assert_overview_matches_zoom(state)
         self.assertEqual(state["viewport_end"], 1000.0)
 
-    def test_transcript_focus_is_short_and_clamped_to_zoom_viewport(self):
+    def test_transcript_bounds_match_zoom_viewport(self):
         state = _new_intuitive_state(
             {
                 "video_id": "video-1",
@@ -1841,21 +2068,28 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             (state["transcript_start"], state["transcript_end"]),
-            (0.0, 90.0),
+            (0.0, 600.0),
         )
 
+        # The legacy focus command may continue to move the playhead, but it
+        # must not narrow the transcript independently of the visible range.
         state = self._intuitive_command(
             state, "set_transcript_focus", time=480.0
         )
         self.assertEqual(state["transcript_focus_sec"], 480.0)
         self.assertEqual(
             (state["transcript_start"], state["transcript_end"]),
-            (435.0, 525.0),
+            (0.0, 600.0),
         )
         transcript = render_intuitive_transcript([], state)
         self.assertIn("表示中:", transcript)
-        self.assertIn("00:07:15", transcript)
-        self.assertIn("00:08:45", transcript)
+        self.assertIn("00:00:00", transcript)
+        self.assertIn("00:10:00", transcript)
+        toolbar = render_intuitive_toolbar(state)
+        self.assertIn('data-transcript-start="0.000"', toolbar)
+        self.assertIn('data-transcript-end="600.000"', toolbar)
+        self.assertIn('data-viewport-start="0.000"', toolbar)
+        self.assertIn('data-viewport-end="600.000"', toolbar)
         zoom = render_intuitive_state_zoom(state)
         self.assertIn("intuitive-transcript-window", zoom)
         self.assertIn("文字起こし表示:", zoom)
@@ -1866,34 +2100,17 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual(boundary_state["playhead_sec"], 480.0)
 
-        # Moving the zoom viewport away clamps the focus and its query interval.
+        # Moving the zoom viewport moves the transcript interval with it.
         state = self._intuitive_command(
             state, "set_viewport", start=700.0, end=900.0
         )
         self.assertEqual(state["transcript_focus_sec"], 700.0)
         self.assertEqual(
             (state["transcript_start"], state["transcript_end"]),
-            (700.0, 790.0),
+            (700.0, 900.0),
         )
 
-    def test_transcript_focus_refresh_does_not_regenerate_video_preview(self):
-        calls = []
-
-        class FakeCursor:
-            def fetchall(self):
-                return [{
-                    "start_sec": 435.0, "end_sec": 436.0,
-                    "text": "focused", "words_json": None,
-                }]
-
-        class FakeConnection:
-            def execute(self, _sql, params):
-                calls.append(params)
-                return FakeCursor()
-
-            def close(self):
-                pass
-
+    def test_transcript_focus_keeps_viewport_and_existing_transcript_dom(self):
         state = _new_intuitive_state(
             {
                 "video_id": "video-1",
@@ -1911,14 +2128,18 @@ class ClipPlanTest(unittest.TestCase):
             "revision": state["revision"], "nonce": state["nonce"],
         }
         with (
-            patch("app.db.get_conn", return_value=FakeConnection()),
+            patch("app.db.get_conn") as get_conn,
             patch("app.make_intuitive_preview") as preview,
         ):
             output = handle_intuitive_command(command, state)
 
         preview.assert_not_called()
-        self.assertEqual(calls, [("video-1", 435.0, 525.0)])
-        self.assertIn("focused", output[5])
+        get_conn.assert_not_called()
+        self.assertEqual(output[5], {"__type__": "update"})
+        self.assertEqual(
+            (output[0]["transcript_start"], output[0]["transcript_end"]),
+            (0.0, 600.0),
+        )
         self.assertEqual(output[0]["preview_start"], 0.0)
         self.assertEqual(output[0]["preview_end"], 90.0)
 
@@ -1977,6 +2198,13 @@ class ClipPlanTest(unittest.TestCase):
         }
         with (
             patch("app.db.get_conn", return_value=FakeConnection()),
+            patch(
+                "app.db.get_segments_in_range",
+                return_value=[{
+                    "start_sec": 120.0, "end_sec": 121.0,
+                    "text": "refreshed", "words_json": None,
+                }],
+            ),
             patch("app.make_intuitive_preview", return_value="viewport.mp4") as preview,
         ):
             output = handle_intuitive_command(command, state)
@@ -2009,6 +2237,13 @@ class ClipPlanTest(unittest.TestCase):
         with (
             patch("app.db.get_conn", return_value=FakeConnection()),
             patch("app.db.get_video", return_value=video),
+            patch(
+                "app.db.get_segments_in_range",
+                return_value=[{
+                    "start_sec": 20.0, "end_sec": 21.0,
+                    "text": "hit", "words_json": None,
+                }],
+            ),
             patch("app.expand_to_speech_boundary", return_value=(20.0, 30.0)),
             patch("app.make_intuitive_preview", return_value="search.mp4"),
         ):
@@ -2064,6 +2299,7 @@ class ClipPlanTest(unittest.TestCase):
         with (
             patch("app.db.get_conn", return_value=FakeConnection()),
             patch("app.db.get_video", return_value=video),
+            patch("app.db.get_segments_in_range", return_value=[]),
             patch("app.expand_to_speech_boundary", return_value=(-2.0, 205.0)),
             patch("app.make_intuitive_preview", return_value="search.mp4"),
         ):
@@ -2074,6 +2310,182 @@ class ClipPlanTest(unittest.TestCase):
             (output[0]["overall_start"], output[0]["overall_end"]),
             (0.0, 200.0),
         )
+
+    def test_search_marker_projection_uses_request_hit_and_shape_contract(self):
+        class ProjectionParser(HTMLParser):
+            value = None
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if "data-intuitive-search-marker-projection" in attributes:
+                    self.value = attributes.get("data-search-markers")
+
+        search_view = {
+            "request_id": 'request-<&"',
+            "results": [
+                {
+                    "hit_id": "text-hit", "video_id": "public-video-1",
+                    "match_type": "文字一致", "start": 10.0, "end": 14.0,
+                    "evidence_start": 11.0, "evidence_end": 13.0,
+                    "text": "<b>一致</b>",
+                },
+                {
+                    "hit_id": "semantic-hit", "video_id": "public-video-2",
+                    "match_type": "意味検索", "start": 20.0, "end": 24.0,
+                    "text": "意味候補",
+                },
+            ],
+        }
+        rendered = render_intuitive_search_marker_projection(search_view)
+        parser = ProjectionParser()
+        parser.feed(rendered)
+        projection = json.loads(parser.value)
+
+        self.assertEqual(projection["request_id"], 'request-<&"')
+        self.assertEqual(
+            [(hit["hit_id"], hit["kind"]) for hit in projection["hits"]],
+            [("text-hit", "text"), ("semantic-hit", "semantic")],
+        )
+        self.assertEqual(projection["hits"][0]["position"], 12.0)
+        self.assertEqual(projection["hits"][1]["position"], 22.0)
+        self.assertNotIn("<b>", rendered)
+
+        state = self._intuitive_state()
+        state["public_video_id"] = "public-video-1"
+        overview = render_intuitive_state_overview(state)
+        self.assertIn('data-public-video-id="public-video-1"', overview)
+        self.assertIn("data-intuitive-search-marker-layer", overview)
+        self.assertIn("data-intuitive-search-marker-legend", overview)
+        self.assertIn('<i class="text"', overview)
+        self.assertIn('<i class="semantic"', overview)
+
+    def test_staged_search_publishes_request_scoped_markers_without_editor_outputs(self):
+        text_result = {
+            "hit_id": "text-hit", "video_id": "public-video-1",
+            "match_type": "文字一致", "start": 1.0, "end": 2.0,
+            "text": "text hit", "score": None,
+        }
+        semantic_result = {
+            "hit_id": "semantic-hit", "video_id": "public-video-1",
+            "match_type": "意味検索", "start": 3.0, "end": 4.0,
+            "text": "semantic hit", "score": 0.8,
+        }
+        stages = [
+            SimpleNamespace(
+                request_id="request-new", hits=("text",),
+                text_hits=("text",), semantic_hits=(), semantic_status=None,
+                complete=False, publication_changed=False,
+            ),
+            SimpleNamespace(
+                request_id="request-new", hits=("text", "semantic"),
+                text_hits=("text",), semantic_hits=("semantic",), semantic_status=None,
+                complete=True, publication_changed=False,
+            ),
+        ]
+        with (
+            patch.object(
+                app_module._intuitive_search_coordinator,
+                "search", return_value=iter(stages),
+            ),
+            patch(
+                "app._decorate_staged_search_results",
+                side_effect=[[text_result], [text_result, semantic_result]],
+            ),
+        ):
+            outputs = list(do_intuitive_search_staged(
+                "query", "public-video-1", 5, 0.55,
+                request=SimpleNamespace(session_hash="session-1"),
+            ))
+
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(len(output) == 4 for output in outputs))
+        self.assertEqual(outputs[0][1]["request_id"], "request-new")
+        self.assertEqual(outputs[1][1]["request_id"], "request-new")
+        self.assertEqual(
+            [result["hit_id"] for result in outputs[1][1]["results"]],
+            ["text-hit", "semantic-hit"],
+        )
+        self.assertIn("text-hit", outputs[0][3])
+        self.assertIn("semantic-hit", outputs[1][3])
+        # These four outputs are search adapter view only. Canonical editor
+        # state, viewport and EditPlan are intentionally not callback outputs.
+        self.assertNotIn("overall_start", json.dumps(outputs, ensure_ascii=False))
+
+    def test_marker_and_result_row_share_selection_path_and_reject_stale_request(self):
+        search_view = {
+            "request_id": "request-current",
+            "results": [
+                {"hit_id": "hit-1"},
+                {"hit_id": "hit-2"},
+            ],
+        }
+        request = SimpleNamespace(session_hash="session-1")
+        with (
+            patch.object(
+                app_module._intuitive_search_coordinator.registry,
+                "is_current", return_value=True,
+            ),
+            patch(
+                "app._select_intuitive_search_result",
+                return_value=("selected",),
+            ) as select,
+        ):
+            marker_output = on_intuitive_search_marker(
+                json.dumps({
+                    "request_id": "request-current", "hit_id": "hit-2",
+                }),
+                search_view,
+                request=request,
+            )
+            row_output = on_intuitive_search_select(
+                search_view, SimpleNamespace(index=(1, 0))
+            )
+
+        self.assertEqual(marker_output, ("selected",))
+        self.assertEqual(row_output, ("selected",))
+        self.assertEqual([call.args[0] for call in select.call_args_list], [1, 1])
+
+        with (
+            patch.object(
+                app_module._intuitive_search_coordinator.registry,
+                "is_current", return_value=False,
+            ),
+            patch("app._select_intuitive_search_result") as select,
+        ):
+            with self.assertRaises(gr.Error):
+                on_intuitive_search_marker(
+                    json.dumps({
+                        "request_id": "request-current", "hit_id": "hit-1",
+                    }),
+                    search_view,
+                    request=request,
+                )
+            select.assert_not_called()
+
+    def test_search_marker_client_contract_filters_current_video_and_invalidates_old_query(self):
+        for contract in (
+            "data-intuitive-search-marker-layer",
+            "overview.dataset.publicVideoId",
+            "String(hit.video_id || '') === videoId",
+            "blockedSearchMarkerRequestId",
+            "rejectedSearchMarkerRequestIds",
+            "rejectedSearchMarkerRequestIds.size > 32",
+            "rejectedSearchMarkerRequestIds.has(requestId)",
+            "blockCurrentSearchMarkers()",
+            "const searchResultIndex = (row) =>",
+            "syncSearchResultSelection(projection)",
+            "match(/[○●]\\s*(\\d+)/)",
+            "marker.dataset.requestId",
+            "marker.dataset.hitId",
+            "#intuitive-search-marker-command",
+            "#intuitive-search-marker-submit",
+            "new MutationObserver(scheduleSearchMarkerSync)",
+        ):
+            self.assertIn(contract, _INTUITIVE_EDITOR_JS)
+        self.assertIn('.intuitive-search-marker[data-marker-kind="text"]::before', _APP_CSS)
+        self.assertIn('.intuitive-search-marker[data-marker-kind="semantic"]::before', _APP_CSS)
+        self.assertIn(".intuitive-search-marker:focus-visible", _APP_CSS)
+        self.assertIn("#intuitive-search-marker-projection", _APP_CSS)
 
     def test_intuitive_preview_and_save_use_canonical_plan(self):
         state = self._intuitive_state()
@@ -2160,6 +2572,7 @@ class ClipPlanTest(unittest.TestCase):
         state["preview_mode"] = "result"
         with (
             patch("app.db.get_conn", return_value=FakeConnection()),
+            patch("app.db.get_segments_in_range", return_value=[]),
             patch("app.make_intuitive_preview", return_value="source.mp4"),
         ):
             output = return_intuitive_source(state)
@@ -2200,6 +2613,7 @@ class ClipPlanTest(unittest.TestCase):
             }
             with (
                 patch("app.db.get_conn", return_value=FakeConnection()),
+                patch("app.db.get_segments_in_range", return_value=[]),
                 patch("app.make_intuitive_preview", return_value="source.mp4"),
             ):
                 return handle_intuitive_command(command, current)
@@ -2928,22 +3342,23 @@ class ClipPlanTest(unittest.TestCase):
                 f"app.py line {lineno} starts with a stray backslash: {line!r}",
             )
 
-    def test_intuitive_editor_is_a_connected_top_level_prototype(self):
+    def test_intuitive_editor_is_the_connected_default_top_level_editor(self):
         config = demo.get_config_file()
         components = config["components"]
 
-        prototype_tabs = [
+        editor_tabs = [
             component
             for component in components
             if component.get("type") == "tabitem"
-            and component.get("props", {}).get("label") == "直感編集（試作）"
+            and component.get("props", {}).get("label") == "検索・編集・切り抜き"
         ]
-        self.assertEqual(len(prototype_tabs), 1)
-        prototype_tab = prototype_tabs[0]
+        self.assertEqual(len(editor_tabs), 1)
+        editor_tab = editor_tabs[0]
         self.assertEqual(
-            prototype_tab["props"].get("elem_id"),
-            "intuitive-editor-prototype-tab",
+            editor_tab["props"].get("elem_id"),
+            "intuitive-editor-tab",
         )
+        self.assertEqual(editor_tab["props"].get("id"), "intuitive-main")
 
         top_level_tabs = next(
             component
@@ -2957,7 +3372,27 @@ class ClipPlanTest(unittest.TestCase):
             if child["id"] == top_level_tabs["id"]
         )
         self.assertIn(
-            prototype_tab["id"],
+            editor_tab["id"],
+            [child["id"] for child in top_level_layout["children"]],
+        )
+        self.assertEqual(
+            top_level_tabs.get("props", {}).get("selected"),
+            "intuitive-main",
+        )
+        # Gradio 6.19 leaves a permanent loading overlay for render=False
+        # tabs. Keep the legacy subtree rendered but hidden by default, while
+        # explicitly selecting the main editor.
+        legacy_tabs = [
+            component
+            for component in components
+            if component.get("type") == "tabitem"
+            and component.get("props", {}).get("label")
+            == "従来版（検索・切り抜き）"
+        ]
+        self.assertEqual(len(legacy_tabs), 1)
+        self.assertFalse(legacy_tabs[0]["props"].get("visible"))
+        self.assertIn(
+            legacy_tabs[0]["id"],
             [child["id"] for child in top_level_layout["children"]],
         )
 
@@ -2965,6 +3400,8 @@ class ClipPlanTest(unittest.TestCase):
             component.get("props", {}).get("elem_id")
             for component in components
         }
+        self.assertNotIn("intuitive-overall-range-guide", elem_ids)
+        self.assertNotIn("intuitive-detail-edit-guide", elem_ids)
         self.assertTrue({
             "intuitive-preview-video",
             "intuitive-video-select",
@@ -2974,6 +3411,7 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-transcript-panel",
             "intuitive-transcript-words",
             "intuitive-adjust-step",
+            "intuitive-overall-adjust-controls",
             "intuitive-overview-timeline",
             "intuitive-zoom-timeline",
             "intuitive-toolbox",
@@ -3020,8 +3458,8 @@ class ClipPlanTest(unittest.TestCase):
             [child["id"] for child in workspace["children"]],
             [
                 components_by_elem_id["intuitive-preview-panel"]["id"],
-                components_by_elem_id["intuitive-transcript-panel"]["id"],
                 components_by_elem_id["intuitive-search-panel"]["id"],
+                components_by_elem_id["intuitive-transcript-panel"]["id"],
             ],
         )
 
@@ -3050,6 +3488,10 @@ class ClipPlanTest(unittest.TestCase):
             self.assertIn(components_by_elem_id[elem_id]["id"], detail_descendants)
         self.assertIn(
             components_by_elem_id["intuitive-overall-range-actions"]["id"],
+            overall_descendants,
+        )
+        self.assertIn(
+            components_by_elem_id["intuitive-overall-adjust-controls"]["id"],
             overall_descendants,
         )
         tab_ids = {overall_tab["id"], detail_tab["id"]}
@@ -3127,6 +3569,10 @@ class ClipPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             components_by_elem_id["intuitive-transcript-panel"]["props"].get("min_width"),
+            280,
+        )
+        self.assertEqual(
+            components_by_elem_id["intuitive-search-panel"]["props"].get("min_width"),
             400,
         )
         self.assertEqual(
@@ -3200,10 +3646,18 @@ class ClipPlanTest(unittest.TestCase):
             _APP_CSS,
         )
         self.assertIn(
-            "#intuitive-transcript-panel { order: 2; min-width: 40% !important; }",
+            "#intuitive-search-panel { order: 2; min-width: 40% !important; }",
             _APP_CSS,
         )
-        self.assertIn("order: 3;", _APP_CSS)
+        responsive_css = _APP_CSS.split("@media (max-width: 1180px)", 1)[1].split(
+            "@media (max-width: 760px)", 1
+        )[0]
+        self.assertIn("#intuitive-transcript-panel {", responsive_css)
+        transcript_rule = responsive_css.split(
+            "#intuitive-transcript-panel {", 1
+        )[1].split("}", 1)[0]
+        self.assertIn("order: 3;", transcript_rule)
+        self.assertIn("min-width: 100% !important;", transcript_rule)
         # A-1 regression: 前へ/後ろへ must look disabled (not just fail
         # server-side) once no boundary is selected, matching apply-time's
         # existing visual-disable convention -- otherwise the button looks
@@ -3316,7 +3770,7 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("event.pointerId !== drag.pointerId", _INTUITIVE_EDITOR_JS)
         self.assertIn("drag.distance = Math.abs(event.clientX - drag.startX)", _INTUITIVE_EDITOR_JS)
         self.assertIn("drag.overallStart", _INTUITIVE_EDITOR_JS)
-        self.assertIn("seekZoom(drag.root, event)", _INTUITIVE_EDITOR_JS)
+        self.assertIn("seekZoom(finishedDrag.root, event)", _INTUITIVE_EDITOR_JS)
         playhead_helper = _INTUITIVE_EDITOR_JS.split(
             "const updateZoomPlayhead = (zoom, absolute) =>", 1
         )[1].split("const scheduleZoomPlayhead =", 1)[0]
@@ -3364,6 +3818,13 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("queued.nonce !== meta.nonce", _INTUITIVE_EDITOR_JS)
         self.assertIn("#intuitive-adjust-step input:checked", _INTUITIVE_EDITOR_JS)
         self.assertIn("type: 'adjust_selected'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("data-intuitive-select-overall-boundary", _INTUITIVE_EDITOR_JS)
+        self.assertIn("[data-intuitive-overall-step]:checked", _INTUITIVE_EDITOR_JS)
+        self.assertIn(
+            "selectedBoundaryKind: root.dataset.selectedBoundaryKind",
+            _INTUITIVE_EDITOR_JS,
+        )
+        self.assertIn("installOverallControlsObserver", _INTUITIVE_EDITOR_JS)
         self.assertIn("updateViewportDrag(drag, event)", _INTUITIVE_EDITOR_JS)
         self.assertIn("root.dataset.viewportMaxSpan", _INTUITIVE_EDITOR_JS)
         self.assertIn("data-viewport-summary", _INTUITIVE_EDITOR_JS)
@@ -3394,18 +3855,20 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIn("isSearchResultSelection", _INTUITIVE_EDITOR_JS)
         self.assertEqual(_INTUITIVE_EDITOR_JS.count("window.confirm("), 1)
         self.assertEqual(
-            _INTUITIVE_EDITOR_JS.count("stopDirtySessionReplacement(event)"), 4
+            _INTUITIVE_EDITOR_JS.count("stopDirtySessionReplacement(event)"), 3
         )
         for replacement_selector in (
-            "#intuitive-video-gallery",
+            "#intuitive-video-card-grid .intuitive-video-card",
             "#intuitive-load-video",
-            "#intuitive-search-button",
-            "#intuitive-search-query",
+            ".intuitive-search-marker",
             "#intuitive-search-results .body-cell",
             "#intuitive-search-results td",
             '#intuitive-search-results [role="gridcell"]',
         ):
             self.assertIn(replacement_selector, _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-search-button", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-search-query", _INTUITIVE_EDITOR_JS)
+        self.assertIn(") blockCurrentSearchMarkers();", _INTUITIVE_EDITOR_JS)
         self.assertIn("commandBusy || commandQueue.length > 0", _INTUITIVE_EDITOR_JS)
         self.assertIn("commandQueue.length = 0", _INTUITIVE_EDITOR_JS)
         missing_bridge_branch = _INTUITIVE_EDITOR_JS.split(
@@ -3457,6 +3920,16 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(keyboard_branch.count("type: 'set_boundary'"), 1)
         self.assertEqual(keyboard_branch.count("type: 'set_viewport'"), 1)
         self.assertIn("currentAdjustmentStep()", keyboard_branch)
+        self.assertEqual(
+            keyboard_branch.count(
+                "['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)"
+            ),
+            2,
+        )
+        self.assertIn(
+            "event.key === 'Home' ? 'aria-valuemin' : 'aria-valuemax'",
+            keyboard_branch,
+        )
         self.assertIn(
             "new Set(['Enter', ' ', 'ArrowDown', 'ArrowUp'])",
             _INTUITIVE_EDITOR_JS,
@@ -3469,8 +3942,28 @@ class ClipPlanTest(unittest.TestCase):
             "event.key === 'Enter'\n      && event.target.closest('#intuitive-search-query')",
             _INTUITIVE_EDITOR_JS,
         )
-        self.assertIn("#intuitive-video-gallery", _INTUITIVE_EDITOR_JS)
+        self.assertNotIn("#intuitive-video-gallery", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-video-card-command", _INTUITIVE_EDITOR_JS)
+        self.assertIn("#intuitive-video-card-submit", _INTUITIVE_EDITOR_JS)
+        self.assertIn("card.dataset.videoId", _INTUITIVE_EDITOR_JS)
+        self.assertIn("request_id", _INTUITIVE_EDITOR_JS)
+        self.assertIn("dispatchEvent(new InputEvent('input'", _INTUITIVE_EDITOR_JS)
+        self.assertIn("requestAnimationFrame(() => submit.click())", _INTUITIVE_EDITOR_JS)
         self.assertIn("openIntuitivePicker()", _INTUITIVE_EDITOR_JS)
+        self.assertIn("const syncTranscriptDecorations = (meta) =>", _INTUITIVE_EDITOR_JS)
+        self.assertIn("root.dataset.transcriptProjection", _INTUITIVE_EDITOR_JS)
+        self.assertIn("syncTranscriptDecorations(current)", _INTUITIVE_EDITOR_JS)
+        for decoration in (
+            "is-selected-word",
+            "is-outside-overall",
+            "is-excluded-word",
+            "marks-overall-start",
+            "marks-overall-end",
+            "marks-pending-cut",
+            "marks-exclusion-start",
+            "marks-exclusion-end",
+        ):
+            self.assertIn(decoration, _INTUITIVE_EDITOR_JS)
         self.assertIn("#intuitive-video-select", _INTUITIVE_EDITOR_JS)
         self.assertIn("intuitive-video-picker", _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
         self.assertIn("button.click()", _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
@@ -3514,23 +4007,37 @@ class ClipPlanTest(unittest.TestCase):
             "intuitive-apply-current",
             "intuitive-folder-browse",
             "intuitive-video-picker",
-            "intuitive-video-gallery",
+            "intuitive-video-card-command",
+            "intuitive-video-card-submit",
             "intuitive-video-filter",
             "intuitive-video-filter-button",
             "intuitive-reload-videos",
             "intuitive-reselect-video",
         ):
             self.assertIn(elem_id, components_by_elem_id)
-        gallery_id = components_by_elem_id["intuitive-video-gallery"]["id"]
-        gallery_select = [
+        self.assertNotIn("intuitive-video-gallery", components_by_elem_id)
+        card_command_id = components_by_elem_id["intuitive-video-card-command"]["id"]
+        card_submit_id = components_by_elem_id["intuitive-video-card-submit"]["id"]
+        card_commands = [
             dependency for dependency in config["dependencies"]
-            if (gallery_id, "select") in dependency.get("targets", [])
+            if (card_submit_id, "click") in dependency.get("targets", [])
         ]
-        self.assertEqual(len(gallery_select), 1)
-        self.assertEqual(gallery_select[0].get("trigger_mode"), "always_last")
-        self.assertEqual(len(gallery_select[0].get("outputs", [])), 14)
+        self.assertEqual(len(card_commands), 1)
+        self.assertEqual(card_commands[0].get("trigger_mode"), "always_last")
+        self.assertEqual(len(card_commands[0].get("outputs", [])), 13)
+        self.assertEqual(card_commands[0].get("inputs", [])[:2], [
+            card_command_id,
+            components_by_elem_id["intuitive-video-filter"]["id"],
+        ])
         search_target_id = components_by_elem_id["intuitive-search-target"]["id"]
-        self.assertEqual(gallery_select[0]["outputs"][-1], search_target_id)
+        video_card_grid_id = components_by_elem_id[
+            "intuitive-video-card-grid"
+        ]["id"]
+        self.assertEqual(
+            card_commands[0]["outputs"][:2],
+            [video_select_id, video_card_grid_id],
+        )
+        self.assertEqual(card_commands[0]["outputs"][-1], search_target_id)
         for elem_id, event_name in (
             ("intuitive-load-video", "click"),
             ("intuitive-video-select", "input"),
@@ -3542,27 +4049,23 @@ class ClipPlanTest(unittest.TestCase):
             ]
             self.assertEqual(len(dependencies), 1)
             self.assertEqual(dependencies[0]["outputs"][-1], search_target_id)
-        initial_cards = components_by_elem_id["intuitive-video-gallery"]["props"].get(
-            "value"
-        ) or []
-        gallery_ids_state = next(
-            component for component in components
-            if component["id"] == gallery_select[0]["inputs"][0]
-        )
-        self.assertEqual(gallery_ids_state["type"], "state")
-        self.assertEqual(len(initial_cards), len(_INTUITIVE_INITIAL_VIDEO_IDS))
-        self.assertNotIn("__all_videos__", _INTUITIVE_INITIAL_VIDEO_IDS)
+        initial_cards = components_by_elem_id[
+            "intuitive-video-card-grid"
+        ]["props"].get("value") or ""
+        self.assertNotIn("__all_videos__", initial_cards)
         self.assertTrue({
-            "build_intuitive_video_gallery",
             "refresh_intuitive_video_picker",
-            "select_intuitive_video_from_gallery",
+            "select_intuitive_video_from_card",
         }.issubset(api_names))
         collapse_dependencies = [
             dependency for dependency in config["dependencies"]
             if "intuitive-video-picker" in str(dependency.get("js") or "")
             and dependency.get("trigger_only_on_success")
         ]
-        self.assertEqual(len(collapse_dependencies), 6)
+        # Video loads, both staged-search submits, row selection and the new
+        # stable-hit marker selection all share the same post-open UI cleanup.
+        self.assertEqual(len(collapse_dependencies), 7)
+        self.assertIn("on_intuitive_search_marker", api_names)
         folder_id = components_by_elem_id["intuitive-folder-browse"]["id"]
         out_dir_components = [
             component for component in components
@@ -3671,6 +4174,31 @@ class ClipPlanTest(unittest.TestCase):
         self.assertNotEqual(
             functions["stop_indexing"].concurrency_id,
             "library-index-io",
+        )
+
+    def test_intuitive_editor_apple_interaction_contract_is_present(self):
+        """Precision edits stay direct while discrete commands answer instantly."""
+        css = _APP_CSS
+        javascript = _INTUITIVE_EDITOR_JS
+
+        self.assertIn("font-optical-sizing: auto", css)
+        self.assertIn(":not(:disabled):active", css)
+        self.assertIn("prefers-reduced-motion: reduce", css)
+        self.assertIn("prefers-reduced-transparency: reduce", css)
+        self.assertIn("prefers-contrast: more", css)
+        self.assertIn(".is-command-pending", css)
+        self.assertIn(".is-intuitive-dragging", css)
+        self.assertIn("setEditorCommandPending(true)", javascript)
+        self.assertIn("setEditorCommandPending(false)", javascript)
+        self.assertIn("grabOffsetX", javascript)
+        self.assertIn("event.clientX - grabOffsetX", javascript)
+
+    def test_intuitive_tool_status_is_a_polite_live_region(self):
+        state = self._intuitive_state()
+        toolbar = render_intuitive_toolbar(state)
+        self.assertIn(
+            'class="intuitive-tool-status" role="status" aria-live="polite"',
+            toolbar,
         )
 
 

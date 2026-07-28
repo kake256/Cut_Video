@@ -3,8 +3,11 @@
 
     python app.py
 
-「検索・切り抜き」タブ: 検索 → 結果選択 → プレビュー → 手動調整 → 保存。
+「検索・編集・切り抜き」タブ: 検索 → プレビュー → 範囲編集 → 保存。
 「動画の追加」タブ: 新規動画の文字起こし〜インデックス化をWebUIから実行。
+
+従来の「検索・切り抜き」画面は CUT_VIDEO_ENABLE_LEGACY_UI=1 のときだけ
+退避UIとして表示する。
 """
 import copy
 import faulthandler
@@ -73,6 +76,7 @@ PREVIEW_TEMP_MAX_AGE_SEC = DEFAULT_TEMP_MAX_AGE_SEC
 # (`Block.__init__`がGRADIO_CACHEを設定するだけで、UIには一切表示しない)。
 _THUMB_CACHE_BLOCK = gr.HTML()
 INDEX_JOB_PIDFILE = config.CACHE_ROOT / "index_job.pid"
+APP_PIDFILE = config.CACHE_ROOT / "app.pid"
 ALL_VIDEOS_VALUE = "__all_videos__"
 
 ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
@@ -305,12 +309,13 @@ def build_video_gallery(filter_text: str = "", selected_video_id: str = ALL_VIDE
     return gr.update(value=items, selected_index=selected_index), video_ids
 
 
-def _intuitive_video_cards_data(filter_text: str = "") -> list[dict]:
+def _intuitive_video_cards_data(
+    filter_text: str = "", *, generate_thumbnails: bool = True
+) -> list[dict]:
     """Individual videos (never the ALL card) enriched with picker metadata.
 
-    Filtering happens here (before thumbnail generation) so that both the
-    hidden selection-proxy Gallery and the visible card grid are built from
-    the exact same filtered, ordered list -- this keeps their indices in sync.
+    Filtering happens before thumbnail generation so irrelevant files never
+    invoke ffmpeg and each visible card carries its stable video ID directly.
     """
     conn = db.get_conn()
     try:
@@ -326,26 +331,21 @@ def _intuitive_video_cards_data(filter_text: str = "") -> list[dict]:
         name = video.get("display_name") or Path(video["path"]).name
         if needle and needle not in name.casefold():
             continue
+        cached_thumbnail = _thumbnail_path(video)
+        thumbnail_path = (
+            str(cached_thumbnail.resolve())
+            if cached_thumbnail.exists()
+            else (_make_video_thumbnail(video) if generate_thumbnails else None)
+        )
         cards.append({
             "video_id": video.get("public_video_id") or video["video_id"],
             "name": name,
             "duration": float(video.get("duration") or 0.0),
-            "thumbnail_path": _make_video_thumbnail(video),
+            "thumbnail_path": thumbnail_path,
             "asr_complete": bool(video.get("asr_complete")),
             "indexed": (video.get("public_video_id") or video["video_id"]) in indexed_ids,
         })
     return cards
-
-
-def _intuitive_gallery_items(cards: list[dict]) -> list[tuple[str, str]]:
-    """Local-path (image, caption) tuples for the hidden gr.Gallery selection proxy."""
-    return [
-        (
-            card["thumbnail_path"] or str(VIDEO_UNAVAILABLE_IMAGE.resolve()),
-            f'{card["name"]}\n{utils.format_timestamp(card["duration"])}',
-        )
-        for card in cards
-    ]
 
 
 def _thumbnail_servable_url(path: str | None) -> str:
@@ -397,22 +397,22 @@ def render_intuitive_video_cards(
     return "".join(parts)
 
 
-def build_intuitive_video_gallery(filter_text: str = "", selected_video_id: str = ""):
-    """Return individual-video cards for intuitive editing (never the ALL card)."""
-    cards = _intuitive_video_cards_data(filter_text)
-    items = _intuitive_gallery_items(cards)
-    video_ids = [card["video_id"] for card in cards]
+def build_intuitive_video_cards(
+    filter_text: str = "",
+    selected_video_id: str = "",
+    *,
+    generate_thumbnails: bool = True,
+) -> str:
+    """Return the directly selectable video-card HTML (never the ALL card)."""
+    cards = _intuitive_video_cards_data(
+        filter_text, generate_thumbnails=generate_thumbnails
+    )
     selected_video_id = parse_video_choice(selected_video_id)
-    try:
-        selected_index = video_ids.index(selected_video_id)
-    except ValueError:
-        selected_index = None
     display_cards = [
         {**card, "thumbnail_url": _thumbnail_servable_url(card.get("thumbnail_path"))}
         for card in cards
     ]
-    cards_html = render_intuitive_video_cards(display_cards, selected_video_id)
-    return gr.update(value=items, selected_index=selected_index), video_ids, cards_html
+    return render_intuitive_video_cards(display_cards, selected_video_id)
 
 
 def _selected_gallery_index(video_ids: list[str], evt: gr.SelectData) -> int:
@@ -431,16 +431,8 @@ def select_video_from_gallery(video_ids: list[str], evt: gr.SelectData):
 
 
 def region_transcript(conn, video_id: str, start: float, end: float) -> str:
-    storage_id = (
-        db.storage_video_id(conn, video_id) or video_id
-        if str(video_id).startswith(db.PUBLIC_ID_PREFIX) else video_id
-    )
-    rows = conn.execute(
-        "SELECT text FROM asr_segments WHERE video_id = ? AND end_sec > ? AND start_sec < ? "
-        "ORDER BY start_sec",
-        (storage_id, start, end),
-    ).fetchall()
-    return " ".join(r["text"] for r in rows)
+    rows = db.get_segments_in_range(conn, video_id, start, end)
+    return " ".join(str(row.get("text") or "") for row in rows)
 
 
 def sync_range_to_video(video_choice: str, current_end: float):
@@ -505,6 +497,74 @@ def _build_intuitive_table(results: list, selected_idx=None) -> list:
             f"{video_name}｜{text}",
         ])
     return rows
+
+
+def _intuitive_search_view_results(search_view) -> list[dict]:
+    """Return results from the request-scoped adapter view.
+
+    Plain lists remain accepted for the older direct-selection helpers and
+    their characterization tests; staged search always emits the structured
+    form so marker clicks can prove which request they belong to.
+    """
+    if isinstance(search_view, dict):
+        results = search_view.get("results")
+        return list(results) if isinstance(results, list) else []
+    return list(search_view) if isinstance(search_view, list) else []
+
+
+def _intuitive_search_view(request_id: str, results: list[dict]) -> dict:
+    return {"request_id": str(request_id or ""), "results": list(results)}
+
+
+def render_intuitive_search_marker_projection(search_view) -> str:
+    """Serialize transient search hits for the overview marker adapter."""
+    request_id = str(
+        search_view.get("request_id") or ""
+        if isinstance(search_view, dict) else ""
+    )
+    markers = []
+    for result in _intuitive_search_view_results(search_view):
+        hit_id = str(result.get("hit_id") or "")
+        video_id = str(result.get("video_id") or "")
+        if not hit_id or not video_id:
+            continue
+        try:
+            start = float(result.get("evidence_start", result.get("start")))
+            end = float(result.get("evidence_end", result.get("end")))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        if end < start:
+            start, end = end, start
+        match_type = str(result.get("match_type") or "")
+        kind = "text" if match_type == "文字一致" else "semantic"
+        evidence_midpoint = start + (end - start) / 2.0
+        label_text = str(result.get("text") or "").strip().replace("\n", " ")
+        if len(label_text) > 48:
+            label_text = label_text[:48] + "..."
+        markers.append({
+            "hit_id": hit_id,
+            "video_id": video_id,
+            "kind": kind,
+            "position": evidence_midpoint,
+            "label": (
+                f"{match_type or '検索結果'} {utils.format_timestamp(evidence_midpoint)}"
+                + (f" {label_text}" if label_text else "")
+            ),
+        })
+    payload = html.escape(
+        json.dumps(
+            {"request_id": request_id, "hits": markers},
+            ensure_ascii=True, separators=(",", ":"),
+        ),
+        quote=True,
+    )
+    return (
+        '<span data-intuitive-search-marker-projection '
+        f'data-request-id="{html.escape(request_id, quote=True)}" '
+        f'data-search-markers="{payload}" aria-hidden="true"></span>'
+    )
 
 
 def _preview_update(
@@ -804,7 +864,15 @@ def make_intuitive_preview(
 
 def render_intuitive_transcript(segments: list[dict], state: dict | None = None) -> str:
     """単語時刻を優先し、安全にエスケープした試作用文字起こしHTMLを返す。"""
+    decoration_exclusions = _clip_intuitive_exclusions(state) if state else []
+
     def classes_for(start: float, end: float, segment: bool = False) -> str:
+        # data-start/data-end are the browser-side interaction contract and are
+        # serialized to milliseconds below.  Use those same values for the
+        # full-render decoration pass so a later JS projection cannot disagree
+        # at a sub-millisecond boundary.
+        start = float(f"{start:.3f}")
+        end = float(f"{end:.3f}")
         classes = ["intuitive-word"]
         if segment:
             classes.append("intuitive-segment")
@@ -820,7 +888,7 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
             classes.append("is-outside-overall")
         if any(
             end > cut["start"] and start < cut["end"]
-            for cut in state.get("exclusions") or []
+            for cut in decoration_exclusions
         ):
             classes.append("is-excluded-word")
         contains_start = lambda value: (
@@ -836,9 +904,9 @@ def render_intuitive_transcript(segments: list[dict], state: dict | None = None)
         pending = state.get("pending_cut_start")
         if pending is not None and contains_start(float(pending)):
             classes.append("marks-pending-cut")
-        if any(contains_start(float(cut["start"])) for cut in state.get("exclusions") or []):
+        if any(contains_start(float(cut["start"])) for cut in decoration_exclusions):
             classes.append("marks-exclusion-start")
-        if any(contains_end(float(cut["end"])) for cut in state.get("exclusions") or []):
+        if any(contains_end(float(cut["end"])) for cut in decoration_exclusions):
             classes.append("marks-exclusion-end")
         return " ".join(classes)
 
@@ -1021,7 +1089,7 @@ def render_intuitive_zoom_timeline(start: float, end: float) -> str:
 
 
 def load_intuitive_video(video_choice: str):
-    """インデックス済み動画の最初の発話付近を試作画面へ読み込む。"""
+    """インデックス済み動画の最初の発話付近を編集画面へ読み込む。"""
     video_id = parse_video_choice(video_choice)
     if not video_id:
         raise gr.Error("直感編集で試す動画を選択してください。")
@@ -1031,13 +1099,7 @@ def load_intuitive_video(video_choice: str):
         video = db.get_video(conn, video_id)
         if not video:
             raise gr.Error(f"動画が見つかりません: {video_id}")
-        storage_id = video["video_id"]
-        first_segment = conn.execute(
-            "SELECT start_sec, end_sec FROM asr_segments "
-            "WHERE video_id = ? AND trim(COALESCE(text, '')) <> '' "
-            "ORDER BY start_sec LIMIT 1",
-            (storage_id,),
-        ).fetchone()
+        first_segment = db.get_first_text_segment(conn, video["video_id"])
         duration = max(float(video.get("duration") or 0.0), 0.0)
         first_start = float(first_segment["start_sec"]) if first_segment else 0.0
         preview_start = max(0.0, first_start - 2.0)
@@ -1045,13 +1107,9 @@ def load_intuitive_video(video_choice: str):
         preview_end = min(effective_duration, preview_start + 90.0)
         if preview_end <= preview_start:
             raise gr.Error("プレビューできる長さの動画ではありません。")
-        rows = conn.execute(
-            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
-            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? "
-            "ORDER BY start_sec",
-            (storage_id, preview_start, preview_end),
-        ).fetchall()
-        segments = [dict(row) for row in rows]
+        segments = db.get_segments_in_range(
+            conn, video["video_id"], preview_start, preview_end
+        )
     finally:
         conn.close()
 
@@ -1095,33 +1153,48 @@ _INTUITIVE_VIEWPORT_MIN_SECONDS = 5.0
 # preview while still making the resize operation useful and predictable.
 _INTUITIVE_VIEWPORT_MAX_SECONDS = 600.0
 _INTUITIVE_HISTORY_LIMIT = 50
-_INTUITIVE_TRANSCRIPT_WINDOW_SECONDS = 90.0
 
 
 def _intuitive_transcript_bounds(
     state: dict, focus: float | None = None,
 ) -> tuple[float, float]:
-    """Return a short transcript window clamped inside the zoom viewport."""
+    """Return transcript bounds that exactly match the zoom viewport.
+
+    ``focus`` remains accepted for compatibility with already queued browser
+    commands, but changing the playhead no longer creates a second, independent
+    transcript window inside the visible timeline range.
+    """
     view_start = float(state["viewport_start"])
     view_end = max(view_start, float(state["viewport_end"]))
-    span = min(_INTUITIVE_TRANSCRIPT_WINDOW_SECONDS, view_end - view_start)
-    if span <= 0:
-        return view_start, view_end
-    if focus is None:
-        focus = state.get("transcript_focus_sec", view_start)
-    try:
-        focus = float(focus)
-    except (TypeError, ValueError):
-        focus = view_start
-    if not math.isfinite(focus):
-        focus = view_start
-    focus = min(max(focus, view_start), view_end)
-    start = min(max(focus - span / 2.0, view_start), view_end - span)
-    return start, start + span
+    return view_start, view_end
+
+
+def _intuitive_transcript_projection(state: dict) -> str:
+    """Small canonical projection used to restyle the existing transcript DOM."""
+    selected = state.get("selected_word") or None
+    payload = {
+        "overall_start": float(state["overall_start"]),
+        "overall_end": float(state["overall_end"]),
+        "exclusions": [
+            [float(cut["start"]), float(cut["end"])]
+            for cut in _clip_intuitive_exclusions(state)
+        ],
+        "pending_cut_start": (
+            None
+            if state.get("pending_cut_start") is None
+            else float(state["pending_cut_start"])
+        ),
+        "selected_word": (
+            None
+            if not selected
+            else [float(selected["start"]), float(selected["end"])]
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
 def _set_intuitive_transcript_focus(state: dict, focus: float | None = None) -> None:
-    """Store a canonical focus and its derived, bounded transcript interval."""
+    """Store a canonical focus and the viewport-aligned transcript interval."""
     view_start = float(state["viewport_start"])
     view_end = float(state["viewport_end"])
     if focus is None:
@@ -1145,6 +1218,7 @@ def _new_intuitive_state(video: dict, start: float, end: float) -> dict:
         "revision": 0,
         "nonce": secrets.token_hex(12),
         "video_id": str(video["video_id"]),
+        "public_video_id": str(video.get("public_video_id") or video["video_id"]),
         "video_path": str(video["path"]),
         "duration": duration,
         "preview_start": float(start),
@@ -1873,7 +1947,14 @@ def render_intuitive_toolbar(state: dict) -> str:
     can_undo = bool(state.get("undo_stack")) and not result_mode
     can_redo = bool(state.get("redo_stack")) and not result_mode
     has_selected_boundary = bool(state.get("selected_boundary"))
+    selected_boundary_kind = html.escape(
+        str((state.get("selected_boundary") or {}).get("kind") or ""),
+        quote=True,
+    )
     transcript_start, transcript_end = _intuitive_transcript_bounds(state)
+    transcript_projection = html.escape(
+        _intuitive_transcript_projection(state), quote=True
+    )
     buttons = "".join(
         f'<button type="button" class="intuitive-tool-button'
         f'{" is-selected" if active == key else ""}" data-intuitive-tool="{key}" '
@@ -1907,14 +1988,16 @@ def render_intuitive_toolbar(state: dict) -> str:
         f'data-can-undo="{str(can_undo).lower()}" '
         f'data-can-redo="{str(can_redo).lower()}" '
         f'data-has-selected-boundary="{str(has_selected_boundary).lower()}" '
+        f'data-selected-boundary-kind="{selected_boundary_kind}" '
         f'data-timeline-edit-mode="{str(bool(state.get("timeline_edit_mode", False))).lower()}" '
         f'data-transcript-start="{transcript_start:.3f}" '
         f'data-transcript-end="{transcript_end:.3f}" '
+        f'data-transcript-projection="{transcript_projection}" '
         f'data-viewport-start="{float(state["viewport_start"]):.3f}" '
         f'data-viewport-end="{float(state["viewport_end"]):.3f}" '
         f'data-preview-start="{float(state["preview_start"]):.3f}" '
         f'data-preview-end="{float(state["preview_end"]):.3f}">'
-        f'<div class="intuitive-tool-heading"><strong>2. 文字起こし編集</strong>'
+        f'<div class="intuitive-tool-heading"><strong>3. 文字起こし編集</strong>'
         f'<span class="intuitive-history-actions">'
         f'<button type="button" data-intuitive-history="undo"'
         f'{"" if can_undo else " disabled"} aria-label="元に戻す (Ctrl+Z)">↶ 元に戻す</button>'
@@ -1922,7 +2005,8 @@ def render_intuitive_toolbar(state: dict) -> str:
         f'{"" if can_redo else " disabled"} aria-label="やり直す (Ctrl+Y)">↷ やり直す</button>'
         f'</span></div>'
         f'<div class="intuitive-tool-buttons">{buttons}</div>'
-        f'<div class="intuitive-tool-status">{selected_html}{status}</div></div>'
+        f'<div class="intuitive-tool-status" role="status" aria-live="polite">'
+        f'{selected_html}{status}</div></div>'
     )
 
 
@@ -1935,19 +2019,31 @@ def render_intuitive_state_overview(state: dict) -> str:
     viewport_span = max(0.0, state["viewport_end"] - state["viewport_start"])
     min_span = min(_INTUITIVE_VIEWPORT_MIN_SECONDS, duration)
     max_span = min(_INTUITIVE_VIEWPORT_MAX_SECONDS, duration)
+    viewport_start_min = max(0.0, state["viewport_end"] - max_span)
+    viewport_start_max = max(
+        viewport_start_min, state["viewport_end"] - min_span
+    )
+    viewport_end_min = min(duration, state["viewport_start"] + min_span)
+    viewport_end_max = min(duration, state["viewport_start"] + max_span)
+    public_video_id = html.escape(
+        str(state.get("public_video_id") or state["video_id"]), quote=True
+    )
     return f"""
     <div class="intuitive-timeline" data-intuitive-overview data-duration="{duration:.3f}"
+         data-public-video-id="{public_video_id}"
          data-preview-start="{state['preview_start']:.3f}" data-preview-end="{state['preview_end']:.3f}"
          data-viewport-start="{state['viewport_start']:.3f}" data-viewport-end="{state['viewport_end']:.3f}"
          data-viewport-min-span="{min_span:.3f}" data-viewport-max-span="{max_span:.3f}">
       <div class="intuitive-timeline-scale"><span>00:00:00</span><strong>5-1. 動画全体の概要タイムライン</strong><span>{utils.format_timestamp(duration)}</span></div>
       <div class="intuitive-overview-track" role="group" aria-label="全体編集範囲と拡大表示範囲">
         <div class="intuitive-overall-window" style="left:{overall_left:.4f}%;width:{overall_right - overall_left:.4f}%" title="全体編集範囲"></div>
+        <div class="intuitive-search-marker-layer" data-intuitive-search-marker-layer
+             aria-label="この動画の検索ヒット"></div>
         <div class="intuitive-overview-window" style="left:{viewport_left:.4f}%;width:{viewport_right - viewport_left:.4f}%" title="拡大表示範囲">
           <span class="intuitive-viewport-interaction">
             <span class="intuitive-viewport-grip start" data-viewport-drag="start"
                   role="slider" tabindex="0" aria-label="表示範囲の開始"
-                  aria-valuemin="0" aria-valuemax="{max(0.0, state['viewport_end'] - min_span):.3f}"
+                  aria-valuemin="{viewport_start_min:.3f}" aria-valuemax="{viewport_start_max:.3f}"
                   aria-valuenow="{state['viewport_start']:.3f}"
                   aria-valuetext="{utils.format_timestamp(state['viewport_start'])}"></span>
             <span class="intuitive-viewport-move" data-viewport-drag="move"
@@ -1957,14 +2053,18 @@ def render_intuitive_state_overview(state: dict) -> str:
                   aria-valuetext="{utils.format_timestamp(state['viewport_start'])} ～ {utils.format_timestamp(state['viewport_end'])}"></span>
             <span class="intuitive-viewport-grip end" data-viewport-drag="end"
                   role="slider" tabindex="0" aria-label="表示範囲の終了"
-                  aria-valuemin="{min(duration, state['viewport_start'] + min_span):.3f}"
-                  aria-valuemax="{duration:.3f}" aria-valuenow="{state['viewport_end']:.3f}"
+                  aria-valuemin="{viewport_end_min:.3f}"
+                  aria-valuemax="{viewport_end_max:.3f}" aria-valuenow="{state['viewport_end']:.3f}"
                   aria-valuetext="{utils.format_timestamp(state['viewport_end'])}"></span>
           </span>
         </div>
       </div>
       <div class="intuitive-viewport-summary">
         <span>表示範囲（保存範囲は変わりません）: <strong data-viewport-summary>{utils.format_timestamp(state['viewport_start'])} ～ {utils.format_timestamp(state['viewport_end'])}（{viewport_span:.1f}秒）</strong></span>
+        <span class="intuitive-search-marker-legend" data-intuitive-search-marker-legend hidden>
+          <span><i class="text" aria-hidden="true"></i>文字一致</span>
+          <span><i class="semantic" aria-hidden="true"></i>意味検索</span>
+        </span>
         <span>両端をドラッグして{min_span:.0f}～{max_span:.0f}秒に変更 / 中央をドラッグして移動</span>
       </div>
     </div>
@@ -1984,12 +2084,22 @@ def render_intuitive_state_zoom(state: dict) -> str:
     drag_edit_enabled = bool(state.get("timeline_edit_mode", False))
     slider_disabled = result_mode or not drag_edit_enabled
 
-    def slider_attributes(kind: str, value: float, label: str) -> str:
+    def slider_attributes(
+        kind: str, value: float, label: str, cut: dict | None = None
+    ) -> str:
         if kind == "overall_start":
             minimum, maximum = 0.0, max(0.0, float(state["overall_end"]) - 0.1)
         elif kind == "overall_end":
             minimum = min(float(state["duration"]), float(state["overall_start"]) + 0.1)
             maximum = float(state["duration"])
+        elif kind == "exclusion_start" and cut:
+            minimum = float(state["overall_start"])
+            maximum = max(minimum, float(cut["end"]) - 0.1)
+        elif kind == "exclusion_end" and cut:
+            minimum = min(
+                float(state["overall_end"]), float(cut["start"]) + 0.1
+            )
+            maximum = float(state["overall_end"])
         else:
             minimum, maximum = float(state["overall_start"]), float(state["overall_end"])
         return (
@@ -2022,9 +2132,9 @@ def render_intuitive_state_zoom(state: dict) -> str:
             f'<div class="intuitive-cut-zone{selected_class}" style="left:{left:.4f}%;width:{right-left:.4f}%" '
             f'data-cut-id="{cut_id}" title="途中カット">'
             f'<span class="intuitive-cut-handle start" data-boundary-kind="exclusion_start" data-cut-id="{cut_id}" '
-            f'{slider_attributes("exclusion_start", cut["start"], "途中カットの開始")}></span>'
+            f'{slider_attributes("exclusion_start", cut["start"], "途中カットの開始", cut)}></span>'
             f'<span class="intuitive-cut-handle end" data-boundary-kind="exclusion_end" data-cut-id="{cut_id}" '
-            f'{slider_attributes("exclusion_end", cut["end"], "途中カットの終了")}></span></div>'
+            f'{slider_attributes("exclusion_end", cut["end"], "途中カットの終了", cut)}></span></div>'
         )
     handles = []
     for kind, value, css_class in (
@@ -2110,17 +2220,9 @@ def _refresh_intuitive_source(state: dict):
     transcript_start, transcript_end = _intuitive_transcript_bounds(state)
     conn = db.get_conn()
     try:
-        storage_id = (
-            db.storage_video_id(conn, state["video_id"]) or state["video_id"]
-            if str(state["video_id"]).startswith(db.PUBLIC_ID_PREFIX)
-            else state["video_id"]
+        segments = db.get_segments_in_range(
+            conn, state["video_id"], transcript_start, transcript_end
         )
-        rows = conn.execute(
-            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
-            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
-            (storage_id, transcript_start, transcript_end),
-        ).fetchall()
-        segments = [dict(row) for row in rows]
     finally:
         conn.close()
     preview_path = make_intuitive_preview(
@@ -2155,17 +2257,9 @@ def _render_intuitive_transcript_for_state(state: dict) -> str:
     transcript_start, transcript_end = _intuitive_transcript_bounds(state)
     conn = db.get_conn()
     try:
-        storage_id = (
-            db.storage_video_id(conn, state["video_id"]) or state["video_id"]
-            if str(state["video_id"]).startswith(db.PUBLIC_ID_PREFIX)
-            else state["video_id"]
+        segments = db.get_segments_in_range(
+            conn, state["video_id"], transcript_start, transcript_end
         )
-        rows = conn.execute(
-            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
-            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
-            (storage_id, transcript_start, transcript_end),
-        ).fetchall()
-        segments = [dict(row) for row in rows]
     finally:
         conn.close()
     return render_intuitive_transcript(segments, state)
@@ -2224,13 +2318,6 @@ def handle_intuitive_command(command_json: str, state: dict):
                 else "unexpected_error"
             )
         return _intuitive_render_outputs(next_state)
-    if next_state.get("document_id"):
-        try:
-            DOCUMENTS.sync_adapter_plan(
-                next_state["document_id"], edit_plan_from_intuitive(next_state)
-            )
-        except Exception:
-            pass
     if command.get("type") == "fit_overall_to_viewport":
         gr.Info(
             "保存範囲を "
@@ -2252,10 +2339,10 @@ def handle_intuitive_command(command_json: str, state: dict):
                 recovered["last_command_status"] = "unexpected_error"
             return _intuitive_render_outputs(recovered)
         return _intuitive_render_outputs(next_state, (preview, transcript, info))
-    transcript = _render_intuitive_transcript_for_state(next_state)
-    return _intuitive_render_outputs(
-        next_state, (gr.update(), transcript, gr.update())
-    )
+    # The viewport did not change, so the transcript words are identical.
+    # Keep that potentially large DOM in place and let the browser apply the
+    # small canonical decoration projection carried by the toolbar update.
+    return _intuitive_render_outputs(next_state)
 
 
 def sync_intuitive_editor(sync_token: str, state: dict):
@@ -2295,13 +2382,10 @@ def load_intuitive_editor(video_choice: str):
     conn = db.get_conn()
     try:
         video = db.get_video(conn, video_id)
-        storage_id = video["video_id"] if video else video_id
-        first_segment = conn.execute(
-            "SELECT start_sec, end_sec FROM asr_segments "
-            "WHERE video_id = ? AND trim(COALESCE(text, '')) <> '' "
-            "ORDER BY start_sec LIMIT 1",
-            (storage_id,),
-        ).fetchone()
+        first_segment = (
+            db.get_first_text_segment(conn, video["video_id"])
+            if video else None
+        )
     finally:
         conn.close()
     if not video:
@@ -2330,19 +2414,24 @@ def load_intuitive_editor_with_search_target(video_choice: str):
     return (*loaded, gr.update(value=video_id or ALL_VIDEOS_VALUE))
 
 
-def select_intuitive_video_from_gallery(
-    video_ids: list[str], filter_text: str, evt: gr.SelectData
-):
-    """Select one card and immediately initialize a fresh intuitive edit session."""
-    index = _selected_gallery_index(video_ids, evt)
-    video_id = video_ids[index]
+def select_intuitive_video_from_card(command_json: str, filter_text: str):
+    """Select a visible HTML card without an index-coupled hidden Gallery."""
+    try:
+        command = json.loads(command_json or "")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise gr.Error("動画を選択できませんでした。一覧を更新してください。") from exc
+    if not isinstance(command, dict):
+        raise gr.Error("動画を選択できませんでした。一覧を更新してください。")
+    video_id = parse_video_choice(str(command.get("video_id") or ""))
     if video_id == ALL_VIDEOS_VALUE:
         raise gr.Error("直感編集では個別の動画を選択してください。")
-    # Rebuild through the same function used to render the card grid so the
-    # highlighted "selected" card always matches the freshly loaded video.
-    _, _, cards_html = build_intuitive_video_gallery(filter_text, video_id)
+    if not video_id:
+        raise gr.Error("動画を選択できませんでした。一覧を更新してください。")
+    cards_html = build_intuitive_video_cards(
+        filter_text, video_id, generate_thumbnails=False
+    )
     return (
-        gr.update(selected_index=index), video_id, cards_html,
+        video_id, cards_html,
         *load_intuitive_editor_with_search_target(video_id),
     )
 
@@ -2353,12 +2442,20 @@ def refresh_intuitive_video_picker(
     current_search_target: str | None = None,
 ):
     """Refresh cards and both fallback/search dropdowns without rebuilding thumbnails."""
-    gallery_update, video_ids, cards_html = build_intuitive_video_gallery(
-        filter_text, selected_video_id
+    cards = _intuitive_video_cards_data(filter_text)
+    cards_html = render_intuitive_video_cards(
+        [
+            {**card, "thumbnail_url": _thumbnail_servable_url(card.get("thumbnail_path"))}
+            for card in cards
+        ],
+        parse_video_choice(selected_video_id),
     )
     choices = [
-        (str(caption).replace("\n", "  —  "), video_id)
-        for (_, caption), video_id in zip(gallery_update["value"], video_ids)
+        (
+            f'{card["name"]}  —  {utils.format_timestamp(card["duration"])}',
+            card["video_id"],
+        )
+        for card in cards
     ]
     search_choices = [("すべての動画", ALL_VIDEOS_VALUE), *choices]
     search_update = {"choices": search_choices}
@@ -2376,8 +2473,6 @@ def refresh_intuitive_video_picker(
                 preserved_target = ALL_VIDEOS_VALUE
         search_update["value"] = preserved_target
     return (
-        gallery_update,
-        video_ids,
         cards_html,
         gr.update(choices=choices),
         gr.update(**search_update),
@@ -2413,12 +2508,9 @@ def _load_intuitive_search_result(index: int, results: list[dict]):
                 desired_start, desired_end = 0.0, min(duration, 90.0)
             elif desired_end > duration:
                 desired_start, desired_end = max(0.0, duration - 90.0), duration
-        rows = conn.execute(
-            "SELECT start_sec, end_sec, text, words_json FROM asr_segments "
-            "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
-            (video["video_id"], desired_start, desired_end),
-        ).fetchall()
-        segments = [dict(row) for row in rows]
+        segments = db.get_segments_in_range(
+            conn, video["video_id"], desired_start, desired_end
+        )
     finally:
         conn.close()
 
@@ -2492,11 +2584,16 @@ def do_intuitive_search_staged(
     overwriting a newer query.
     """
     query = str(query or "").strip()
+    session_id = getattr(request, "session_hash", None)
     if not query:
-        yield [], [], "検索する文字・フレーズを入力してください。"
+        request_id = _intuitive_search_coordinator.registry.begin(session_id)
+        search_view = _intuitive_search_view(request_id, [])
+        yield (
+            [], search_view, "検索する文字・フレーズを入力してください。",
+            render_intuitive_search_marker_projection(search_view),
+        )
         return
 
-    session_id = getattr(request, "session_hash", None)
     video_filter = parse_video_choice(video_choice)
     semantic_limit = max(1, int(top_k))
     text_limit = max(20, semantic_limit)
@@ -2540,17 +2637,62 @@ def do_intuitive_search_staged(
             status = (
                 f"文字一致: {text_count}件 / 意味検索: {semantic_count}件"
             )
-        yield _build_intuitive_table(results), results, status
+        search_view = _intuitive_search_view(stage.request_id, results)
+        yield (
+            _build_intuitive_table(results),
+            search_view,
+            status,
+            render_intuitive_search_marker_projection(search_view),
+        )
 
 
-def on_intuitive_search_select(results: list, evt: gr.SelectData):
-    raw_index = evt.index if evt and evt.index is not None else 0
-    index = raw_index[0] if isinstance(raw_index, (tuple, list)) else raw_index
-    index = int(index)
+def _select_intuitive_search_result(index: int, search_view):
+    results = _intuitive_search_view_results(search_view)
+    if index < 0 or index >= len(results):
+        raise gr.Error("検索結果を選択してください。")
     return (
         _build_intuitive_table(results, selected_idx=index),
         *_load_intuitive_search_result(index, results),
     )
+
+
+def on_intuitive_search_select(search_view, evt: gr.SelectData):
+    raw_index = evt.index if evt and evt.index is not None else 0
+    index = raw_index[0] if isinstance(raw_index, (tuple, list)) else raw_index
+    return _select_intuitive_search_result(int(index), search_view)
+
+
+def on_intuitive_search_marker(command_json: str, search_view, request: gr.Request = None):
+    """Resolve a marker by stable hit ID, then use the row-selection path."""
+    try:
+        command = json.loads(command_json or "")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise gr.Error("検索マーカーを選択できませんでした。再検索してください。") from exc
+    if not isinstance(command, dict):
+        raise gr.Error("検索マーカーを選択できませんでした。再検索してください。")
+    view_request_id = str(
+        search_view.get("request_id") or ""
+        if isinstance(search_view, dict) else ""
+    )
+    command_request_id = str(command.get("request_id") or "")
+    session_id = getattr(request, "session_hash", None)
+    if (
+        not view_request_id
+        or command_request_id != view_request_id
+        or not _intuitive_search_coordinator.registry.is_current(
+            session_id, command_request_id
+        )
+    ):
+        raise gr.Error("検索結果が更新されています。現在の候補を選び直してください。")
+    hit_id = str(command.get("hit_id") or "")
+    results = _intuitive_search_view_results(search_view)
+    index = next(
+        (i for i, result in enumerate(results) if str(result.get("hit_id") or "") == hit_id),
+        -1,
+    )
+    if index < 0:
+        raise gr.Error("検索結果が更新されています。現在の候補を選び直してください。")
+    return _select_intuitive_search_result(index, search_view)
 
 
 def preview_intuitive_editor(state: dict):
@@ -2691,16 +2833,7 @@ def save_intuitive_editor(
 
 
 def get_region_sentences(conn, video_id: str, lo: float, hi: float) -> list:
-    storage_id = (
-        db.storage_video_id(conn, video_id) or video_id
-        if str(video_id).startswith(db.PUBLIC_ID_PREFIX) else video_id
-    )
-    rows = conn.execute(
-        "SELECT start_sec, end_sec, text FROM asr_segments "
-        "WHERE video_id = ? AND end_sec > ? AND start_sec < ? ORDER BY start_sec",
-        (storage_id, lo, hi),
-    ).fetchall()
-    return [dict(r) for r in rows]
+    return db.get_segments_in_range(conn, video_id, lo, hi)
 
 
 def _sentence_choices(sents: list) -> list:
@@ -3241,7 +3374,14 @@ def on_save(
 
 # ---------- 動画の追加 (インデックス作成) ----------
 
-def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = True):
+def do_index(
+    video_path: str,
+    asr_model: str,
+    force: bool,
+    batch_infer: bool = True,
+    llm_analysis: bool = False,
+    llm_model: str = "",
+):
     """新規動画をインデックス化する。進捗ログをストリーミング表示する。
 
     video_pathがhttp(s)://で始まる場合は、先にダウンロードしてからインデックス化する。
@@ -3300,6 +3440,11 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
             cmd.append("--force")
         if not batch_infer:
             cmd += ["--batch-size", "1"]
+        if llm_analysis:
+            selected_llm_model = (llm_model or config.LLM_ANALYSIS_MODEL).strip()
+            if not selected_llm_model:
+                raise gr.Error("LLM解析を有効にする場合はOllamaモデル名を指定してください。")
+            cmd += ["--llm-analysis", "--llm-model", selected_llm_model]
         env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
         proc = subprocess.Popen(
             cmd,
@@ -3353,6 +3498,155 @@ def do_index(video_path: str, asr_model: str, force: bool, batch_infer: bool = T
         _index_lock.release()
 
 
+def format_latest_llm_analysis(video_choice: str) -> str:
+    """Render the latest successful derived analysis without exposing ASR rows."""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        return "動画を選択してください。"
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        if revision is None:
+            return "この動画には有効な文字起こしがありません。"
+        runs = db.list_analysis_runs(conn, video_id, revision)
+        if not runs:
+            return "この文字起こしにはLLM解析結果がありません。"
+        latest = runs[0]
+        ready = next((item for item in runs if item["status"] == "ready"), None)
+        notices = []
+        if latest["status"] == "failed":
+            notices.append(
+                "> 最新の解析は失敗しました: "
+                + html.escape(str(latest.get("error_message") or "原因不明"))
+            )
+        elif latest["status"] in {"pending", "running"}:
+            notices.append("> 最新の解析は処理中です。")
+        if ready is None:
+            return "\n\n".join(notices or ["解析結果はまだ利用できません。"])
+
+        tags = ready.get("tags") or []
+        chapters = db.get_analysis_chapters(conn, ready["analysis_run_id"])
+        result = ready.get("result") or {}
+        lines = notices + [
+            "### 動画全体の要約",
+            html.escape(str(ready.get("summary") or "要約はありません。")),
+            "",
+            "### タグ",
+            " / ".join(f"`{html.escape(str(tag))}`" for tag in tags)
+            if tags else "タグはありません。",
+        ]
+        if result:
+            coverage = result.get("segment_coverage_ratio")
+            coverage_text = (
+                f"{float(coverage) * 100:.1f}%"
+                if isinstance(coverage, (int, float))
+                else "未計測"
+            )
+            lines += [
+                "",
+                "### 解析品質",
+                f"- 文字起こしセグメント網羅率: **{coverage_text}**",
+                "- 解析窓: "
+                f"{int(result.get('window_count') or 0)} / "
+                f"章: {int(result.get('chapter_count') or len(chapters))}",
+                "- 方式: "
+                f"`{html.escape(str(ready.get('prompt_version') or '不明'))}` / "
+                f"モデル: `{html.escape(str(ready.get('model') or '不明'))}`",
+            ]
+        lines += ["", "### 時間付きの章"]
+        if not chapters:
+            lines.append("章は生成されませんでした。")
+        for chapter in chapters:
+            start = utils.format_timestamp(float(chapter["start_sec"]))
+            end = utils.format_timestamp(float(chapter["end_sec"]))
+            title = html.escape(str(chapter.get("title") or "無題"))
+            summary = html.escape(str(chapter.get("summary") or ""))
+            chapter_tags = " / ".join(
+                f"`{html.escape(str(tag))}`"
+                for tag in chapter.get("tags", [])
+            )
+            lines.append(f"- **{start}–{end}　{title}**")
+            if summary:
+                lines.append(f"  - {summary}")
+            if chapter_tags:
+                lines.append(f"  - {chapter_tags}")
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+def do_existing_llm_analysis(video_choice: str, model: str):
+    """Run retryable local analysis in a separate process for an existing video."""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("解析する動画を選択してください。")
+    selected_model = (model or config.LLM_ANALYSIS_MODEL).strip()
+    if not selected_model:
+        raise gr.Error("Ollamaモデル名を指定してください。")
+    if not _index_lock.acquire(blocking=False):
+        raise gr.Error(
+            "別の動画追加またはLLM解析が実行中です。完了までお待ちください。"
+        )
+
+    import os
+    import sys
+
+    command = [
+        sys.executable,
+        "analyze_transcript.py",
+        "--video-id",
+        video_id,
+        "--model",
+        selected_model,
+    ]
+    env = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+    process = None
+    log_lines = ["ローカルLLM解析を開始しました。"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            cwd=str(Path(__file__).parent),
+        )
+        INDEX_JOB_PIDFILE.write_text(str(process.pid), encoding="utf-8")
+        _index_state["proc"] = process
+        _index_state["stopped"] = False
+        yield "\n".join(log_lines), gr.update()
+        for line in iter(process.stdout.readline, ""):
+            text = line.rstrip()
+            if text:
+                log_lines.append(text)
+                yield "\n".join(log_lines), gr.update()
+        code = process.wait()
+        if code == 0:
+            yield "\n".join(log_lines), format_latest_llm_analysis(video_choice)
+        elif _index_state["stopped"]:
+            log_lines.append(
+                "LLM解析を停止しました。既存の文字起こし・検索結果は変更されていません。"
+            )
+            yield "\n".join(log_lines), gr.update()
+        else:
+            log_lines.append(
+                "解析に失敗しました。既存の文字起こし・検索結果は変更されていません。"
+            )
+            yield "\n".join(log_lines), gr.update()
+    finally:
+        INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+        _index_state["proc"] = None
+        _index_lock.release()
+
+
 # 終了ボタン押下時にブラウザ側で実行するJS。まずタブを閉じようとし、
 # ブラウザのセキュリティ制約で閉じられない場合は画面を終了表示に差し替える
 # (サーバー停止による接続エラー画面になるより分かりやすい)。
@@ -3378,6 +3672,7 @@ def shutdown_app():
             ["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True
         )
     INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+    _remove_app_pidfile()
     # このレスポンスを返してからプロセスを終了する
     threading.Timer(3.0, lambda: os._exit(0)).start()
     return gr.update(
@@ -3488,6 +3783,11 @@ _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS = r"""() => {
   requestAnimationFrame(focusEditor);
   setTimeout(focusEditor, 120);
   setTimeout(focusEditor, 300);
+  const syncSearchMarkers = () => document.dispatchEvent(
+    new CustomEvent('cut-video:sync-search-markers')
+  );
+  requestAnimationFrame(syncSearchMarkers);
+  setTimeout(syncSearchMarkers, 120);
 }"""
 
 
@@ -3511,7 +3811,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
     )
     quit_confirm_btn.click(shutdown_app, outputs=[quit_msg], js=_QUIT_JS)
 
-    with gr.Tab("検索・切り抜き"):
+    with gr.Tab(
+        "従来版（検索・切り抜き）",
+        visible=config.ENABLE_LEGACY_UI,
+        elem_id="legacy-search-cut-tab",
+    ):
         results_state = gr.State([])
         ctx_state = gr.State(None)
         video_select = gr.State(ALL_VIDEOS_VALUE)
@@ -4107,21 +4411,24 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[saved_path],
         )
 
-    with gr.Tab("直感編集（試作）", elem_id="intuitive-editor-prototype-tab"):
+    with gr.Tab(
+        "検索・編集・切り抜き",
+        id="intuitive-main",
+        elem_id="intuitive-editor-tab",
+    ):
         intuitive_state = gr.State(None)
-        # `open=True` does not emit an Accordion expand event on first render.
-        # Seed cards and their IDs together so the initially open picker is
-        # immediately usable; later filter/reload actions use the same helper.
-        _INTUITIVE_INITIAL_CARDS = _intuitive_video_cards_data("")
-        _INTUITIVE_INITIAL_GALLERY = _intuitive_gallery_items(_INTUITIVE_INITIAL_CARDS)
-        _INTUITIVE_INITIAL_VIDEO_IDS = [
-            card["video_id"] for card in _INTUITIVE_INITIAL_CARDS
-        ]
+        # An initially open Accordion does not emit an expand event.
+        # Seed directly selectable cards so the picker is immediately usable.
+        # First paint uses only cached thumbnails. Missing thumbnails are made
+        # when the user expands, filters or explicitly refreshes the picker,
+        # so a newly added large library cannot block application startup.
+        _INTUITIVE_INITIAL_CARDS = _intuitive_video_cards_data(
+            "", generate_thumbnails=False
+        )
         _INTUITIVE_INITIAL_CARDS_HTML = render_intuitive_video_cards([
             {**card, "thumbnail_url": _thumbnail_servable_url(card.get("thumbnail_path"))}
             for card in _INTUITIVE_INITIAL_CARDS
         ])
-        intuitive_video_gallery_ids = gr.State(_INTUITIVE_INITIAL_VIDEO_IDS)
 
         with gr.Accordion(
             "サムネイルから編集する動画を選ぶ", open=True,
@@ -4145,21 +4452,17 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 label="動画一覧（選ぶと自動で編集を開始）",
                 elem_id="intuitive-video-card-grid",
             )
-            # Real selection wiring stays on a hidden gr.Gallery so nonce/FIFO,
-            # the dirty-session confirm, auto-preview and Accordion-close all
-            # keep working exactly as before. The visible card grid above is a
-            # pure display layer whose clicks are forwarded (by index) onto
-            # this Gallery's own buttons -- see the click-forward listener in
-            # `_INTUITIVE_EDITOR_JS`.
-            intuitive_video_gallery = gr.Gallery(
-                value=_INTUITIVE_INITIAL_GALLERY,
-                columns=4,
-                allow_preview=False,
-                object_fit="cover",
-                selected_index=None,
-                elem_id="intuitive-video-gallery",
-                elem_classes=["intuitive-gallery-proxy"],
+            # A tiny hidden bridge carries the clicked card's stable video ID
+            # into Gradio. No parallel Gallery or index coupling is required.
+            intuitive_video_card_command = gr.Textbox(
+                value="",
                 show_label=False,
+                container=False,
+                elem_id="intuitive-video-card-command",
+            )
+            intuitive_video_card_submit = gr.Button(
+                "select-card",
+                elem_id="intuitive-video-card-submit",
             )
             with gr.Row(elem_classes=["intuitive-fallback-picker"]):
                 intuitive_video_select = gr.Dropdown(
@@ -4172,7 +4475,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "選択動画を再読み込み", variant="secondary", scale=1,
                     elem_id="intuitive-load-video",
                 )
-        intuitive_search_results = gr.State([])
+        intuitive_search_results = gr.State({"request_id": "", "results": []})
         with gr.Group(elem_id="intuitive-header"):
             with gr.Row(elem_id="intuitive-mode-row"):
                 intuitive_video_info = gr.Markdown(
@@ -4210,27 +4513,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     elem_id="intuitive-preview-video",
                 )
             with gr.Column(
-                scale=4, min_width=400,
-                elem_id="intuitive-transcript-panel",
-            ):
-                intuitive_toolbar = gr.HTML(
-                    '<div class="intuitive-toolbox"><strong>2. 文字起こし編集</strong>'
-                    '<div class="intuitive-tool-buttons">'
-                    '<button disabled>全体開始</button><button disabled>全体終了</button>'
-                    '<button disabled>除外開始</button><button disabled>除外終了</button></div>'
-                    '<div class="intuitive-tool-status">動画を読み込んでください。</div></div>',
-                    elem_id="intuitive-toolbox",
-                    elem_classes=["intuitive-tool-header"],
-                )
-                intuitive_transcript = gr.HTML(
-                    render_intuitive_transcript([]),
-                    elem_id="intuitive-transcript-words",
-                )
-            with gr.Column(
-                scale=3, min_width=280, elem_id="intuitive-search-panel",
+                scale=4, min_width=400, elem_id="intuitive-search-panel",
             ):
                 gr.Markdown(
-                    "**3. 文字クエリー検索**",
+                    "**2. 文字クエリー検索**",
                     elem_classes=["intuitive-panel-heading"],
                 )
                 with gr.Row(elem_classes=["intuitive-search-primary"]):
@@ -4262,6 +4548,24 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "検索すると、文字一致を先に表示し、意味検索結果を後から追加します。",
                     elem_id="intuitive-search-status",
                 )
+            with gr.Column(
+                scale=3, min_width=280,
+                elem_id="intuitive-transcript-panel",
+            ):
+                intuitive_toolbar = gr.HTML(
+                    '<div class="intuitive-toolbox"><strong>3. 文字起こし編集</strong>'
+                    '<div class="intuitive-tool-buttons">'
+                    '<button disabled>全体開始</button><button disabled>全体終了</button>'
+                    '<button disabled>除外開始</button><button disabled>除外終了</button></div>'
+                    '<div class="intuitive-tool-status" role="status" aria-live="polite">'
+                    '動画を読み込んでください。</div></div>',
+                    elem_id="intuitive-toolbox",
+                    elem_classes=["intuitive-tool-header"],
+                )
+                intuitive_transcript = gr.HTML(
+                    render_intuitive_transcript([]),
+                    elem_id="intuitive-transcript-words",
+                )
 
         # 全体の俯瞰と詳細操作は同じ EditPlan を見る二つの表示です。
         # Gradio の Tab 切替には callback を結び付けず、再生位置・選択境界・
@@ -4271,14 +4575,6 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 "① 全体を決める",
                 elem_id="intuitive-overall-range-tab",
             ):
-                gr.Markdown(
-                    "保存する大枠を決めます。上の文字起こし編集で「全体開始」または"
-                    "「全体終了」を選び、文字起こし範囲を選択してください。"
-                    "青枠は詳細編集に表示する範囲で、中央のドラッグで移動、両端の"
-                    "ドラッグで拡大・縮小できます。",
-                    elem_id="intuitive-overall-range-guide",
-                    elem_classes=["intuitive-timeline-tab-guide"],
-                )
                 gr.HTML(
                     '<div class="intuitive-overall-range-actions">'
                     '<span>青枠で詳細表示する範囲を合わせた後、保存範囲へ反映できます。</span>'
@@ -4287,21 +4583,53 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     '</div>',
                     elem_id="intuitive-overall-range-actions",
                 )
+                gr.HTML(
+                    '<div class="intuitive-overall-adjust-controls" '
+                    'data-intuitive-overall-controls>'
+                    '<div class="intuitive-overall-boundary-picker" role="group" '
+                    'aria-label="微調整する全体境界">'
+                    '<span>調整する境界</span>'
+                    '<button type="button" data-intuitive-select-overall-boundary="overall_start" '
+                    'aria-pressed="false">全体開始</button>'
+                    '<button type="button" data-intuitive-select-overall-boundary="overall_end" '
+                    'aria-pressed="false">全体終了</button></div>'
+                    '<fieldset class="intuitive-overall-adjust-steps">'
+                    '<legend>調整幅（秒）</legend>'
+                    '<label><input type="radio" name="intuitive-overall-adjust-step" '
+                    'value="0.1" data-intuitive-overall-step>0.1</label>'
+                    '<label><input type="radio" name="intuitive-overall-adjust-step" '
+                    'value="1" data-intuitive-overall-step checked>1</label>'
+                    '<label><input type="radio" name="intuitive-overall-adjust-step" '
+                    'value="10" data-intuitive-overall-step>10</label>'
+                    '<label><input type="radio" name="intuitive-overall-adjust-step" '
+                    'value="30" data-intuitive-overall-step>30</label>'
+                    '<label><input type="radio" name="intuitive-overall-adjust-step" '
+                    'value="60" data-intuitive-overall-step>60</label>'
+                    '<label><input type="radio" name="intuitive-overall-adjust-step" '
+                    'value="600" data-intuitive-overall-step>600</label>'
+                    '</fieldset>'
+                    '<div class="intuitive-overall-adjust-actions" role="group" '
+                    'aria-label="選択した全体境界を微調整">'
+                    '<button type="button" data-intuitive-overall-adjust="-1" disabled>前へ</button>'
+                    '<button type="button" data-intuitive-overall-adjust="1" disabled>後ろへ</button>'
+                    '</div></div>',
+                    elem_id="intuitive-overall-adjust-controls",
+                )
                 intuitive_overview_timeline = gr.HTML(
                     render_intuitive_overview_timeline(1.0, 0.0, 1.0),
                     elem_id="intuitive-overview-timeline",
+                )
+                intuitive_search_marker_projection = gr.HTML(
+                    render_intuitive_search_marker_projection(
+                        {"request_id": "", "results": []}
+                    ),
+                    elem_id="intuitive-search-marker-projection",
                 )
 
             with gr.Tab(
                 "② 詳細編集（任意）",
                 elem_id="intuitive-detail-edit-tab",
             ):
-                gr.Markdown(
-                    "拡大した範囲で境界を微調整し、必要な箇所だけ途中カットします。"
-                    "全体開始・全体終了も、この画面から引き続き変更できます。",
-                    elem_id="intuitive-detail-edit-guide",
-                    elem_classes=["intuitive-timeline-tab-guide"],
-                )
                 intuitive_zoom_timeline = gr.HTML(
                     render_intuitive_zoom_timeline(0.0, 1.0),
                     elem_id="intuitive-zoom-timeline",
@@ -4452,6 +4780,12 @@ with gr.Blocks(title="動画シーン検索") as demo:
             value='<span data-intuitive-sync-token="" aria-hidden="true"></span>',
             elem_id="intuitive-sync-ack",
         )
+        intuitive_search_marker_command = gr.Textbox(
+            value="", elem_id="intuitive-search-marker-command",
+        )
+        intuitive_search_marker_submit = gr.Button(
+            "select-search-marker", elem_id="intuitive-search-marker-submit",
+        )
         intuitive_result_time = gr.Number(value=0.0, visible=False)
         intuitive_render_outputs = [
             intuitive_state,
@@ -4501,28 +4835,19 @@ with gr.Blocks(title="動画シーン検索") as demo:
             concurrency_limit=1,
         ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
         intuitive_video_picker.expand(
-            build_intuitive_video_gallery,
+            build_intuitive_video_cards,
             inputs=[intuitive_video_filter, intuitive_video_select],
-            outputs=[
-                intuitive_video_gallery, intuitive_video_gallery_ids,
-                intuitive_video_gallery_html,
-            ],
+            outputs=[intuitive_video_gallery_html],
         )
         intuitive_video_filter_btn.click(
-            build_intuitive_video_gallery,
+            build_intuitive_video_cards,
             inputs=[intuitive_video_filter, intuitive_video_select],
-            outputs=[
-                intuitive_video_gallery, intuitive_video_gallery_ids,
-                intuitive_video_gallery_html,
-            ],
+            outputs=[intuitive_video_gallery_html],
         )
         intuitive_video_filter.submit(
-            build_intuitive_video_gallery,
+            build_intuitive_video_cards,
             inputs=[intuitive_video_filter, intuitive_video_select],
-            outputs=[
-                intuitive_video_gallery, intuitive_video_gallery_ids,
-                intuitive_video_gallery_html,
-            ],
+            outputs=[intuitive_video_gallery_html],
         )
         intuitive_reload_btn.click(
             refresh_intuitive_video_picker,
@@ -4531,18 +4856,15 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_search_target,
             ],
             outputs=[
-                intuitive_video_gallery,
-                intuitive_video_gallery_ids,
                 intuitive_video_gallery_html,
                 intuitive_video_select,
                 intuitive_search_target,
             ],
         )
-        intuitive_video_gallery.select(
-            select_intuitive_video_from_gallery,
-            inputs=[intuitive_video_gallery_ids, intuitive_video_filter],
+        intuitive_video_card_submit.click(
+            select_intuitive_video_from_card,
+            inputs=[intuitive_video_card_command, intuitive_video_filter],
             outputs=[
-                intuitive_video_gallery,
                 intuitive_video_select,
                 intuitive_video_gallery_html,
                 *intuitive_load_and_search_outputs,
@@ -4559,6 +4881,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             intuitive_result_table,
             intuitive_search_results,
             intuitive_search_status,
+            intuitive_search_marker_projection,
         ]
         intuitive_search_btn.click(
             do_intuitive_search_staged,
@@ -4585,6 +4908,25 @@ with gr.Blocks(title="動画シーン検索") as demo:
         intuitive_result_table.select(
             on_intuitive_search_select,
             inputs=[intuitive_search_results],
+            outputs=[
+                intuitive_result_table,
+                intuitive_state,
+                intuitive_preview,
+                intuitive_transcript,
+                intuitive_video_info,
+                intuitive_toolbar,
+                intuitive_overview_timeline,
+                intuitive_zoom_timeline,
+                intuitive_summary,
+                intuitive_exclusion_list,
+                intuitive_selected_time,
+            ],
+            concurrency_id="intuitive-editor-state",
+            concurrency_limit=1,
+        ).success(fn=None, js=_INTUITIVE_COLLAPSE_VIDEO_PICKER_JS)
+        intuitive_search_marker_submit.click(
+            on_intuitive_search_marker,
+            inputs=[intuitive_search_marker_command, intuitive_search_results],
             outputs=[
                 intuitive_result_table,
                 intuitive_state,
@@ -4672,17 +5014,82 @@ with gr.Blocks(title="動画シーン検索") as demo:
             )
             index_btn = gr.Button("インデックス作成", variant="primary")
             stop_btn = gr.Button("処理を停止", variant="stop")
+        with gr.Row():
+            llm_analysis_chk = gr.Checkbox(
+                value=False,
+                label="文字起こし後に要約・タグ・章を生成（実験・ローカルOllama）",
+            )
+            llm_model_box = gr.Textbox(
+                value=config.LLM_ANALYSIS_MODEL,
+                label="Ollamaモデル",
+                placeholder="例: qwen3:8b",
+            )
+        gr.Markdown(
+            "LLM解析は既定で無効です。有効時も文字起こし・検索の完了後に実行され、"
+            "解析失敗で動画登録は取り消されません。外部クラウドには送信しません。"
+            "初回だけ `setup_ollama.bat` を実行してOllamaとモデルを準備してください。"
+        )
         index_log = gr.Textbox(label="進捗ログ", interactive=False, lines=10)
 
         video_browse_btn.click(browse_video, inputs=[new_video_box], outputs=[new_video_box])
         index_btn.click(
             do_index,
-            inputs=[new_video_box, asr_model_dd, force_chk, batch_infer_chk],
+            inputs=[
+                new_video_box,
+                asr_model_dd,
+                force_chk,
+                batch_infer_chk,
+                llm_analysis_chk,
+                llm_model_box,
+            ],
             outputs=[index_log, video_select],
             concurrency_id="library-index-io",
             concurrency_limit=1,
         )
         stop_btn.click(stop_indexing)
+
+        with gr.Accordion("LLM解析結果（実験）", open=False):
+            gr.Markdown(
+                "保存済みの要約・タグ・時間付き章を確認できます。"
+                "既存動画の解析も別プロセスで実行します。"
+            )
+            with gr.Row():
+                llm_result_video = gr.Dropdown(
+                    choices=list_video_choices_only(),
+                    label="解析結果を確認する動画",
+                    scale=3,
+                )
+                llm_result_reload = gr.Button("動画一覧を更新", scale=1)
+            with gr.Row():
+                llm_result_show = gr.Button("保存済み結果を表示")
+                llm_result_analyze = gr.Button(
+                    "この動画をローカルLLMで解析",
+                    variant="primary",
+                )
+            llm_result_log = gr.Textbox(
+                label="LLM解析ログ",
+                interactive=False,
+                lines=4,
+            )
+            llm_result_markdown = gr.Markdown(
+                "動画を選択して保存済み結果を表示してください。"
+            )
+            llm_result_reload.click(
+                lambda: gr.update(choices=list_video_choices_only()),
+                outputs=[llm_result_video],
+            )
+            llm_result_show.click(
+                format_latest_llm_analysis,
+                inputs=[llm_result_video],
+                outputs=[llm_result_markdown],
+            )
+            llm_result_analyze.click(
+                do_existing_llm_analysis,
+                inputs=[llm_result_video, llm_model_box],
+                outputs=[llm_result_log, llm_result_markdown],
+                concurrency_id="library-index-io",
+                concurrency_limit=1,
+            )
 
     with gr.Tab("インデックスの共有"):
         gr.Markdown(
@@ -4749,13 +5156,177 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[relink_status], concurrency_id="library-index-io", concurrency_limit=1,
         )
 
+# Gradio 6.19 never clears its loading overlay when any Tab is render=False.
+# Keep the opt-in legacy tab rendered but invisible, then explicitly select the
+# main editor on the implicit top-level Tabs container.
+_top_level_tabs = next(
+    child for child in demo.children if isinstance(child, gr.Tabs)
+)
+_top_level_tabs.selected = "intuitive-main"
+
 
 def _already_running(port: int = APP_PORT) -> bool:
+    return _app_is_healthy(port, timeout_sec=2.0, attempts=3)
+
+
+def _app_is_healthy(
+    port: int = APP_PORT,
+    *,
+    timeout_sec: float = 1.5,
+    attempts: int = 2,
+) -> bool:
+    """Return True only when this Cut_Video Gradio app answers over HTTP."""
+    import json
+    import time
+    import urllib.error
+    import urllib.request
+
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(port)}/config",
+                timeout=max(0.1, float(timeout_sec)),
+            ) as response:
+                status = response.status
+                payload = json.load(response)
+            if (
+                status == 200
+                and payload.get("mode") == "blocks"
+                and payload.get("title") == "動画シーン検索"
+            ):
+                return True
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            urllib.error.URLError,
+        ):
+            pass
+        if attempt + 1 < attempts:
+            time.sleep(0.25)
+    return False
+
+
+def _port_is_open(port: int = APP_PORT) -> bool:
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1.0)
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _write_app_pidfile(port: int = APP_PORT) -> None:
+    """Atomically record the exact process allowed to be cleaned next startup."""
+    import json
+    import os
+
+    APP_PIDFILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "port": int(port),
+        "app_path": str(Path(__file__).resolve()),
+    }
+    temporary = APP_PIDFILE.with_suffix(APP_PIDFILE.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, APP_PIDFILE)
+
+
+def _remove_app_pidfile() -> None:
+    """Remove the PID record only when it still belongs to this process."""
+    import json
+    import os
+
+    try:
+        payload = json.loads(APP_PIDFILE.read_text(encoding="utf-8"))
+        if int(payload.get("pid", -1)) != os.getpid():
+            return
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return
+    APP_PIDFILE.unlink(missing_ok=True)
+
+
+def _stale_app_process(pid: int, port: int) -> bool:
+    """Verify that pid both owns the port and runs this project's app.py."""
+    import os
+    import subprocess
+
+    if os.name != "nt" or pid <= 0 or pid == os.getpid():
+        return False
+    script = (
+        f"$targetPid = {int(pid)}; "
+        f"$owners = @(Get-NetTCPConnection -LocalPort {int(port)} -State Listen "
+        "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess); "
+        f"$proc = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' "
+        "-ErrorAction SilentlyContinue; "
+        "if ($proc -and ($owners -contains $targetPid)) { $proc.CommandLine }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    tokens = (result.stdout or "").replace('"', " ").replace("'", " ").split()
+    return any(Path(token).name.casefold() == "app.py" for token in tokens)
+
+
+def _cleanup_stale_app_instance(port: int = APP_PORT) -> bool:
+    """Stop only a recorded Cut_Video process that owns an unresponsive port."""
+    import json
+    import os
+    import subprocess
+    import time
+
+    if not _port_is_open(port) or _app_is_healthy(
+        port, timeout_sec=1.0, attempts=1
+    ):
+        return False
+
+    try:
+        payload = json.loads(APP_PIDFILE.read_text(encoding="utf-8"))
+        pid = int(payload["pid"])
+        recorded_port = int(payload["port"])
+        recorded_path = Path(payload["app_path"]).resolve()
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        APP_PIDFILE.unlink(missing_ok=True)
+        return False
+
+    if (
+        pid == os.getpid()
+        or recorded_port != int(port)
+        or recorded_path != Path(__file__).resolve()
+        or not _stale_app_process(pid, port)
+    ):
+        APP_PIDFILE.unlink(missing_ok=True)
+        return False
+
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    for _ in range(30):
+        if not _port_is_open(port):
+            APP_PIDFILE.unlink(missing_ok=True)
+            print(f"応答不能だった前回のWebUI (PID {pid}) を停止しました。")
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def _cleanup_stale_index_job() -> None:
@@ -4782,7 +5353,7 @@ def _cleanup_stale_index_job() -> None:
     if pid == os.getpid():
         return
 
-    # コマンドラインを確認し、index_video.py を実行しているプロセスだけを停止する。
+    # コマンドラインを確認し、このアプリが起動する長時間ジョブだけを停止する。
     # (PID再利用で app.py 自身や無関係なpythonプロセスを誤って停止しないため)
     try:
         check = subprocess.run(
@@ -4792,10 +5363,11 @@ def _cleanup_stale_index_job() -> None:
         )
     except (subprocess.SubprocessError, OSError):
         return
-    if "index_video" in (check.stdout or ""):
+    command_line = (check.stdout or "").lower()
+    allowed_jobs = ("index_video.py", "analyze_transcript.py")
+    if any(job_name in command_line for job_name in allowed_jobs):
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-        print(f"前回の残留インデックス処理 (PID {pid}) を停止しました。"
-              "文字起こしは途中保存から再開できます。")
+        print(f"前回の残留バックグラウンド処理 (PID {pid}) を停止しました。")
 
 
 if __name__ == "__main__":
@@ -4807,12 +5379,23 @@ if __name__ == "__main__":
         webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
         raise SystemExit(0)
 
+    if _port_is_open(APP_PORT) and not _cleanup_stale_app_instance(APP_PORT):
+        print(f"[ERROR] 127.0.0.1:{APP_PORT} は使用中ですが、"
+              "Cut_Videoから正常な応答がありません。")
+        print("タスクマネージャーで以前の app.py を終了するか、"
+              "このポートを使っている別アプリを終了してから再実行してください。")
+        raise SystemExit(1)
+
     _enable_crash_log()
     _cleanup_stale_index_job()
     _initialize_preview_cache()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=APP_PORT,
-        inbrowser=True,
-        css=_APP_CSS,
-    )
+    _write_app_pidfile(APP_PORT)
+    try:
+        demo.launch(
+            server_name="127.0.0.1",
+            server_port=APP_PORT,
+            inbrowser=True,
+            css=_APP_CSS,
+        )
+    finally:
+        _remove_app_pidfile()

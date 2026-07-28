@@ -480,6 +480,9 @@ responseに必要なもの:
 - reducerの一括移動はしない。plan、history、sessionの順に薄くする。
 - validation errorはdomain/application codeから`gr.Error`へ最外周で変換する。
 - 既存のcommand FIFO、revision ACK、read-only syncを移行中も維持する。
+- 検索ヒットのtimelineマーカーはcanonical EditPlanへ格納しない。request ID付きの
+  adapter viewをDOMへ投影し、stable hit IDを既存の検索結果open経路へ渡す。
+  検索laneからeditor overview全体を再生成してviewportを巻き戻してはならない。
 
 ### 11.2 CLI
 
@@ -680,6 +683,8 @@ HTTP serverは含めない。
 
 勝たなければ置換しない。
 
+採用判断後の現行方針: 直感編集を正式メイン「検索・編集・切り抜き」として採用した。従来の「検索・切り抜き」は既定では非表示とし、`CUT_VIDEO_ENABLE_LEGACY_UI=1`のときだけ移行確認用に表示する。詳細編集タイムライン直前の重複説明ガイドを削除し、プレビューからタイムラインまでを初期viewportへ収める。通常の境界編集では文字起こし全体を再取得・再描画せず、装飾用projectionだけを更新する。文字起こし範囲queryはactive `transcript_revision`へ限定し、`(video_id, transcript_revision, start_sec)`の複合indexを利用する。
+
 ### Phase 6: Desktop shell評価
 
 Phase 5合格時だけ、pywebviewとTauriを比較する。sidecar、installer、GPU runtime同梱は配布要件が確定するまで行わない。
@@ -709,6 +714,10 @@ Phase 5合格時だけ、pywebviewとTauriを比較する。sidecar、installer�
 - WebSocket進捗
 - Tauri/pywebview/installer
 - 汎用タイムラインeditor
+
+`experiment/llm-transcript-analysis` は上記判断を変更する本線実装ではない。
+ASR公開後の失敗許容derived-data stage、revision紐付け、loopback限定provider、
+時間根拠の検証を評価するための分離ブランチ実験とする。
 
 ## 15. 各フェーズ共通の完了条件
 

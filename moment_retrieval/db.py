@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -125,6 +125,42 @@ CREATE TABLE IF NOT EXISTS publication_leases (
     heartbeat REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+
+-- LLM outputs are derived data.  The immutable ASR rows above remain the
+-- canonical source for timing and search, even when an analysis is rerun.
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    analysis_run_id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(video_id),
+    transcript_revision TEXT NOT NULL REFERENCES transcript_revisions(transcript_revision),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'ready', 'failed')),
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    summary TEXT,
+    tags_json TEXT,
+    result_json TEXT,
+    error_message TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_revision
+ON analysis_runs(video_id, transcript_revision, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS analysis_chapters (
+    chapter_id TEXT PRIMARY KEY,
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    start_segment_id INTEGER NOT NULL,
+    end_segment_id INTEGER NOT NULL,
+    start_sec REAL NOT NULL,
+    end_sec REAL NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT,
+    tags_json TEXT,
+    UNIQUE(analysis_run_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_chapters_run
+ON analysis_chapters(analysis_run_id, ordinal);
 """
 
 
@@ -384,6 +420,10 @@ def init_db(conn: sqlite3.Connection, *, create_backup: bool = True) -> Path | N
             if statement.strip():
                 conn.execute(statement)
         _migrate_legacy_schema(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_segments_revision_range "
+            "ON asr_segments(video_id, transcript_revision, start_sec)"
+        )
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
     except Exception:
@@ -817,6 +857,200 @@ def get_segments(
             (storage_id, effective_revision),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+ANALYSIS_STATUSES = frozenset({"pending", "running", "ready", "failed"})
+
+
+def create_analysis_run(
+    conn: sqlite3.Connection,
+    video_id: str,
+    transcript_revision: str,
+    *,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    commit: bool = True,
+) -> str:
+    """Create a new, rerunnable derived LLM analysis record.
+
+    This function never mutates ``asr_segments`` or ``transcript_revisions``.
+    ``video_id`` accepts either the public or storage identifier, but persists
+    the storage identifier so the foreign-key relationship remains valid.
+    """
+    storage_id = _storage_id(conn, video_id) or video_id
+    valid = conn.execute(
+        "SELECT 1 FROM transcript_revisions r JOIN videos v "
+        "ON v.source_generation = r.source_generation "
+        "WHERE v.video_id = ? AND r.transcript_revision = ? LIMIT 1",
+        (storage_id, transcript_revision),
+    ).fetchone()
+    if valid is None:
+        raise ValueError("transcript revision does not belong to this video")
+    run_id = f"analysis_{uuid.uuid4().hex}"
+    conn.execute(
+        "INSERT INTO analysis_runs(analysis_run_id, video_id, transcript_revision, status, "
+        "provider, model, prompt_version) VALUES(?, ?, ?, 'pending', ?, ?, ?)",
+        (run_id, storage_id, transcript_revision, provider, model, prompt_version),
+    )
+    if commit:
+        conn.commit()
+    return run_id
+
+
+def update_analysis_run(
+    conn: sqlite3.Connection,
+    analysis_run_id: str,
+    *,
+    status: str,
+    summary: str | None = None,
+    tags: list[str] | None = None,
+    result: dict | None = None,
+    error_message: str | None = None,
+    commit: bool = True,
+) -> None:
+    """Transition an analysis run and persist only its derived result fields."""
+    if status not in ANALYSIS_STATUSES:
+        raise ValueError(f"invalid analysis status: {status}")
+    cursor = conn.execute(
+        "UPDATE analysis_runs SET status = ?, summary = ?, tags_json = ?, result_json = ?, "
+        "error_message = ?, updated_at = datetime('now') WHERE analysis_run_id = ?",
+        (
+            status,
+            summary,
+            json.dumps(tags, ensure_ascii=False) if tags is not None else None,
+            json.dumps(result, ensure_ascii=False, sort_keys=True) if result is not None else None,
+            error_message,
+            analysis_run_id,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("analysis run does not exist")
+    if commit:
+        conn.commit()
+
+
+def replace_analysis_chapters(
+    conn: sqlite3.Connection,
+    analysis_run_id: str,
+    chapters: Iterable[dict],
+    *,
+    commit: bool = True,
+) -> None:
+    """Replace chapters for one run; callers supply already validated timings."""
+    conn.execute("DELETE FROM analysis_chapters WHERE analysis_run_id = ?", (analysis_run_id,))
+    rows = []
+    for ordinal, chapter in enumerate(chapters):
+        rows.append((
+            f"chapter_{uuid.uuid4().hex}", analysis_run_id, ordinal,
+            int(chapter["start_segment_id"]), int(chapter["end_segment_id"]),
+            float(chapter["start_sec"]), float(chapter["end_sec"]),
+            str(chapter["title"]), chapter.get("summary"),
+            json.dumps(chapter.get("tags", []), ensure_ascii=False),
+        ))
+    conn.executemany(
+        "INSERT INTO analysis_chapters(chapter_id, analysis_run_id, ordinal, start_segment_id, "
+        "end_segment_id, start_sec, end_sec, title, summary, tags_json) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
+    )
+    if commit:
+        conn.commit()
+
+
+def get_analysis_run(conn: sqlite3.Connection, analysis_run_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM analysis_runs WHERE analysis_run_id = ?", (analysis_run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    for field in ("tags_json", "result_json"):
+        if result.get(field):
+            result[field[:-5]] = json.loads(result[field])
+    return result
+
+
+def get_analysis_chapters(conn: sqlite3.Connection, analysis_run_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM analysis_chapters WHERE analysis_run_id = ? ORDER BY ordinal",
+        (analysis_run_id,),
+    ).fetchall()
+    chapters = []
+    for row in rows:
+        result = dict(row)
+        result["tags"] = json.loads(result.pop("tags_json") or "[]")
+        chapters.append(result)
+    return chapters
+
+
+def list_analysis_runs(
+    conn: sqlite3.Connection, video_id: str, transcript_revision: str
+) -> list[dict]:
+    storage_id = _storage_id(conn, video_id) or video_id
+    rows = conn.execute(
+        "SELECT * FROM analysis_runs WHERE video_id = ? AND transcript_revision = ? "
+        "ORDER BY created_at DESC, rowid DESC",
+        (storage_id, transcript_revision),
+    ).fetchall()
+    return [get_analysis_run(conn, str(row["analysis_run_id"])) for row in rows]
+
+
+def get_segments_in_range(
+    conn: sqlite3.Connection,
+    video_id: str,
+    start_sec: float,
+    end_sec: float,
+    *,
+    transcript_revision: str | None = None,
+) -> list[dict]:
+    """Return only the active transcript rows overlapping one source range."""
+    storage_id = _storage_id(conn, video_id) or video_id
+    effective_revision = (
+        transcript_revision
+        if transcript_revision is not None
+        else get_active_transcript_revision(conn, storage_id)
+    )
+    params: tuple = (storage_id, float(start_sec), float(end_sec))
+    revision_clause = ""
+    if effective_revision is not None:
+        revision_clause = " AND transcript_revision = ?"
+        params = (*params, effective_revision)
+    rows = conn.execute(
+        "SELECT segment_id, video_id, start_sec, end_sec, text, words_json, "
+        "transcript_revision FROM asr_segments "
+        "WHERE video_id = ? AND end_sec > ? AND start_sec < ?"
+        f"{revision_clause} ORDER BY start_sec, segment_id",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_first_text_segment(
+    conn: sqlite3.Connection,
+    video_id: str,
+    *,
+    transcript_revision: str | None = None,
+) -> dict | None:
+    """Return the first non-empty row from the active transcript revision."""
+    storage_id = _storage_id(conn, video_id) or video_id
+    effective_revision = (
+        transcript_revision
+        if transcript_revision is not None
+        else get_active_transcript_revision(conn, storage_id)
+    )
+    params: tuple = (storage_id,)
+    revision_clause = ""
+    if effective_revision is not None:
+        revision_clause = " AND transcript_revision = ?"
+        params = (*params, effective_revision)
+    row = conn.execute(
+        "SELECT segment_id, video_id, start_sec, end_sec, text, words_json, "
+        "transcript_revision FROM asr_segments WHERE video_id = ? "
+        "AND trim(COALESCE(text, '')) <> ''"
+        f"{revision_clause} ORDER BY start_sec, segment_id LIMIT 1",
+        params,
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def get_indexed_video_ids(conn: sqlite3.Connection) -> set[str]:

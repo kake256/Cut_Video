@@ -15,6 +15,7 @@ import hashlib
 import html
 import json
 import math
+import re
 import secrets
 import statistics
 import subprocess
@@ -4161,6 +4162,22 @@ def _highlight_export_context(video_choice: str) -> tuple[dict, list[dict]]:
         if run is None:
             raise gr.Error("保存できる見どころ候補がありません。")
         candidates = db.get_highlight_candidates(conn, run["highlight_run_id"])
+        chapters = db.get_analysis_chapters(conn, run["analysis_run_id"])
+        chapter_titles = {
+            int(chapter["ordinal"]): str(chapter.get("title") or "").strip()
+            for chapter in chapters
+        }
+        candidates = [
+            {
+                **candidate,
+                "export_title": (
+                    chapter_titles.get(int(candidate["source_chapter_ordinal"]))
+                    or str(candidate.get("title") or "").strip()
+                    or "見どころ"
+                ),
+            }
+            for candidate in candidates
+        ]
         video = db.get_video(conn, video_id)
         if not video or not Path(video["path"]).is_file():
             raise gr.Error("候補の元動画が見つかりません。")
@@ -4169,13 +4186,41 @@ def _highlight_export_context(video_choice: str) -> tuple[dict, list[dict]]:
         conn.close()
 
 
+_WINDOWS_RESERVED_FILENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+
+
+def _safe_highlight_filename_part(
+    value: str, *, fallback: str, max_length: int
+) -> str:
+    """Return a readable filename part that is safe on Windows."""
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or ""))
+    sanitized = re.sub(r"\s+", " ", sanitized).strip(" .")
+    if not sanitized:
+        sanitized = fallback
+    sanitized = sanitized[:max_length].rstrip(" .") or fallback
+    if sanitized.upper() in _WINDOWS_RESERVED_FILENAMES:
+        sanitized = f"_{sanitized}"
+    return sanitized
+
+
 def _available_highlight_output_path(
-    output_dir: Path, ordinal: int, start_sec: float, end_sec: float
+    output_dir: Path, video_name: str, chapter_title: str
 ) -> Path:
-    stem = (
-        f"highlight_{ordinal:02d}_"
-        f"{round(start_sec * 1000):012d}_{round(end_sec * 1000):012d}"
+    safe_video_name = _safe_highlight_filename_part(
+        Path(video_name).stem,
+        fallback="動画",
+        max_length=64,
     )
+    safe_chapter_title = _safe_highlight_filename_part(
+        chapter_title,
+        fallback="見どころ",
+        max_length=96,
+    )
+    stem = f"{safe_video_name}_{safe_chapter_title}"
     candidate = output_dir / f"{stem}.mp4"
     suffix = 2
     while candidate.exists() or candidate.with_name(
@@ -4216,11 +4261,16 @@ def export_highlight_candidates(
         output_dir.mkdir(parents=True, exist_ok=True)
         log_lines.append(f"{len(candidates)}件の候補をローカル保存します。")
         yield "\n".join(log_lines), outputs
+        video_name = str(
+            video.get("display_name") or Path(video["path"]).name
+        )
         for ordinal, candidate in enumerate(candidates, start=1):
             start = float(candidate["start_sec"])
             end = float(candidate["end_sec"])
             output = _available_highlight_output_path(
-                output_dir, ordinal, start, end
+                output_dir,
+                video_name,
+                str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
             )
             temporary = output.with_name(
                 f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
@@ -5763,39 +5813,40 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "文字起こし済み動画の要約を作成・確認し、その保存済み要約から"
             "見どころ候補を作成します。処理はローカルOllamaだけを使用します。"
         )
-        with gr.Accordion("1. LLM要約を作る・確認する", open=True):
-            gr.Markdown(
-                "保存済みの要約・タグ・時間付き章を確認できます。"
-                "要約がない動画は、この画面から別プロセスで作成できます。"
+        with gr.Row():
+            llm_result_video = gr.Dropdown(
+                choices=list_llm_result_video_choices(),
+                label="対象動画（要約・見どころ共通）",
+                scale=3,
             )
-            with gr.Row():
-                llm_result_video = gr.Dropdown(
-                    choices=list_llm_result_video_choices(),
-                    label="要約を作成・確認する動画",
-                    scale=3,
-                )
-                llm_workspace_model_box = gr.Textbox(
-                    value=config.LLM_ANALYSIS_MODEL,
-                    label="Ollamaモデル",
-                    placeholder="例: qwen3:8b",
-                    scale=1,
-                )
-                llm_result_reload = gr.Button("動画一覧を更新", scale=1)
-            with gr.Row():
-                llm_result_show = gr.Button("保存済み結果を表示")
-                llm_result_analyze = gr.Button(
-                    "この動画をローカルLLMで解析",
-                    variant="primary",
-                )
-            llm_result_log = gr.Textbox(
-                label="LLM解析ログ",
-                interactive=False,
-                lines=4,
+            llm_workspace_model_box = gr.Textbox(
+                value=config.LLM_ANALYSIS_MODEL,
+                label="Ollamaモデル",
+                placeholder="例: qwen3:8b",
+                scale=1,
             )
-            llm_result_markdown = gr.Markdown(
-                "動画を選択して保存済み結果を表示してください。"
-            )
-            with gr.Accordion("2. 保存済み要約から見どころを作る", open=True):
+            llm_result_reload = gr.Button("動画一覧を更新", scale=1)
+        with gr.Tabs(elem_id="llm-workspace-tabs"):
+            with gr.Tab("① 要約を作る・確認する"):
+                gr.Markdown(
+                    "保存済みの要約・タグ・時間付き章を確認できます。"
+                    "要約がない動画は、この画面から別プロセスで作成できます。"
+                )
+                with gr.Row():
+                    llm_result_show = gr.Button("保存済み結果を表示")
+                    llm_result_analyze = gr.Button(
+                        "この動画をローカルLLMで解析",
+                        variant="primary",
+                    )
+                llm_result_log = gr.Textbox(
+                    label="LLM解析ログ",
+                    interactive=False,
+                    lines=4,
+                )
+                llm_result_markdown = gr.Markdown(
+                    "動画を選択して保存済み結果を表示してください。"
+                )
+            with gr.Tab("② 要約から見どころを作る・切り抜く"):
                 gr.Markdown(
                     "保存済みの章から候補章を選び、選んだ章の元文字起こしへ戻って"
                     "内容が収まる範囲を作ります。映像・表情・音の盛り上がりは評価しません。"
@@ -5834,7 +5885,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     highlight_max_duration = gr.Number(
                         value=config.LLM_HIGHLIGHT_MAX_DURATION_SEC,
                         minimum=1,
-                        label="最大尺（秒）",
+                        label="最大尺（秒・話の完結を優先）",
                     )
                 with gr.Row():
                     highlight_result_show = gr.Button("保存済み候補を表示")

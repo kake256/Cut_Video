@@ -11,7 +11,7 @@ from moment_retrieval.llm_analysis import OllamaProvider
 
 
 def generate_active_highlights(video_id: str, *, model: str, count: int = 6,
-                               min_duration: float = 20.0, max_duration: float = 90.0) -> dict:
+                               min_duration: float = 20.0, max_duration: float = 180.0) -> dict:
     conn = db.get_conn()
     try:
         db.init_db(conn)

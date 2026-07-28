@@ -70,6 +70,7 @@ class AppLlmAnalysisTest(unittest.TestCase):
     def test_highlight_export_can_atomically_save_all_visible_candidates(self):
         video = {
             "path": "synthetic.mp4",
+            "display_name": "synthetic:source.mp4",
             "duration": 120.0,
         }
         candidates = [
@@ -77,11 +78,13 @@ class AppLlmAnalysisTest(unittest.TestCase):
                 "highlight_candidate_id": "candidate-1",
                 "start_sec": 10.0,
                 "end_sec": 20.0,
+                "export_title": "導入/最初の話題",
             },
             {
                 "highlight_candidate_id": "candidate-2",
                 "start_sec": 30.0,
                 "end_sec": 45.0,
+                "export_title": "本題：詳しい説明",
             },
         ]
         with tempfile.TemporaryDirectory() as temporary:
@@ -107,7 +110,73 @@ class AppLlmAnalysisTest(unittest.TestCase):
             saved = outputs[-1][1]
             self.assertEqual(len(saved), 2)
             self.assertTrue(all(Path(path).is_file() for path in saved))
+            self.assertEqual(
+                [Path(path).name for path in saved],
+                [
+                    "synthetic_source_導入_最初の話題.mp4",
+                    "synthetic_source_本題：詳しい説明.mp4",
+                ],
+            )
             self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
+
+    def test_highlight_filename_parts_are_windows_safe(self):
+        self.assertEqual(
+            app._safe_highlight_filename_part(
+                '章: まとめ/結論?*', fallback="見どころ", max_length=80
+            ),
+            "章_ まとめ_結論__",
+        )
+        self.assertEqual(
+            app._safe_highlight_filename_part(
+                "CON", fallback="動画", max_length=80
+            ),
+            "_CON",
+        )
+
+    def test_highlight_export_uses_source_chapter_title(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.mp4"
+            source.write_bytes(b"video")
+            with (
+                patch.object(app, "parse_video_choice", return_value="vid_synthetic"),
+                patch.object(app.db, "get_conn", return_value=_Connection()),
+                patch.object(app.db, "init_db"),
+                patch.object(
+                    app.db,
+                    "get_active_transcript_revision",
+                    return_value="revision-1",
+                ),
+                patch.object(
+                    app.db,
+                    "get_latest_ready_highlight_run",
+                    return_value={
+                        "highlight_run_id": "highlight-1",
+                        "analysis_run_id": "analysis-1",
+                    },
+                ),
+                patch.object(
+                    app.db,
+                    "get_highlight_candidates",
+                    return_value=[{
+                        "highlight_candidate_id": "candidate-1",
+                        "source_chapter_ordinal": 2,
+                        "title": "candidate title",
+                    }],
+                ),
+                patch.object(
+                    app.db,
+                    "get_analysis_chapters",
+                    return_value=[{"ordinal": 2, "title": "chapter title"}],
+                ),
+                patch.object(
+                    app.db,
+                    "get_video",
+                    return_value={"path": str(source), "display_name": "source.mp4"},
+                ),
+            ):
+                _video, candidates = app._highlight_export_context("synthetic")
+
+        self.assertEqual(candidates[0]["export_title"], "chapter title")
 
     def test_llm_summary_and_highlights_have_a_dedicated_ordered_tab(self):
         tab_labels = [
@@ -115,16 +184,9 @@ class AppLlmAnalysisTest(unittest.TestCase):
             for component in app.demo.config.get("components", [])
             if component.get("type") == "tabitem"
         ]
-        accordion_labels = [
-            (component.get("props") or {}).get("label")
-            for component in app.demo.config.get("components", [])
-            if component.get("type") == "accordion"
-        ]
         self.assertIn("LLM要約・見どころ", tab_labels)
-        summary_index = accordion_labels.index("1. LLM要約を作る・確認する")
-        highlight_index = accordion_labels.index(
-            "2. 保存済み要約から見どころを作る"
-        )
+        summary_index = tab_labels.index("① 要約を作る・確認する")
+        highlight_index = tab_labels.index("② 要約から見どころを作る・切り抜く")
         self.assertLess(summary_index, highlight_index)
 
     def test_saved_summary_enables_highlight_generation_without_reanalysis(self):

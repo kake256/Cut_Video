@@ -712,9 +712,65 @@ body:has(#intuitive-toolbox [data-active-tool]:not([data-active-tool=""]))
 #intuitive-sync-token, #intuitive-sync-submit, #intuitive-sync-ack,
 #intuitive-video-card-command, #intuitive-video-card-submit,
 #intuitive-search-marker-projection, #intuitive-search-marker-command,
-#intuitive-search-marker-submit {
+#intuitive-search-marker-submit, #highlight-candidate-selection {
   display: none !important;
 }
+
+/* Highlight candidates are selected where they are read.  Keep this a flat
+   document-like list instead of a second detached Radio control. */
+.highlight-candidate-view { display: grid; gap: .65rem; }
+.highlight-candidate-quality h3 { margin: 0 0 .2rem; font-size: 1.08rem; }
+.highlight-candidate-quality p { margin: 0 0 .4rem; color: var(--body-text-color-subdued); }
+.highlight-candidate-quality details { font-size: .86rem; }
+.highlight-candidate-quality details > summary { cursor: pointer; font-weight: 600; }
+.highlight-candidate-quality ul { margin: .35rem 0 0 1.2rem; }
+.highlight-candidate-card-list {
+  min-width: 0; margin: 0; padding: 0; border: 0;
+  display: grid; gap: 0;
+}
+.highlight-candidate-legend {
+  width: 100%; padding: .2rem 0 .35rem; font-weight: 700;
+}
+.highlight-candidate-card {
+  display: block; padding: .72rem .8rem .78rem .55rem;
+  border-top: 1px solid var(--border-color-primary);
+  border-left: 3px solid transparent;
+  cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease;
+}
+.highlight-candidate-card:last-child {
+  border-bottom: 1px solid var(--border-color-primary);
+}
+.highlight-candidate-card:hover { background: var(--background-fill-secondary); }
+.highlight-candidate-card:has(input:checked),
+.highlight-candidate-card.is-selected {
+  border-left-color: var(--primary-500);
+  background: color-mix(in srgb, var(--primary-500) 7%, transparent);
+}
+.highlight-candidate-heading {
+  display: flex; align-items: flex-start; gap: .5rem; min-width: 0;
+}
+.highlight-candidate-heading input[type="radio"] {
+  flex: 0 0 auto; width: 1rem; height: 1rem; margin: .16rem 0 0;
+  accent-color: var(--primary-500); cursor: pointer;
+}
+.highlight-candidate-title { line-height: 1.4; overflow-wrap: anywhere; }
+.highlight-candidate-description {
+  margin: .42rem 0 0 2rem; padding: 0; line-height: 1.55;
+  color: var(--body-text-color);
+}
+.highlight-candidate-description li { margin: .14rem 0; }
+.highlight-candidate-tag {
+  display: inline-block; margin: .08rem .28rem .08rem 0; padding: .03rem .3rem;
+  border: 1px solid var(--border-color-primary); border-radius: .28rem;
+  background: var(--background-fill-secondary); font-size: .83em;
+}
+.highlight-candidate-warning { color: var(--warning-text-color, #9a5b00); }
+.highlight-candidate-notice,
+.highlight-candidate-empty {
+  padding: .65rem .75rem; border-radius: .45rem;
+  background: var(--background-fill-secondary);
+}
+.highlight-candidate-notice.is-error { color: var(--error-text-color, #b42318); }
 body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-before,
 body:has(#intuitive-toolbox [data-preview-mode="result"]) #intuitive-adjust-before button,
 body:has(#intuitive-toolbox [data-preview-mode="result"]) button#intuitive-adjust-after,

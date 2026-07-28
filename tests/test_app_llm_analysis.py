@@ -19,15 +19,24 @@ class _Connection:
 
 
 class AppLlmAnalysisTest(unittest.TestCase):
-    def test_highlight_generation_and_candidate_selection_use_radio_controls(self):
+    def test_highlight_generation_uses_mode_radio_and_inline_candidate_bridge(self):
         radio_labels = [
             (component.get("props") or {}).get("label")
             for component in app.demo.config.get("components", [])
             if component.get("type") == "radio"
         ]
         self.assertIn("候補の作り方", radio_labels)
-        self.assertIn("プレビュー・編集する候補", radio_labels)
         self.assertIn("保存対象", radio_labels)
+        components_by_elem_id = {
+            (component.get("props") or {}).get("elem_id"): component
+            for component in app.demo.config.get("components", [])
+        }
+        self.assertEqual(
+            components_by_elem_id["highlight-candidate-selection"]["type"],
+            "textbox",
+        )
+        self.assertIn("highlight-candidate-inline", app._INTUITIVE_EDITOR_JS)
+        self.assertIn("#highlight-candidate-selection", app._APP_CSS)
 
     def test_query_generation_dispatches_without_reanalyzing_summary(self):
         with (
@@ -152,7 +161,7 @@ class AppLlmAnalysisTest(unittest.TestCase):
             outputs = app.load_summary_highlight_workspace("vid_synthetic")
 
         self.assertIn("保存済み要約がない", outputs[1])
-        self.assertIsNone(outputs[3]["value"])
+        self.assertEqual(outputs[3]["value"], "")
         self.assertFalse(outputs[4]["interactive"])
 
     def test_latest_ready_analysis_is_escaped_and_time_linked(self):
@@ -286,6 +295,9 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertIn("最小尺へ自動拡張: 2件", rendered)
         self.assertIn("境界警告: 1件", rendered)
         self.assertIn("最大尺内で前後関係を完結できない", rendered)
+        self.assertIn('name="highlight-candidate-inline"', rendered)
+        self.assertIn('value="candidate-safe"', rendered)
+        self.assertIn("highlight-candidate-description", rendered)
         self.assertEqual(choices[0][1], "candidate-safe")
 
     def test_highlight_candidate_opens_as_exact_clean_edit_plan(self):

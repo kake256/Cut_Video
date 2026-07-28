@@ -454,6 +454,35 @@
     requestAnimationFrame(() => submit.click());
   }, true);
 
+  // Keep candidate selection next to the candidate explanation.  The custom
+  // cards provide native radio keyboard/assistive behavior, while this small
+  // bridge sends only the stable candidate ID back to Gradio for later
+  // preview/edit/export actions.
+  document.addEventListener('change', (event) => {
+    const radio = event.target.closest(
+      '#highlight-candidate-cards input[name="highlight-candidate-inline"]'
+    );
+    if (!radio) return;
+    const candidateId = radio.value || '';
+    const field = document.querySelector(
+      '#highlight-candidate-selection textarea, '
+      + '#highlight-candidate-selection input'
+    );
+    if (!candidateId || !field) return;
+    document.querySelectorAll(
+      '#highlight-candidate-cards .highlight-candidate-card'
+    ).forEach((card) => {
+      card.classList.toggle('is-selected', card.contains(radio));
+    });
+    const prototype = field instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
+    setter.call(field, candidateId);
+    field.dispatchEvent(new InputEvent('input', {
+      bubbles: true, composed: true, inputType: 'insertText', data: null
+    }));
+  }, true);
+
   document.addEventListener('click', (event) => {
     const marker = event.target.closest('.intuitive-search-marker');
     if (!marker || event.defaultPrevented) return;

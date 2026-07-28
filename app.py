@@ -3645,10 +3645,7 @@ def load_summary_highlight_workspace(video_choice: str):
         summary,
         status,
         highlight_markdown,
-        gr.update(
-            choices=choices,
-            value=choices[0][1] if choices else None,
-        ),
+        gr.update(value=choices[0][1] if choices else ""),
         gr.update(interactive=ready),
     )
 
@@ -3725,7 +3722,7 @@ def do_existing_llm_analysis(video_choice: str, model: str):
 
 
 def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]]]:
-    """Return escaped candidate Markdown and stable dropdown choices."""
+    """Return escaped inline-radio cards and stable candidate IDs."""
     video_id = parse_video_choice(video_choice)
     if not video_id:
         return "動画を選択してください。", []
@@ -3743,13 +3740,23 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
         notices = []
         if latest and latest["status"] == "failed":
             notices.append(
-                "> 最新の候補生成は失敗しました: "
+                '<div class="highlight-candidate-notice is-error">'
+                "最新の候補生成は失敗しました: "
                 + html.escape(str(latest.get("error_message") or "原因不明"))
+                + "</div>"
             )
         elif latest and latest["status"] in {"pending", "running"}:
-            notices.append("> 最新の候補生成は処理中です。")
+            notices.append(
+                '<div class="highlight-candidate-notice">'
+                "最新の候補生成は処理中です。</div>"
+            )
         if ready is None:
-            return "\n\n".join(notices or ["候補はまだ利用できません。"]), []
+            return "".join(
+                notices or [
+                    '<div class="highlight-candidate-empty">'
+                    "候補はまだ利用できません。</div>"
+                ]
+            ), []
 
         candidates = db.get_highlight_candidates(conn, ready["highlight_run_id"])
         result = ready.get("result") or {}
@@ -3758,34 +3765,43 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             "自然言語クエリ検索"
             if generation_mode == "query" else "要約から自動選定"
         )
-        lines = notices + [
-            "### 見どころ候補",
-            (
-                "文字起こしだけを使った候補です。映像だけの出来事、表情、音の盛り上がりは "
-                "評価していません。必ずプレビューで確認してください。"
-            ),
-            "",
-            "### 生成品質",
-            f"- 生成方式: **{generation_description}**",
-            f"- 候補: **{len(candidates)}件** / 要求: {int(result.get('requested_count') or ready.get('requested_count') or 0)}件",
-            "- 候補尺: "
+        requested = int(
+            result.get("requested_count") or ready.get("requested_count") or 0
+        )
+        query_html = ""
+        if generation_mode == "query" and result.get("query"):
+            query_html = (
+                "<li>クエリ: "
+                f"{html.escape(str(result['query']))}</li>"
+            )
+        parts = [
+            '<div class="highlight-candidate-view">',
+            *notices,
+            '<section class="highlight-candidate-quality">',
+            "<h3>見どころ候補</h3>",
+            "<p>文字起こしだけを使った候補です。映像だけの出来事、表情、"
+            "音の盛り上がりは評価していません。必ずプレビューで確認してください。</p>",
+            "<details><summary>生成品質を表示</summary><ul>",
+            f"<li>生成方式: <strong>{generation_description}</strong></li>",
+            query_html,
+            f"<li>候補: <strong>{len(candidates)}件</strong> / 要求: {requested}件</li>",
+            "<li>候補尺: "
             f"{float(result.get('duration_min') or 0.0):.1f}〜"
             f"{float(result.get('duration_max') or 0.0):.1f}秒 "
-            f"（中央値 {float(result.get('duration_median') or 0.0):.1f}秒）",
-            f"- 重複抑制: {int(result.get('overlap_suppressed_count') or 0)}件 / "
+            f"（中央値 {float(result.get('duration_median') or 0.0):.1f}秒）</li>",
+            f"<li>重複抑制: {int(result.get('overlap_suppressed_count') or 0)}件 / "
             f"最小尺へ自動拡張: {int(result.get('boundary_expanded_count') or 0)}件 / "
             f"境界警告: {int(result.get('boundary_warning_count') or 0)}件 / "
-            f"最小尺未達: {int(result.get('below_min_duration_count') or 0)}件",
-            "- segment根拠: "
-            + ("全候補で確認済み" if result.get("all_segment_linked") else "未確認"),
-            f"- 隔離した不正ASR segment: {int(result.get('invalid_segment_count') or 0)}件",
-            "",
+            f"最小尺未達: {int(result.get('below_min_duration_count') or 0)}件</li>",
+            "<li>segment根拠: "
+            + ("全候補で確認済み" if result.get("all_segment_linked") else "未確認")
+            + "</li>",
+            f"<li>隔離した不正ASR segment: "
+            f"{int(result.get('invalid_segment_count') or 0)}件</li>",
+            "</ul></details></section>",
+            '<fieldset class="highlight-candidate-card-list">',
+            '<legend class="highlight-candidate-legend">候補を選択</legend>',
         ]
-        if generation_mode == "query" and result.get("query"):
-            lines.insert(
-                lines.index("### 生成品質") + 2,
-                f"- クエリ: `{html.escape(str(result['query']))}`",
-            )
         choices: list[tuple[str, str]] = []
         for ordinal, candidate in enumerate(candidates, start=1):
             start = float(candidate["start_sec"])
@@ -3794,42 +3810,55 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             summary = html.escape(str(candidate.get("summary") or ""))
             reason = html.escape(str(candidate.get("reason") or ""))
             category = html.escape(str(candidate.get("category") or "未分類"))
-            tags = " / ".join(
-                f"`{html.escape(str(tag))}`" for tag in candidate.get("tags", [])
+            tags = "".join(
+                '<span class="highlight-candidate-tag">'
+                f"{html.escape(str(tag))}</span>"
+                for tag in candidate.get("tags", [])
             )
             duration = end - start
-            lines.append(
-                f"#### {ordinal}. {utils.format_timestamp(start)}–"
+            candidate_id = str(candidate["highlight_candidate_id"])
+            escaped_candidate_id = html.escape(candidate_id, quote=True)
+            checked = " checked" if ordinal == 1 else ""
+            parts.extend([
+                '<label class="highlight-candidate-card'
+                + (" is-selected" if ordinal == 1 else "") + '">',
+                '<span class="highlight-candidate-heading">',
+                f'<input type="radio" name="highlight-candidate-inline" '
+                f'value="{escaped_candidate_id}"{checked}>',
+                '<strong class="highlight-candidate-title">'
+                f"{ordinal}. {utils.format_timestamp(start)}–"
                 f"{utils.format_timestamp(end)}（{duration:.1f}秒）　{title}"
-            )
-            lines.append(f"- 分類: {category}")
+                "</strong></span>",
+                '<ul class="highlight-candidate-description">',
+                f"<li>分類: {category}</li>",
+            ])
             if summary:
-                lines.append(f"- 内容: {summary}")
+                parts.append(f"<li>内容: {summary}</li>")
             if reason:
-                lines.append(f"- 選定理由: {reason}")
+                parts.append(f"<li>選定理由: {reason}</li>")
             if tags:
-                lines.append(f"- タグ: {tags}")
+                parts.append(f"<li>タグ: {tags}</li>")
             if candidate.get("boundary_warning"):
-                lines.append(
-                    "- ⚠ 最大尺内で前後関係を完結できない可能性があります。"
-                    "プレビュー後に編集画面で境界を調整してください。"
+                parts.append(
+                    '<li class="highlight-candidate-warning">⚠ 最大尺内で前後関係を'
+                    "完結できない可能性があります。プレビュー後に編集画面で境界を"
+                    "調整してください。</li>"
                 )
+            parts.extend(["</ul>", "</label>"])
             label = (
                 f"{ordinal}. {utils.format_timestamp(start)}–"
                 f"{utils.format_timestamp(end)}  {str(candidate.get('title') or '無題')}"
             )
-            choices.append((label, str(candidate["highlight_candidate_id"])))
-        return "\n".join(lines), choices
+            choices.append((label, candidate_id))
+        parts.extend(["</fieldset>", "</div>"])
+        return "".join(parts), choices
     finally:
         conn.close()
 
 
 def load_latest_highlight_view(video_choice: str):
-    markdown, choices = _latest_highlight_view(video_choice)
-    return markdown, gr.update(
-        choices=choices,
-        value=choices[0][1] if choices else None,
-    )
+    cards, choices = _latest_highlight_view(video_choice)
+    return cards, gr.update(value=choices[0][1] if choices else "")
 
 
 def _resolve_highlight_candidate(video_choice: str, candidate_id: str):
@@ -4110,10 +4139,7 @@ def do_highlight_generation(
     yield (
         "\n".join(log_lines),
         markdown,
-        gr.update(
-            choices=choices,
-            value=choices[0][1] if choices else None,
-        ),
+        gr.update(value=choices[0][1] if choices else ""),
     )
 
 
@@ -4312,10 +4338,7 @@ def do_existing_highlight_analysis(
             yield (
                 "\n".join(log_lines),
                 markdown,
-                gr.update(
-                    choices=choices,
-                    value=choices[0][1] if choices else None,
-                ),
+                gr.update(value=choices[0][1] if choices else ""),
             )
         elif _index_state["stopped"]:
             log_lines.append(
@@ -5825,12 +5848,19 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     interactive=False,
                     lines=4,
                 )
-                highlight_result_markdown = gr.Markdown(
-                    "先に動画と保存済みLLM解析結果を選択してください。"
+                highlight_result_markdown = gr.HTML(
+                    '<div class="highlight-candidate-empty">'
+                    "先に動画と保存済みLLM解析結果を選択してください。</div>",
+                    elem_id="highlight-candidate-cards",
                 )
-                highlight_candidate_select = gr.Radio(
-                    choices=[],
-                    label="プレビュー・編集する候補",
+                # Inline radio cards write their stable candidate ID here.
+                # Keeping one Gradio bridge makes preview/edit/export callbacks
+                # independent from the rendered card order.
+                highlight_candidate_select = gr.Textbox(
+                    value="",
+                    show_label=False,
+                    container=False,
+                    elem_id="highlight-candidate-selection",
                 )
                 with gr.Row():
                     highlight_preview_btn = gr.Button("選択候補をプレビュー")

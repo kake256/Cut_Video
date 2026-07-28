@@ -93,6 +93,21 @@ body:has(#intuitive-toolbox [data-intuitive-root])
   background: var(--background-fill-secondary); color: var(--body-text-color-subdued);
   border: 1px solid var(--border-color-primary);
 }
+.intuitive-video-badge-summary-ready {
+  color: #18794e; border-color: rgba(24, 121, 78, .35);
+  background: rgba(24, 121, 78, .09); font-weight: 650;
+}
+.intuitive-video-badge-summary-missing {
+  color: var(--body-text-color-subdued); font-weight: 600;
+}
+:is(#llm-summary-video-card-grid, #llm-highlight-video-card-grid)
+  .intuitive-video-card.is-summary-missing {
+  opacity: .5; filter: saturate(.55);
+}
+:is(#llm-summary-video-card-grid, #llm-highlight-video-card-grid)
+  .intuitive-video-card.is-summary-missing:is(:hover, :focus-visible, .is-selected) {
+  opacity: .78; filter: saturate(.8);
+}
 .intuitive-video-duration, .intuitive-ts-chip, .intuitive-stat,
 .intuitive-selected-boundary-chip, .intuitive-timeline-scale,
 .intuitive-viewport-summary, .intuitive-exclusion-length,

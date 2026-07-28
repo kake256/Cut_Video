@@ -389,9 +389,23 @@ def render_intuitive_video_cards(
             badges.append('<span class="intuitive-video-badge">文字起こし済み</span>')
         if card.get("indexed"):
             badges.append('<span class="intuitive-video-badge">索引あり</span>')
+        summary_class = ""
+        if "summary_ready" in card:
+            if card.get("summary_ready"):
+                summary_class = " is-summary-ready"
+                badges.append(
+                    '<span class="intuitive-video-badge '
+                    'intuitive-video-badge-summary-ready">要約済み</span>'
+                )
+            else:
+                summary_class = " is-summary-missing"
+                badges.append(
+                    '<span class="intuitive-video-badge '
+                    'intuitive-video-badge-summary-missing">未要約</span>'
+                )
         selected_class = " is-selected" if selected_id and video_id == selected_id else ""
         parts.append(
-            f'<button type="button" class="intuitive-video-card{selected_class}" '
+            f'<button type="button" class="intuitive-video-card{selected_class}{summary_class}" '
             f'data-index="{index}" data-video-id="{escaped_id}" title="{escaped_name}">'
             '<span class="intuitive-video-thumb">'
             f'<img src="{escaped_thumb}" alt="" loading="lazy">'
@@ -421,6 +435,48 @@ def build_intuitive_video_cards(
         for card in cards
     ]
     return render_intuitive_video_cards(display_cards, selected_video_id)
+
+
+def _llm_video_cards_data(
+    filter_text: str = "", *, generate_thumbnails: bool = True
+) -> list[dict]:
+    """Add saved-summary state to the shared thumbnail card data."""
+    cards = _intuitive_video_cards_data(
+        filter_text, generate_thumbnails=generate_thumbnails
+    )
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        for card in cards:
+            revision = db.get_active_transcript_revision(conn, card["video_id"])
+            card["summary_ready"] = bool(
+                revision is not None
+                and db.get_latest_ready_analysis_run(
+                    conn, card["video_id"], revision
+                ) is not None
+            )
+    finally:
+        conn.close()
+    return cards
+
+
+def build_llm_video_cards(
+    filter_text: str = "",
+    selected_video_id: str = "",
+    *,
+    generate_thumbnails: bool = True,
+) -> str:
+    """Render the shared video cards with LLM summary status decoration."""
+    cards = _llm_video_cards_data(
+        filter_text, generate_thumbnails=generate_thumbnails
+    )
+    display_cards = [
+        {**card, "thumbnail_url": _thumbnail_servable_url(card.get("thumbnail_path"))}
+        for card in cards
+    ]
+    return render_intuitive_video_cards(
+        display_cards, parse_video_choice(selected_video_id)
+    )
 
 
 def _selected_gallery_index(video_ids: list[str], evt: gr.SelectData) -> int:
@@ -3643,7 +3699,7 @@ def select_llm_video_from_card(command_json: str, filter_text: str):
     video_id = _llm_video_id_from_card_command(command_json)
     return (
         video_id,
-        build_intuitive_video_cards(
+        build_llm_video_cards(
             filter_text, video_id, generate_thumbnails=False
         ),
     )
@@ -3651,7 +3707,7 @@ def select_llm_video_from_card(command_json: str, filter_text: str):
 
 def refresh_llm_video_picker(filter_text: str, selected_video_id: str):
     return (
-        build_intuitive_video_cards(filter_text, selected_video_id),
+        build_llm_video_cards(filter_text, selected_video_id),
         gr.update(choices=list_llm_result_video_choices()),
     )
 
@@ -3665,10 +3721,10 @@ def sync_llm_video_selection(
     video_id = parse_video_choice(video_choice) or ""
     return (
         gr.update(value=video_id or None),
-        build_intuitive_video_cards(
+        build_llm_video_cards(
             summary_filter, video_id, generate_thumbnails=False
         ),
-        build_intuitive_video_cards(
+        build_llm_video_cards(
             highlight_filter, video_id, generate_thumbnails=False
         ),
     )
@@ -5862,7 +5918,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "文字起こし済み動画の要約を作成・確認し、その保存済み要約から"
             "見どころ候補を作成します。処理はローカルOllamaだけを使用します。"
         )
-        _LLM_INITIAL_VIDEO_CARDS = build_intuitive_video_cards(
+        _LLM_INITIAL_VIDEO_CARDS = build_llm_video_cards(
             "", "", generate_thumbnails=False
         )
         with gr.Tabs(elem_id="llm-workspace-tabs"):
@@ -6104,17 +6160,17 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 llm_result_video,
             ]
             llm_summary_video_picker.expand(
-                build_intuitive_video_cards,
+                build_llm_video_cards,
                 inputs=summary_picker_inputs,
                 outputs=[llm_summary_video_cards],
             )
             llm_summary_video_filter_btn.click(
-                build_intuitive_video_cards,
+                build_llm_video_cards,
                 inputs=summary_picker_inputs,
                 outputs=[llm_summary_video_cards],
             )
             llm_summary_video_filter.submit(
-                build_intuitive_video_cards,
+                build_llm_video_cards,
                 inputs=summary_picker_inputs,
                 outputs=[llm_summary_video_cards],
             )
@@ -6123,17 +6179,17 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 llm_highlight_video,
             ]
             llm_highlight_video_picker.expand(
-                build_intuitive_video_cards,
+                build_llm_video_cards,
                 inputs=highlight_picker_inputs,
                 outputs=[llm_highlight_video_cards],
             )
             llm_highlight_video_filter_btn.click(
-                build_intuitive_video_cards,
+                build_llm_video_cards,
                 inputs=highlight_picker_inputs,
                 outputs=[llm_highlight_video_cards],
             )
             llm_highlight_video_filter.submit(
-                build_intuitive_video_cards,
+                build_llm_video_cards,
                 inputs=highlight_picker_inputs,
                 outputs=[llm_highlight_video_cards],
             )
@@ -6283,6 +6339,19 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     highlight_candidate_select,
                     highlight_result_generate,
                 ],
+            ).then(
+                sync_llm_video_selection,
+                inputs=[
+                    llm_result_video,
+                    llm_summary_video_filter,
+                    llm_highlight_video_filter,
+                ],
+                outputs=[
+                    llm_highlight_video,
+                    llm_summary_video_cards,
+                    llm_highlight_video_cards,
+                ],
+                show_progress="minimal",
             )
             highlight_result_show.click(
                 load_latest_highlight_view,

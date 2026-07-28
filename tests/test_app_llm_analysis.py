@@ -200,11 +200,12 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertIn("llm-highlight-video-card-grid", component_ids)
         self.assertIn("#llm-summary-video-card-command", app._INTUITIVE_EDITOR_JS)
         self.assertIn("#llm-highlight-video-card-command", app._INTUITIVE_EDITOR_JS)
+        self.assertIn("is-summary-missing", app._APP_CSS)
 
     def test_llm_thumbnail_card_selects_stable_video_id(self):
         with patch.object(
             app,
-            "build_intuitive_video_cards",
+            "build_llm_video_cards",
             return_value='<button class="intuitive-video-card is-selected">card</button>',
         ) as build_cards:
             video_id, cards = app.select_llm_video_from_card(
@@ -217,6 +218,35 @@ class AppLlmAnalysisTest(unittest.TestCase):
         build_cards.assert_called_once_with(
             "filter", "vid_synthetic", generate_thumbnails=False
         )
+
+    def test_llm_cards_show_and_dim_saved_summary_state(self):
+        cards = [
+            {
+                "video_id": "video-ready",
+                "name": "ready.mp4",
+                "duration": 60.0,
+                "thumbnail_url": "ready.jpg",
+                "asr_complete": True,
+                "indexed": True,
+                "summary_ready": True,
+            },
+            {
+                "video_id": "video-missing",
+                "name": "missing.mp4",
+                "duration": 90.0,
+                "thumbnail_url": "missing.jpg",
+                "asr_complete": True,
+                "indexed": True,
+                "summary_ready": False,
+            },
+        ]
+
+        rendered = app.render_intuitive_video_cards(cards)
+
+        self.assertIn("is-summary-ready", rendered)
+        self.assertIn("is-summary-missing", rendered)
+        self.assertIn("要約済み", rendered)
+        self.assertIn("未要約", rendered)
 
     def test_saved_summary_enables_highlight_generation_without_reanalysis(self):
         with (

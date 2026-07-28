@@ -27,6 +27,7 @@ class AppLlmAnalysisTest(unittest.TestCase):
         ]
         self.assertIn("候補の作り方", radio_labels)
         self.assertIn("保存対象", radio_labels)
+        self.assertIn("出力形式", radio_labels)
         components_by_elem_id = {
             (component.get("props") or {}).get("elem_id"): component
             for component in app.demo.config.get("components", [])
@@ -119,6 +120,86 @@ class AppLlmAnalysisTest(unittest.TestCase):
             )
             self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
 
+    def test_highlight_export_can_render_captioned_short_video(self):
+        video = {
+            "path": "synthetic.mp4",
+            "display_name": "synthetic.mp4",
+            "duration": 120.0,
+            "public_video_id": "vid_synthetic",
+        }
+        candidate = {
+            "highlight_candidate_id": "candidate-1",
+            "start_sec": 10.0,
+            "end_sec": 25.0,
+            "export_title": "要点",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            def fake_render(_source, _start, _end, output, **_kwargs):
+                Path(output).write_bytes(b"vertical-video")
+
+            with (
+                patch.object(
+                    app, "_highlight_export_context", return_value=(video, [candidate]),
+                ),
+                patch.object(
+                    app, "_highlight_short_captions", return_value=((object(),), []),
+                ) as caption_mapper,
+                patch.object(app, "render_short_clip", side_effect=fake_render) as renderer,
+            ):
+                outputs = list(app.export_highlight_candidates(
+                    "vid_synthetic", "candidate-1", "selected", temporary, True,
+                    "short", "blur", "720x1280", True,
+                ))
+
+            saved = outputs[-1][1]
+            self.assertEqual(
+                [Path(path).name for path in saved],
+                ["synthetic_要点_short.mp4"],
+            )
+            caption_mapper.assert_called_once_with(video, candidate)
+            options = renderer.call_args.kwargs["options"]
+            self.assertEqual(
+                (options.width, options.height, options.layout),
+                (720, 1280, "blur"),
+            )
+            self.assertTrue(options.burn_captions)
+
+    def test_highlight_publish_never_replaces_an_unexpected_existing_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staged = root / "staged.mp4"
+            destination = root / "result.mp4"
+            staged.write_bytes(b"new")
+            destination.write_bytes(b"existing")
+
+            with self.assertRaisesRegex(app.gr.Error, "同名ファイル"):
+                app._publish_highlight_without_overwrite(staged, destination)
+
+            self.assertEqual(destination.read_bytes(), b"existing")
+            self.assertEqual(staged.read_bytes(), b"new")
+
+    def test_short_captions_use_the_highlight_revision_snapshot(self):
+        video = {
+            "public_video_id": "vid_synthetic",
+            "duration": 120.0,
+            "_highlight_transcript_revision": "revision-from-highlight",
+        }
+        candidate = {"start_sec": 10.0, "end_sec": 20.0}
+        with (
+            patch.object(app.db, "get_conn", return_value=_Connection()),
+            patch.object(app.db, "get_segments_in_range", return_value=[]) as rows,
+            patch.object(app.db, "get_active_transcript_revision") as active_revision,
+        ):
+            captions, warnings = app._highlight_short_captions(video, candidate)
+
+        self.assertEqual(captions, ())
+        self.assertEqual(warnings, [])
+        active_revision.assert_not_called()
+        self.assertEqual(
+            rows.call_args.kwargs["transcript_revision"],
+            "revision-from-highlight",
+        )
+
     def test_highlight_filename_parts_are_windows_safe(self):
         self.assertEqual(
             app._safe_highlight_filename_part(
@@ -174,9 +255,12 @@ class AppLlmAnalysisTest(unittest.TestCase):
                     return_value={"path": str(source), "display_name": "source.mp4"},
                 ),
             ):
-                _video, candidates = app._highlight_export_context("synthetic")
+                context_video, candidates = app._highlight_export_context("synthetic")
 
         self.assertEqual(candidates[0]["export_title"], "chapter title")
+        self.assertEqual(
+            context_video["_highlight_transcript_revision"], "revision-1"
+        )
 
     def test_llm_summary_and_highlights_have_a_dedicated_ordered_tab(self):
         tab_labels = [

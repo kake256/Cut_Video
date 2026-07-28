@@ -65,6 +65,12 @@ from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
 from moment_retrieval.ui_experiment import UIExperimentRecorder, compare_ui_runs
 from moment_retrieval.subtitles import map_subtitles
+from moment_retrieval.short_video import (
+    ShortVideoOptions,
+    parse_short_resolution,
+    prepare_short_captions,
+    render_short_clip,
+)
 from moment_retrieval.ui_assets import _APP_CSS, _INTUITIVE_EDITOR_JS
 from moment_retrieval.transcript_types import parse_segment
 
@@ -4332,7 +4338,12 @@ def _highlight_export_context(video_choice: str) -> tuple[dict, list[dict]]:
         video = db.get_video(conn, video_id)
         if not video or not Path(video["path"]).is_file():
             raise gr.Error("候補の元動画が見つかりません。")
-        return video, candidates
+        return {
+            **video,
+            "_highlight_transcript_revision": str(
+                run.get("transcript_revision") or revision
+            ),
+        }, candidates
     finally:
         conn.close()
 
@@ -4359,7 +4370,7 @@ def _safe_highlight_filename_part(
 
 
 def _available_highlight_output_path(
-    output_dir: Path, video_name: str, chapter_title: str
+    output_dir: Path, video_name: str, chapter_title: str, *, variant: str = ""
 ) -> Path:
     safe_video_name = _safe_highlight_filename_part(
         Path(video_name).stem,
@@ -4371,7 +4382,12 @@ def _available_highlight_output_path(
         fallback="見どころ",
         max_length=96,
     )
+    safe_variant = _safe_highlight_filename_part(
+        variant, fallback="", max_length=24,
+    ) if variant else ""
     stem = f"{safe_video_name}_{safe_chapter_title}"
+    if safe_variant:
+        stem = f"{stem}_{safe_variant}"
     candidate = output_dir / f"{stem}.mp4"
     suffix = 2
     while candidate.exists() or candidate.with_name(
@@ -4382,12 +4398,66 @@ def _available_highlight_output_path(
     return candidate
 
 
+def _highlight_short_captions(
+    video: dict, candidate: dict,
+) -> tuple[tuple, list[str]]:
+    """Map only one candidate's active ASR rows onto its output timeline."""
+    video_id = str(video.get("public_video_id") or video.get("video_id") or "")
+    start = float(candidate["start_sec"])
+    end = float(candidate["end_sec"])
+    duration = float(video.get("duration") or end)
+    plan = edit_plan_from_legacy(start, end, None, duration)
+    revision = str(video.get("_highlight_transcript_revision") or "")
+    if not revision:
+        raise gr.Error("候補に対応する文字起こし世代を確認できません。候補を再表示してください。")
+    warnings: list[str] = []
+    parsed = []
+    conn = db.get_conn()
+    try:
+        rows = db.get_segments_in_range(
+            conn, video_id, start, end, transcript_revision=revision,
+        )
+        for row in rows:
+            try:
+                parsed.append(parse_segment(row, plan.source_duration_ms))
+            except ValueError as exc:
+                warnings.append(str(exc))
+    finally:
+        conn.close()
+    mapped = map_subtitles(parsed, make_effective_export_plan(plan))
+    warnings.extend(mapped.warnings)
+    return prepare_short_captions(mapped.cues), warnings
+
+
+def _publish_highlight_without_overwrite(source: Path, destination: Path) -> None:
+    """Publish within one filesystem without replacing an unexpected target."""
+    import os
+
+    try:
+        if os.name == "nt":
+            # Windows rename fails when destination already exists.
+            os.rename(source, destination)
+        else:
+            # POSIX rename replaces. A same-filesystem hard link gives us an
+            # atomic create-if-absent operation, after which staging is removed.
+            os.link(source, destination)
+            source.unlink()
+    except FileExistsError as exc:
+        raise gr.Error(
+            f"保存先に同名ファイルが作成されました: {destination.name}"
+        ) from exc
+
+
 def export_highlight_candidates(
     video_choice: str,
     selected_candidate_id: str,
     export_scope: str,
     output_dir_text: str,
     precise: bool,
+    export_format: str = "standard",
+    short_layout: str = "blur",
+    short_resolution: str = "1080x1920",
+    short_captions: bool = True,
 ):
     """Cut selected/generated candidates locally with atomic final publish."""
     if not _highlight_export_lock.acquire(blocking=False):
@@ -4410,7 +4480,25 @@ def export_highlight_candidates(
             or str(config.ARTIFACT_ROOT / "highlights")
         )
         output_dir.mkdir(parents=True, exist_ok=True)
-        log_lines.append(f"{len(candidates)}件の候補をローカル保存します。")
+        if export_format not in {"standard", "short"}:
+            raise gr.Error("出力形式を選択してください。")
+        short_options = None
+        if export_format == "short":
+            try:
+                width, height = parse_short_resolution(short_resolution)
+                short_options = ShortVideoOptions(
+                    width=width,
+                    height=height,
+                    layout=short_layout,
+                    burn_captions=bool(short_captions),
+                ).validate()
+            except ValueError as exc:
+                raise gr.Error(str(exc)) from exc
+            log_lines.append(
+                f"{len(candidates)}件を9:16ショート動画としてローカル保存します。"
+            )
+        else:
+            log_lines.append(f"{len(candidates)}件の候補をローカル保存します。")
         yield "\n".join(log_lines), outputs
         video_name = str(
             video.get("display_name") or Path(video["path"]).name
@@ -4422,6 +4510,7 @@ def export_highlight_candidates(
                 output_dir,
                 video_name,
                 str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
+                variant="short" if export_format == "short" else "",
             )
             temporary = output.with_name(
                 f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
@@ -4434,20 +4523,40 @@ def export_highlight_candidates(
                     raise gr.Error(
                         "同じ候補の保存処理が競合しました。もう一度実行してください。"
                     ) from exc
-                cut_clip(
-                    Path(video["path"]),
-                    start,
-                    end,
-                    temporary,
-                    pad=0.0,
-                    precise=bool(precise),
-                    duration=float(video.get("duration") or end),
-                )
-                if output.exists():
-                    raise gr.Error(
-                        f"保存先に同名ファイルが作成されました: {output.name}"
+                if export_format == "short":
+                    captions = ()
+                    subtitle_warnings: list[str] = []
+                    if short_options and short_options.burn_captions:
+                        captions, subtitle_warnings = _highlight_short_captions(
+                            video, candidate,
+                        )
+                        if not captions:
+                            log_lines.append(
+                                f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
+                                "字幕なしで生成します。"
+                            )
+                    render_short_clip(
+                        Path(video["path"]), start, end, temporary,
+                        captions=captions,
+                        options=short_options or ShortVideoOptions(),
+                        duration=float(video.get("duration") or end),
                     )
-                temporary.replace(output)
+                    if subtitle_warnings:
+                        log_lines.append(
+                            f"{ordinal}/{len(candidates)} 字幕時刻の警告: "
+                            f"{len(subtitle_warnings)}件（本文はログに表示しません）"
+                        )
+                else:
+                    cut_clip(
+                        Path(video["path"]),
+                        start,
+                        end,
+                        temporary,
+                        pad=0.0,
+                        precise=bool(precise),
+                        duration=float(video.get("duration") or end),
+                    )
+                _publish_highlight_without_overwrite(temporary, output)
             finally:
                 temporary.unlink(missing_ok=True)
                 claim.unlink(missing_ok=True)
@@ -6120,6 +6229,35 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         value="selected",
                         label="保存対象",
                     )
+                    highlight_export_format = gr.Radio(
+                        choices=[
+                            ("通常動画", "standard"),
+                            ("ショート動画（9:16＋自動字幕）", "short"),
+                        ],
+                        value="standard",
+                        label="出力形式",
+                    )
+                    with gr.Row():
+                        highlight_short_layout = gr.Radio(
+                            choices=[
+                                ("背景ぼかし（映像全体を残す）", "blur"),
+                                ("中央を縦に切り抜く", "crop"),
+                            ],
+                            value="blur",
+                            label="ショート動画の画面配置",
+                            scale=2,
+                        )
+                        highlight_short_resolution = gr.Dropdown(
+                            choices=["1080x1920", "720x1280"],
+                            value="1080x1920",
+                            label="ショート動画の解像度",
+                            scale=1,
+                        )
+                        highlight_short_captions = gr.Checkbox(
+                            value=True,
+                            label="ASR字幕を動画へ焼き込む",
+                            scale=1,
+                        )
                     with gr.Row():
                         highlight_export_dir = gr.Textbox(
                             value=str(config.ARTIFACT_ROOT / "highlights"),
@@ -6128,9 +6266,13 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         )
                         highlight_export_precise = gr.Checkbox(
                             value=True,
-                            label="フレーム精度で保存",
+                            label="通常動画をフレーム精度で保存",
                             scale=1,
                         )
+                    gr.Markdown(
+                        "ショート動画は再エンコード固定です。背景ぼかしは元映像全体を残し、"
+                        "中央切り抜きは画面を大きく表示します。字幕・動画はローカルだけで処理します。"
+                    )
                     highlight_export_btn = gr.Button(
                         "候補を切り抜いて保存",
                         variant="primary",
@@ -6407,6 +6549,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     highlight_export_scope,
                     highlight_export_dir,
                     highlight_export_precise,
+                    highlight_export_format,
+                    highlight_short_layout,
+                    highlight_short_resolution,
+                    highlight_short_captions,
                 ],
                 outputs=[highlight_export_log, highlight_export_files],
                 concurrency_id="highlight-export-io",

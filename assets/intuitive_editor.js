@@ -426,18 +426,39 @@
     if (!stopDirtySessionReplacement(event)) rememberSearchResultSelection(event);
   }, true);
 
-  // Send the visible card's stable video ID straight into Gradio. This avoids
-  // rendering a second hidden Gallery and removes index-order coupling.
+  // Send a visible card's stable video ID straight into its Gradio bridge.
+  // The editor and both LLM work tabs reuse the same card renderer without a
+  // second hidden Gallery or index-order coupling.
   document.addEventListener('click', (event) => {
-    const card = event.target.closest('#intuitive-video-card-grid .intuitive-video-card');
+    const bridges = [
+      {
+        root: '#intuitive-video-card-grid',
+        field: '#intuitive-video-card-command',
+        submit: '#intuitive-video-card-submit'
+      },
+      {
+        root: '#llm-summary-video-card-grid',
+        field: '#llm-summary-video-card-command',
+        submit: '#llm-summary-video-card-submit'
+      },
+      {
+        root: '#llm-highlight-video-card-grid',
+        field: '#llm-highlight-video-card-command',
+        submit: '#llm-highlight-video-card-submit'
+      }
+    ];
+    const bridge = bridges.find(({root}) =>
+      event.target.closest(`${root} .intuitive-video-card`)
+    );
+    if (!bridge) return;
+    const card = event.target.closest(`${bridge.root} .intuitive-video-card`);
     if (!card) return;
     const videoId = card.dataset.videoId || '';
     const field = document.querySelector(
-      '#intuitive-video-card-command textarea, #intuitive-video-card-command input'
+      `${bridge.field} textarea, ${bridge.field} input`
     );
     const submit = document.querySelector(
-      '#intuitive-video-card-submit button, button#intuitive-video-card-submit, ' +
-      '#intuitive-video-card-submit'
+      `${bridge.submit} button, button${bridge.submit}, ${bridge.submit}`
     );
     if (!videoId || !field || !submit) return;
     event.preventDefault();

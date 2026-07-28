@@ -711,6 +711,8 @@ body:has(#intuitive-toolbox [data-active-tool]:not([data-active-tool=""]))
 #intuitive-command-json, #intuitive-command-submit,
 #intuitive-sync-token, #intuitive-sync-submit, #intuitive-sync-ack,
 #intuitive-video-card-command, #intuitive-video-card-submit,
+#llm-summary-video-card-command, #llm-summary-video-card-submit,
+#llm-highlight-video-card-command, #llm-highlight-video-card-submit,
 #intuitive-search-marker-projection, #intuitive-search-marker-command,
 #intuitive-search-marker-submit, #highlight-candidate-selection {
   display: none !important;

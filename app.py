@@ -4,7 +4,7 @@
     python app.py
 
 「検索・編集・切り抜き」タブ: 検索 → プレビュー → 範囲編集 → 保存。
-「動画の追加」タブ: 新規動画の文字起こし〜インデックス化をWebUIから実行。
+「動画保存」タブ: URL動画の保存と文字起こし〜インデックス化をWebUIから実行。
 
 従来の「検索・切り抜き」画面は CUT_VIDEO_ENABLE_LEGACY_UI=1 のときだけ
 退避UIとして表示する。
@@ -73,6 +73,7 @@ THUMBNAIL_DIR = config.CACHE_ROOT / "thumbnails"
 ALL_VIDEOS_IMAGE = Path("assets/all_videos.svg")
 VIDEO_UNAVAILABLE_IMAGE = Path("assets/video_unavailable.svg")
 DEFAULT_CLIPS_DIR = "clips"
+DEFAULT_INDEX_EXPORT_DIR = Path("exports")
 APP_PORT = 7860
 PREVIEW_RENDER_TIMEOUT_SEC = 600
 PREVIEW_CACHE_MAX_BYTES = DEFAULT_MAX_BYTES
@@ -188,6 +189,51 @@ def browse_folder(current: str) -> str:
 def browse_video(current: str) -> str:
     path = _tk_dialog("file")
     return path if path else current
+
+
+def _launch_explorer(target: Path, *, select_file: bool = False) -> None:
+    """Open one verified local path without invoking a command shell."""
+    resolved = target.expanduser().resolve()
+    if select_file:
+        if not resolved.is_file():
+            raise gr.Error("表示するファイルが見つかりません。")
+        arguments = ["explorer.exe", f"/select,{resolved}"]
+    else:
+        resolved.mkdir(parents=True, exist_ok=True)
+        if not resolved.is_dir():
+            raise gr.Error("表示するフォルダが見つかりません。")
+        arguments = ["explorer.exe", str(resolved)]
+    try:
+        subprocess.Popen(
+            arguments,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        raise gr.Error("エクスプローラーを開けませんでした。") from exc
+
+
+def open_output_folder(folder_text: str) -> str:
+    folder = Path(str(folder_text or "").strip() or DEFAULT_CLIPS_DIR)
+    _launch_explorer(folder)
+    return "保存フォルダを開きました。"
+
+
+def open_source_video_folder() -> str:
+    folder = config.SOURCE_ROOTS[0] if config.SOURCE_ROOTS else Path("video")
+    _launch_explorer(folder)
+    return "動画保存フォルダを開きました。"
+
+
+def open_exported_index_location(export_path_text: str) -> str:
+    raw = str(export_path_text or "").strip()
+    if raw.startswith("保存先:"):
+        raw = raw.removeprefix("保存先:").strip()
+    exported = Path(raw).expanduser() if raw else None
+    if exported is not None and exported.is_file():
+        _launch_explorer(exported, select_file=True)
+        return "書き出したインデックスを表示しました。"
+    _launch_explorer(DEFAULT_INDEX_EXPORT_DIR)
+    return "インデックス保存フォルダを開きました。"
 
 
 # ---------- 検索・切り抜き ----------
@@ -5585,11 +5631,16 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "保存", variant="primary", scale=1,
                     elem_id="intuitive-save-button",
                 )
+                intuitive_open_output_btn = gr.Button(
+                    "保存場所を開く", scale=1,
+                    elem_id="intuitive-open-output-folder",
+                )
             intuitive_saved_path = gr.Textbox(
                 label="保存結果", interactive=False, lines=1,
                 show_label=False, container=False,
                 elem_id="intuitive-saved-path",
             )
+            intuitive_open_folder_status = gr.Markdown("")
 
         with gr.Accordion("UI比較計測（匿名・ローカル保存）", open=False):
             gr.Markdown(
@@ -5854,63 +5905,12 @@ with gr.Blocks(title="動画シーン検索") as demo:
             inputs=[intuitive_out_dir],
             outputs=[intuitive_out_dir],
         )
+        intuitive_open_output_btn.click(
+            open_output_folder,
+            inputs=[intuitive_out_dir],
+            outputs=[intuitive_open_folder_status],
+        )
         demo.load(fn=None, js=_INTUITIVE_EDITOR_JS)
-
-    with gr.Tab("動画の追加"):
-        gr.Markdown(
-            "新規動画を文字起こしして検索対象に追加します。"
-            "動画の長さに応じて数分かかります(処理中はこのページを開いたままにしてください)。"
-        )
-        with gr.Row():
-            new_video_box = gr.Textbox(label="動画ファイルのパス または URL", scale=3)
-            video_browse_btn = gr.Button("ファイル参照", scale=1)
-        with gr.Row():
-            asr_model_dd = gr.Dropdown(
-                choices=["large-v3", "large-v3-turbo", "medium"],
-                value=config.ASR_MODEL_SIZE,
-                label="ASRモデル (turbo/mediumは高速・低精度)",
-            )
-            force_chk = gr.Checkbox(value=False, label="再インデックス (既存を削除して作り直す)")
-        with gr.Row():
-            batch_infer_chk = gr.Checkbox(
-                value=True,
-                label="バッチ並列推論 (高速。切り出し境界がやや粗くなる)",
-            )
-            index_btn = gr.Button("インデックス作成", variant="primary")
-            stop_btn = gr.Button("処理を停止", variant="stop")
-        with gr.Row():
-            llm_analysis_chk = gr.Checkbox(
-                value=False,
-                label="文字起こし後に要約・タグ・章を生成（実験・ローカルOllama）",
-            )
-            llm_model_box = gr.Textbox(
-                value=config.LLM_ANALYSIS_MODEL,
-                label="Ollamaモデル",
-                placeholder="例: qwen3:8b",
-            )
-        gr.Markdown(
-            "LLM解析は既定で無効です。有効時も文字起こし・検索の完了後に実行され、"
-            "解析失敗で動画登録は取り消されません。外部クラウドには送信しません。"
-            "初回だけ `setup_ollama.bat` を実行してOllamaとモデルを準備してください。"
-        )
-        index_log = gr.Textbox(label="進捗ログ", interactive=False, lines=10)
-
-        video_browse_btn.click(browse_video, inputs=[new_video_box], outputs=[new_video_box])
-        index_btn.click(
-            do_index,
-            inputs=[
-                new_video_box,
-                asr_model_dd,
-                force_chk,
-                batch_infer_chk,
-                llm_analysis_chk,
-                llm_model_box,
-            ],
-            outputs=[index_log, video_select],
-            concurrency_id="library-index-io",
-            concurrency_limit=1,
-        )
-        stop_btn.click(stop_indexing)
 
     with gr.Tab("LLM要約・見どころ"):
         gr.Markdown(
@@ -6413,6 +6413,68 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 concurrency_limit=1,
             )
 
+    with gr.Tab("動画保存"):
+        gr.Markdown(
+            "URLから動画を保存するか、ローカル動画を文字起こしして検索対象に追加します。"
+            "動画の長さに応じて数分かかります(処理中はこのページを開いたままにしてください)。"
+        )
+        with gr.Row():
+            new_video_box = gr.Textbox(label="動画ファイルのパス または URL", scale=3)
+            video_browse_btn = gr.Button("ファイル参照", scale=1)
+            open_source_folder_btn = gr.Button("動画保存フォルダを開く", scale=1)
+        with gr.Row():
+            asr_model_dd = gr.Dropdown(
+                choices=["large-v3", "large-v3-turbo", "medium"],
+                value=config.ASR_MODEL_SIZE,
+                label="ASRモデル (turbo/mediumは高速・低精度)",
+            )
+            force_chk = gr.Checkbox(value=False, label="再インデックス (既存を削除して作り直す)")
+        with gr.Row():
+            batch_infer_chk = gr.Checkbox(
+                value=True,
+                label="バッチ並列推論 (高速。切り出し境界がやや粗くなる)",
+            )
+            index_btn = gr.Button("インデックス作成", variant="primary")
+            stop_btn = gr.Button("処理を停止", variant="stop")
+        with gr.Row():
+            llm_analysis_chk = gr.Checkbox(
+                value=False,
+                label="文字起こし後に要約・タグ・章を生成（実験・ローカルOllama）",
+            )
+            llm_model_box = gr.Textbox(
+                value=config.LLM_ANALYSIS_MODEL,
+                label="Ollamaモデル",
+                placeholder="例: qwen3:8b",
+            )
+        gr.Markdown(
+            "LLM解析は既定で無効です。有効時も文字起こし・検索の完了後に実行され、"
+            "解析失敗で動画登録は取り消されません。外部クラウドには送信しません。"
+            "初回だけ `setup_ollama.bat` を実行してOllamaとモデルを準備してください。"
+        )
+        index_log = gr.Textbox(label="進捗ログ", interactive=False, lines=10)
+        source_folder_status = gr.Markdown("")
+
+        video_browse_btn.click(browse_video, inputs=[new_video_box], outputs=[new_video_box])
+        open_source_folder_btn.click(
+            open_source_video_folder,
+            outputs=[source_folder_status],
+        )
+        index_btn.click(
+            do_index,
+            inputs=[
+                new_video_box,
+                asr_model_dd,
+                force_chk,
+                batch_infer_chk,
+                llm_analysis_chk,
+                llm_model_box,
+            ],
+            outputs=[index_log, video_select],
+            concurrency_id="library-index-io",
+            concurrency_limit=1,
+        )
+        stop_btn.click(stop_indexing)
+
     with gr.Tab("インデックスの共有"):
         gr.Markdown(
             "文字起こし済みのインデックスをzipファイルとして書き出し/読み込みし、"
@@ -6434,7 +6496,14 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         export_btn = gr.Button("エクスポート", variant="primary")
         export_file = gr.File(label="ダウンロード", interactive=False)
-        export_path_box = gr.Textbox(label="保存先パス", interactive=False)
+        with gr.Row():
+            export_path_box = gr.Textbox(
+                label="保存先パス", interactive=False, scale=4
+            )
+            open_export_location_btn = gr.Button(
+                "ファイルの場所を開く", scale=1
+            )
+        export_location_status = gr.Markdown("")
 
         with gr.Row():
             gr.Markdown("### インポート")
@@ -6462,6 +6531,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
             outputs=[export_file, export_path_box],
             concurrency_id="library-index-io",
             concurrency_limit=1,
+        )
+        open_export_location_btn.click(
+            open_exported_index_location,
+            inputs=[export_path_box],
+            outputs=[export_location_status],
         )
         import_btn.click(
             do_import,

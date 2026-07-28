@@ -1169,7 +1169,7 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         # hidden document.
         hidden_revision = int(root.get_attribute("data-revision"))
         hidden_dirty = root.get_attribute("data-edit-dirty")
-        page.get_by_role("tab", name="動画の追加").click()
+        page.get_by_role("tab", name="動画保存").click()
         self.assertEqual(page.locator("#intuitive-save-bar:visible").count(), 0)
         page.keyboard.press("Control+Z")
         page.wait_for_timeout(150)

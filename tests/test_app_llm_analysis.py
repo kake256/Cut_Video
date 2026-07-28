@@ -185,6 +185,16 @@ class AppLlmAnalysisTest(unittest.TestCase):
             if component.get("type") == "tabitem"
         ]
         self.assertIn("LLM要約・見どころ", tab_labels)
+        visible_top_tabs = [
+            "検索・編集・切り抜き",
+            "LLM要約・見どころ",
+            "動画保存",
+            "インデックスの共有",
+        ]
+        self.assertEqual(
+            sorted(visible_top_tabs, key=tab_labels.index),
+            visible_top_tabs,
+        )
         summary_index = tab_labels.index("① 要約を作る・確認する")
         highlight_index = tab_labels.index("② 要約から見どころを作る・切り抜く")
         self.assertLess(summary_index, highlight_index)
@@ -247,6 +257,29 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertIn("is-summary-missing", rendered)
         self.assertIn("要約済み", rendered)
         self.assertIn("未要約", rendered)
+
+    def test_output_and_export_locations_open_without_a_shell(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_dir = root / "clips"
+            exported = root / "exports" / "index.zip"
+            exported.parent.mkdir()
+            exported.write_bytes(b"zip")
+            with patch.object(app.subprocess, "Popen") as popen:
+                folder_status = app.open_output_folder(str(output_dir))
+                export_status = app.open_exported_index_location(
+                    f"保存先: {exported}"
+                )
+                output_created = output_dir.is_dir()
+
+        self.assertTrue(output_created)
+        self.assertIn("保存フォルダ", folder_status)
+        self.assertIn("インデックス", export_status)
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(popen.call_args_list[0].args[0][0], "explorer.exe")
+        self.assertTrue(
+            popen.call_args_list[1].args[0][1].startswith("/select,")
+        )
 
     def test_saved_summary_enables_highlight_generation_without_reanalysis(self):
         with (

@@ -351,6 +351,8 @@ TimelineMap実装前は、編集結果プレビュー中の境界編集を禁止
 
 ### 10.1 動画保存
 
+- WebUIの上部タブは「検索・編集・切り抜き」「LLM要約・見どころ」「動画保存」「インデックスの共有」の順に表示する。
+- 切り抜き成果物とダウンロード動画は各保存画面から保存フォルダをExplorerで開ける。共有用インデックスzipは、生成後にExplorerで当該ファイルを選択表示でき、未生成時は既定のexportフォルダを開く。
 - 単一区間と複数Kept rangeが同じ保存use caseを通る。
 - paddingは全成果物の先頭と末尾だけに適用し、除外した中間へ食い込ませない。
 - `make_effective_export_plan`はoverallを`[max(0, overall.start-pad_before), min(source_duration, overall.end+pad_after))`へ拡張し、既存exclusionはSource時刻のまま維持してKept rangeを再導出する。requested paddingとsource端でclampされたeffective paddingを両方返す。

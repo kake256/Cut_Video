@@ -9,7 +9,8 @@ from moment_retrieval import db
 from moment_retrieval.highlight_analysis import (
     AnalysisValidationError, HighlightAnalysisError, _anchor_prompt,
     _boundary_label_prompt, _metadata_prompt, _refine_checked_boundaries,
-    _has_obvious_continuation, fit_boundary, run_highlight_analysis,
+    _has_obvious_continuation, build_query_highlight_candidates,
+    fit_boundary, run_highlight_analysis,
     suppress_overlaps, validate_selection_response,
     valid_source_segments,
 )
@@ -120,6 +121,126 @@ class HighlightAnalysisTest(unittest.TestCase):
         self.assertEqual((len(kept), suppressed), (2, 1))
         with self.assertRaisesRegex(AnalysisValidationError, "invalid time"):
             suppress_overlaps([{"start_sec": 1, "end_sec": 1}])
+
+    def test_query_hits_become_segment_linked_deduplicated_candidates(self):
+        rows = [
+            {
+                "segment_id": index,
+                "start_sec": (index - 1) * 5.0,
+                "end_sec": index * 5.0,
+                "text": "発話はここで完結します。",
+            }
+            for index in range(1, 21)
+        ]
+        chapters = [
+            {
+                "ordinal": 0,
+                "start_sec": 0.0,
+                "end_sec": 50.0,
+            },
+            {
+                "ordinal": 1,
+                "start_sec": 50.0,
+                "end_sec": 100.0,
+            },
+        ]
+        hits = [
+            {
+                "start": 10.0,
+                "end": 15.0,
+                "evidence_start": 10.0,
+                "evidence_end": 15.0,
+                "match_type": "文字一致",
+                "score": None,
+            },
+            {
+                "start": 12.0,
+                "end": 16.0,
+                "evidence_start": 12.0,
+                "evidence_end": 16.0,
+                "match_type": "意味検索",
+                "score": 0.8,
+            },
+            {
+                "start": 65.0,
+                "end": 70.0,
+                "evidence_start": 65.0,
+                "evidence_end": 70.0,
+                "match_type": "意味検索",
+                "score": 0.7,
+            },
+        ]
+
+        candidates, suppressed = build_query_highlight_candidates(
+            rows,
+            chapters,
+            hits,
+            "環境改善の説明",
+            requested_count=3,
+            min_duration_sec=20.0,
+            max_duration_sec=30.0,
+        )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(suppressed, 1)
+        self.assertEqual(
+            [candidate["source_chapter_ordinal"] for candidate in candidates],
+            [0, 1],
+        )
+        for candidate in candidates:
+            self.assertLessEqual(
+                candidate["end_sec"] - candidate["start_sec"], 30.0
+            )
+            self.assertLessEqual(
+                candidate["start_segment_id"],
+                candidate["anchor_start_segment_id"],
+            )
+            self.assertGreaterEqual(
+                candidate["end_segment_id"],
+                candidate["anchor_end_segment_id"],
+            )
+
+        with self.assertRaisesRegex(ValueError, "query"):
+            build_query_highlight_candidates(rows, chapters, hits, "   ")
+
+    def test_query_candidate_skips_one_overlong_anchor_without_losing_others(self):
+        rows = [
+            {
+                "segment_id": 1,
+                "start_sec": 0.0,
+                "end_sec": 100.0,
+                "text": "非常に長い旧ASR区間",
+            },
+            {
+                "segment_id": 2,
+                "start_sec": 100.0,
+                "end_sec": 110.0,
+                "text": "通常の発話です。",
+            },
+            {
+                "segment_id": 3,
+                "start_sec": 110.0,
+                "end_sec": 120.0,
+                "text": "続く発話です。",
+            },
+        ]
+        hits = [
+            {"start": 10.0, "end": 20.0},
+            {"start": 101.0, "end": 105.0},
+        ]
+
+        candidates, _ = build_query_highlight_candidates(
+            rows,
+            [],
+            hits,
+            "通常の発話",
+            requested_count=2,
+            min_duration_sec=10.0,
+            max_duration_sec=30.0,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["anchor_start_segment_id"], 2)
 
     def test_boundary_check_can_add_required_following_segment(self):
         class CheckProvider:

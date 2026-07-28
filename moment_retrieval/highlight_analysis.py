@@ -25,6 +25,7 @@ CONTEXT_BACK_SEC = 8.0
 CONTEXT_FORWARD_SEC = 12.0
 NATURAL_GAP_SEC = 1.0
 OVERLAP_THRESHOLD = 0.30
+QUERY_PROMPT_VERSION = "query-highlights-v1"
 
 
 class HighlightAnalysisError(TranscriptAnalysisError):
@@ -571,6 +572,135 @@ def suppress_overlaps(candidates: Sequence[dict], *, threshold: float = OVERLAP_
         else:
             kept.append(candidate)
     return kept, suppressed
+
+
+def build_query_highlight_candidates(
+    segments: Sequence[dict],
+    chapters: Sequence[dict],
+    hits: Sequence[dict],
+    query: str,
+    *,
+    requested_count: int = 6,
+    min_duration_sec: float = DEFAULT_MIN_DURATION_SEC,
+    max_duration_sec: float = DEFAULT_MAX_DURATION_SEC,
+) -> tuple[list[dict], int]:
+    """Turn ranked local text/semantic hits into source-linked candidates.
+
+    Search supplies relevance order.  This function never asks an LLM for a
+    timestamp: it selects an existing ASR segment near each evidence span and
+    fits the final range to immutable segment boundaries.
+    """
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        raise ValueError("query must not be empty")
+    if not 1 <= int(requested_count) <= 10:
+        raise ValueError("requested_count must be between 1 and 10")
+    if not 0 < float(min_duration_sec) <= float(max_duration_sec):
+        raise ValueError("duration bounds must satisfy 0 < min <= max")
+    rows = valid_source_segments(segments)
+    if not rows:
+        raise AnalysisValidationError("source segments are empty")
+
+    candidates: list[dict] = []
+    query_label = normalized_query[:60]
+    for hit in hits:
+        try:
+            evidence_start = float(
+                hit.get("evidence_start")
+                if hit.get("evidence_start") is not None else hit.get("start")
+            )
+            evidence_end = float(
+                hit.get("evidence_end")
+                if hit.get("evidence_end") is not None else hit.get("end")
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(evidence_start)
+            or not math.isfinite(evidence_end)
+        ):
+            continue
+        if evidence_end < evidence_start:
+            evidence_start, evidence_end = evidence_end, evidence_start
+        midpoint = evidence_start + (evidence_end - evidence_start) / 2.0
+        overlapping = [
+            row for row in rows
+            if float(row["end_sec"]) > evidence_start
+            and float(row["start_sec"]) < evidence_end
+        ]
+        anchor = min(
+            overlapping or rows,
+            key=lambda row: abs(
+                (float(row["start_sec"]) + float(row["end_sec"])) / 2.0
+                - midpoint
+            ),
+        )
+        anchor_id = int(anchor["segment_id"])
+        try:
+            fitted = fit_boundary(
+                rows,
+                anchor_id,
+                anchor_id,
+                min_duration_sec=min_duration_sec,
+                max_duration_sec=max_duration_sec,
+            )
+        except AnalysisValidationError:
+            # One legacy overlong/malformed anchor must not discard other
+            # ranked hits that can still produce safe candidates.
+            continue
+        anchor_midpoint = (
+            float(anchor["start_sec"]) + float(anchor["end_sec"])
+        ) / 2.0
+        chapter = next(
+            (
+                item for item in chapters
+                if float(item["start_sec"]) <= anchor_midpoint
+                < float(item["end_sec"])
+            ),
+            None,
+        )
+        if chapter is None and chapters:
+            chapter = min(
+                chapters,
+                key=lambda item: abs(
+                    (
+                        float(item["start_sec"])
+                        + float(item["end_sec"])
+                    ) / 2.0 - anchor_midpoint
+                ),
+            )
+        match_type = str(hit.get("match_type") or "検索")
+        score = hit.get("score")
+        score_text = (
+            f"（類似度 {float(score):.2f}）"
+            if isinstance(score, (int, float)) and math.isfinite(float(score))
+            else ""
+        )
+        end_row = next(
+            row for row in rows
+            if int(row["segment_id"]) == int(fitted["end_segment_id"])
+        )
+        candidates.append({
+            "source_chapter_ordinal": int(chapter["ordinal"]) if chapter else 0,
+            "anchor_start_segment_id": anchor_id,
+            "anchor_end_segment_id": anchor_id,
+            **fitted,
+            "boundary_expanded": (
+                int(fitted["start_segment_id"]) != anchor_id
+                or int(fitted["end_segment_id"]) != anchor_id
+            ),
+            "boundary_warning": _has_obvious_continuation(
+                str(end_row.get("text") or "")
+            ),
+            "title": f"「{query_label}」に関する場面",
+            "summary": "自然言語クエリに関連する文字起こし区間です。",
+            "reason": f"{match_type}の検索結果から作成しました{score_text}。",
+            "category": "クエリ検索",
+            "tags": [query_label],
+        })
+
+    kept, suppressed = suppress_overlaps(candidates)
+    return kept[:int(requested_count)], suppressed
 
 
 def run_highlight_analysis(conn, video_id: str, revision: str, analysis_run_id: str, provider: AnalysisProvider, model: str,

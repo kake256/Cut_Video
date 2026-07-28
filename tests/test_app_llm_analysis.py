@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,6 +19,87 @@ class _Connection:
 
 
 class AppLlmAnalysisTest(unittest.TestCase):
+    def test_highlight_generation_and_candidate_selection_use_radio_controls(self):
+        radio_labels = [
+            (component.get("props") or {}).get("label")
+            for component in app.demo.config.get("components", [])
+            if component.get("type") == "radio"
+        ]
+        self.assertIn("候補の作り方", radio_labels)
+        self.assertIn("プレビュー・編集する候補", radio_labels)
+        self.assertIn("保存対象", radio_labels)
+
+    def test_query_generation_dispatches_without_reanalyzing_summary(self):
+        with (
+            patch.object(
+                app,
+                "_create_query_highlight_run",
+                return_value={"candidate_count": 2},
+            ) as create_query,
+            patch.object(
+                app,
+                "_latest_highlight_view",
+                return_value=("query candidates", [("first", "candidate-1")]),
+            ),
+        ):
+            outputs = list(app.do_highlight_generation(
+                "query",
+                "vid_synthetic",
+                "unused-model",
+                "環境改善について説明している場面",
+                3,
+                20.0,
+                90.0,
+            ))
+
+        create_query.assert_called_once()
+        self.assertEqual(len(outputs), 2)
+        self.assertIn("2件", outputs[-1][0])
+        self.assertEqual(outputs[-1][1], "query candidates")
+        self.assertEqual(outputs[-1][2]["value"], "candidate-1")
+
+    def test_highlight_export_can_atomically_save_all_visible_candidates(self):
+        video = {
+            "path": "synthetic.mp4",
+            "duration": 120.0,
+        }
+        candidates = [
+            {
+                "highlight_candidate_id": "candidate-1",
+                "start_sec": 10.0,
+                "end_sec": 20.0,
+            },
+            {
+                "highlight_candidate_id": "candidate-2",
+                "start_sec": 30.0,
+                "end_sec": 45.0,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            def fake_cut(_source, _start, _end, output, **_kwargs):
+                Path(output).write_bytes(b"synthetic-video")
+
+            with (
+                patch.object(
+                    app,
+                    "_highlight_export_context",
+                    return_value=(video, candidates),
+                ),
+                patch.object(app, "cut_clip", side_effect=fake_cut),
+            ):
+                outputs = list(app.export_highlight_candidates(
+                    "vid_synthetic",
+                    "candidate-1",
+                    "all",
+                    temporary,
+                    True,
+                ))
+
+            saved = outputs[-1][1]
+            self.assertEqual(len(saved), 2)
+            self.assertTrue(all(Path(path).is_file() for path in saved))
+            self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
+
     def test_llm_summary_and_highlights_have_a_dedicated_ordered_tab(self):
         tab_labels = [
             (component.get("props") or {}).get("label")

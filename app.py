@@ -16,6 +16,7 @@ import html
 import json
 import math
 import secrets
+import statistics
 import subprocess
 import threading
 import time
@@ -27,6 +28,11 @@ from moment_retrieval import config, db, utils
 from cut_clip import cut_clip, cut_clips
 from moment_retrieval.downloader import DownloadError, download_video
 from moment_retrieval.embedder import TextEmbedder
+from moment_retrieval.highlight_analysis import (
+    QUERY_PROMPT_VERSION,
+    build_query_highlight_candidates,
+    valid_source_segments,
+)
 from moment_retrieval.preview_cache import (
     DEFAULT_LOCK_STRIPES,
     DEFAULT_MAX_BYTES,
@@ -83,6 +89,7 @@ ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
 
 _embedder = None
 _index_lock = threading.Lock()
+_highlight_export_lock = threading.Lock()
 _preview_cache_manager = PreviewCache(
     PREVIEW_DIR,
     max_bytes=PREVIEW_CACHE_MAX_BYTES,
@@ -3746,6 +3753,11 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
 
         candidates = db.get_highlight_candidates(conn, ready["highlight_run_id"])
         result = ready.get("result") or {}
+        generation_mode = str(result.get("generation_mode") or "summary")
+        generation_description = (
+            "自然言語クエリ検索"
+            if generation_mode == "query" else "要約から自動選定"
+        )
         lines = notices + [
             "### 見どころ候補",
             (
@@ -3754,6 +3766,7 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             ),
             "",
             "### 生成品質",
+            f"- 生成方式: **{generation_description}**",
             f"- 候補: **{len(candidates)}件** / 要求: {int(result.get('requested_count') or ready.get('requested_count') or 0)}件",
             "- 候補尺: "
             f"{float(result.get('duration_min') or 0.0):.1f}〜"
@@ -3768,6 +3781,11 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             f"- 隔離した不正ASR segment: {int(result.get('invalid_segment_count') or 0)}件",
             "",
         ]
+        if generation_mode == "query" and result.get("query"):
+            lines.insert(
+                lines.index("### 生成品質") + 2,
+                f"- クエリ: `{html.escape(str(result['query']))}`",
+            )
         choices: list[tuple[str, str]] = []
         for ordinal, candidate in enumerate(candidates, start=1):
             start = float(candidate["start_sec"])
@@ -3936,6 +3954,283 @@ def load_highlight_candidate_into_editor(video_choice: str, candidate_id: str):
         *loaded,
         gr.update(value=video_id),
     )
+
+
+def _create_query_highlight_run(
+    video_choice: str,
+    query: str,
+    requested_count: int,
+    min_duration_sec: float,
+    max_duration_sec: float,
+) -> dict:
+    """Persist deterministic candidates derived from shared local search."""
+    video_id = parse_video_choice(video_choice)
+    normalized_query = str(query or "").strip()
+    if not video_id:
+        raise gr.Error("候補を生成する動画を選択してください。")
+    if not normalized_query:
+        raise gr.Error("検索したい内容を自然言語で入力してください。")
+    requested_count = int(requested_count)
+    min_duration_sec = float(min_duration_sec)
+    max_duration_sec = float(max_duration_sec)
+    if not 3 <= requested_count <= 10:
+        raise gr.Error("候補件数は3〜10件で指定してください。")
+    if (
+        not math.isfinite(min_duration_sec)
+        or not math.isfinite(max_duration_sec)
+        or not 0 < min_duration_sec <= max_duration_sec
+    ):
+        raise gr.Error("候補尺は 0 < 最小尺 <= 最大尺 で指定してください。")
+
+    hits = search_video_results(
+        normalized_query,
+        video_id,
+        max(20, requested_count * 4),
+        config.MIN_SCORE,
+    )
+    if not hits:
+        raise gr.Error("この動画ではクエリに該当する場面が見つかりませんでした。")
+
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        if revision is None:
+            raise gr.Error("この動画には有効な文字起こしがありません。")
+        analysis = db.get_latest_ready_analysis_run(conn, video_id, revision)
+        if analysis is None:
+            raise gr.Error("先にこの動画のLLM要約を作成してください。")
+        source_segments = db.get_segments(
+            conn, video_id, transcript_revision=revision
+        )
+        valid_segments = valid_source_segments(source_segments)
+        chapters = db.get_analysis_chapters(conn, analysis["analysis_run_id"])
+        candidates, suppressed = build_query_highlight_candidates(
+            valid_segments,
+            chapters,
+            hits,
+            normalized_query,
+            requested_count=requested_count,
+            min_duration_sec=min_duration_sec,
+            max_duration_sec=max_duration_sec,
+        )
+        if not candidates:
+            raise gr.Error("検索結果から有効な切り抜き範囲を作成できませんでした。")
+        run_id = db.create_highlight_run(
+            conn,
+            video_id,
+            revision,
+            analysis["analysis_run_id"],
+            provider="local-search",
+            model="text+BGE-M3",
+            prompt_version=QUERY_PROMPT_VERSION,
+            requested_count=requested_count,
+            min_duration_sec=min_duration_sec,
+            max_duration_sec=max_duration_sec,
+            commit=False,
+        )
+        durations = [
+            float(candidate["end_sec"]) - float(candidate["start_sec"])
+            for candidate in candidates
+        ]
+        result = {
+            "generation_mode": "query",
+            "query": normalized_query,
+            "requested_count": requested_count,
+            "candidate_count": len(candidates),
+            "source_chapter_count": len(chapters),
+            "invalid_segment_count": len(source_segments) - len(valid_segments),
+            "duration_min": min(durations),
+            "duration_median": statistics.median(durations),
+            "duration_max": max(durations),
+            "below_min_duration_count": sum(
+                duration < min_duration_sec for duration in durations
+            ),
+            "boundary_expanded_count": sum(
+                bool(candidate.get("boundary_expanded"))
+                for candidate in candidates
+            ),
+            "boundary_warning_count": sum(
+                bool(candidate.get("boundary_warning"))
+                for candidate in candidates
+            ),
+            "overlap_suppressed_count": suppressed,
+            "all_segment_linked": True,
+            "prompt_version": QUERY_PROMPT_VERSION,
+        }
+        db.replace_highlight_candidates(
+            conn, run_id, candidates, commit=False
+        )
+        db.update_highlight_run(
+            conn, run_id, status="ready", result=result, commit=False
+        )
+        conn.commit()
+        return {"highlight_run_id": run_id, **result}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def do_highlight_generation(
+    generation_mode: str,
+    video_choice: str,
+    model: str,
+    query: str,
+    requested_count: int,
+    min_duration_sec: float,
+    max_duration_sec: float,
+):
+    """Dispatch the selected candidate source while keeping one UI contract."""
+    if generation_mode == "summary":
+        yield from do_existing_highlight_analysis(
+            video_choice,
+            model,
+            requested_count,
+            min_duration_sec,
+            max_duration_sec,
+        )
+        return
+    if generation_mode != "query":
+        raise gr.Error("候補の作り方を選択してください。")
+    log_lines = ["自然言語クエリで文字一致・意味検索を実行しています。"]
+    yield "\n".join(log_lines), gr.update(), gr.update()
+    result = _create_query_highlight_run(
+        video_choice,
+        query,
+        requested_count,
+        min_duration_sec,
+        max_duration_sec,
+    )
+    log_lines.append(
+        f"検索から見どころ候補を{result['candidate_count']}件作成しました。"
+    )
+    markdown, choices = _latest_highlight_view(video_choice)
+    yield (
+        "\n".join(log_lines),
+        markdown,
+        gr.update(
+            choices=choices,
+            value=choices[0][1] if choices else None,
+        ),
+    )
+
+
+def highlight_generation_mode_update(generation_mode: str):
+    return gr.update(visible=generation_mode == "query")
+
+
+def _highlight_export_context(video_choice: str) -> tuple[dict, list[dict]]:
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("動画を選択してください。")
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        if revision is None:
+            raise gr.Error("この動画には有効な文字起こしがありません。")
+        run = db.get_latest_ready_highlight_run(conn, video_id, revision)
+        if run is None:
+            raise gr.Error("保存できる見どころ候補がありません。")
+        candidates = db.get_highlight_candidates(conn, run["highlight_run_id"])
+        video = db.get_video(conn, video_id)
+        if not video or not Path(video["path"]).is_file():
+            raise gr.Error("候補の元動画が見つかりません。")
+        return video, candidates
+    finally:
+        conn.close()
+
+
+def _available_highlight_output_path(
+    output_dir: Path, ordinal: int, start_sec: float, end_sec: float
+) -> Path:
+    stem = (
+        f"highlight_{ordinal:02d}_"
+        f"{round(start_sec * 1000):012d}_{round(end_sec * 1000):012d}"
+    )
+    candidate = output_dir / f"{stem}.mp4"
+    suffix = 2
+    while candidate.exists() or candidate.with_name(
+        f".{candidate.name}.cut-video-claim"
+    ).exists():
+        candidate = output_dir / f"{stem}_{suffix}.mp4"
+        suffix += 1
+    return candidate
+
+
+def export_highlight_candidates(
+    video_choice: str,
+    selected_candidate_id: str,
+    export_scope: str,
+    output_dir_text: str,
+    precise: bool,
+):
+    """Cut selected/generated candidates locally with atomic final publish."""
+    if not _highlight_export_lock.acquire(blocking=False):
+        raise gr.Error("別の見どころ候補を保存中です。完了までお待ちください。")
+    outputs: list[str] = []
+    log_lines: list[str] = []
+    try:
+        video, candidates = _highlight_export_context(video_choice)
+        if export_scope == "selected":
+            candidates = [
+                candidate for candidate in candidates
+                if candidate["highlight_candidate_id"] == selected_candidate_id
+            ]
+            if not candidates:
+                raise gr.Error("保存する候補を選択してください。")
+        elif export_scope != "all":
+            raise gr.Error("保存対象を選択してください。")
+        output_dir = Path(
+            str(output_dir_text or "").strip()
+            or str(config.ARTIFACT_ROOT / "highlights")
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_lines.append(f"{len(candidates)}件の候補をローカル保存します。")
+        yield "\n".join(log_lines), outputs
+        for ordinal, candidate in enumerate(candidates, start=1):
+            start = float(candidate["start_sec"])
+            end = float(candidate["end_sec"])
+            output = _available_highlight_output_path(
+                output_dir, ordinal, start, end
+            )
+            temporary = output.with_name(
+                f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
+            )
+            claim = output.with_name(f".{output.name}.cut-video-claim")
+            try:
+                try:
+                    claim.touch(exist_ok=False)
+                except FileExistsError as exc:
+                    raise gr.Error(
+                        "同じ候補の保存処理が競合しました。もう一度実行してください。"
+                    ) from exc
+                cut_clip(
+                    Path(video["path"]),
+                    start,
+                    end,
+                    temporary,
+                    pad=0.0,
+                    precise=bool(precise),
+                    duration=float(video.get("duration") or end),
+                )
+                if output.exists():
+                    raise gr.Error(
+                        f"保存先に同名ファイルが作成されました: {output.name}"
+                    )
+                temporary.replace(output)
+            finally:
+                temporary.unlink(missing_ok=True)
+                claim.unlink(missing_ok=True)
+            outputs.append(str(output.resolve()))
+            log_lines.append(
+                f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
+            )
+            yield "\n".join(log_lines), list(outputs)
+    finally:
+        _highlight_export_lock.release()
 
 
 def do_existing_highlight_analysis(
@@ -5481,10 +5776,24 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 gr.Markdown(
                     "保存済みの章から候補章を選び、選んだ章の元文字起こしへ戻って"
                     "内容が収まる範囲を作ります。映像・表情・音の盛り上がりは評価しません。"
-                    "候補は自動保存せず、プレビューまたは編集画面で確認します。"
+                    "候補はプレビュー・編集でき、確認後に選択候補または全候補をまとめて保存できます。"
                 )
                 highlight_source_status = gr.Markdown(
                     "要約生成済みの動画を上で選ぶと、保存済み要約を再利用できます。"
+                )
+                highlight_generation_mode = gr.Radio(
+                    choices=[
+                        ("要約から自動選定", "summary"),
+                        ("自然言語クエリで検索", "query"),
+                    ],
+                    value="summary",
+                    label="候補の作り方",
+                )
+                highlight_query = gr.Textbox(
+                    label="検索したい内容",
+                    placeholder="例: 配信環境の改善について具体的に説明している場面",
+                    lines=2,
+                    visible=False,
                 )
                 with gr.Row():
                     highlight_count = gr.Number(
@@ -5507,7 +5816,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 with gr.Row():
                     highlight_result_show = gr.Button("保存済み候補を表示")
                     highlight_result_generate = gr.Button(
-                        "保存済み要約から見どころ候補を生成",
+                        "見どころ候補を生成",
                         variant="primary",
                         interactive=False,
                     )
@@ -5519,7 +5828,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 highlight_result_markdown = gr.Markdown(
                     "先に動画と保存済みLLM解析結果を選択してください。"
                 )
-                highlight_candidate_select = gr.Dropdown(
+                highlight_candidate_select = gr.Radio(
                     choices=[],
                     label="プレビュー・編集する候補",
                 )
@@ -5538,6 +5847,40 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 highlight_preview_detail = gr.Markdown(
                     "候補を選び、プレビューボタンを押してください。"
                 )
+                with gr.Accordion("3. 作成した候補を切り抜いて保存", open=True):
+                    highlight_export_scope = gr.Radio(
+                        choices=[
+                            ("選択候補のみ", "selected"),
+                            ("表示中の全候補", "all"),
+                        ],
+                        value="selected",
+                        label="保存対象",
+                    )
+                    with gr.Row():
+                        highlight_export_dir = gr.Textbox(
+                            value=str(config.ARTIFACT_ROOT / "highlights"),
+                            label="保存先フォルダ",
+                            scale=3,
+                        )
+                        highlight_export_precise = gr.Checkbox(
+                            value=True,
+                            label="フレーム精度で保存",
+                            scale=1,
+                        )
+                    highlight_export_btn = gr.Button(
+                        "候補を切り抜いて保存",
+                        variant="primary",
+                    )
+                    highlight_export_log = gr.Textbox(
+                        label="保存ログ",
+                        interactive=False,
+                        lines=4,
+                    )
+                    highlight_export_files = gr.File(
+                        label="保存したファイル",
+                        file_count="multiple",
+                        interactive=False,
+                    )
             llm_result_reload.click(
                 lambda: gr.update(choices=list_llm_result_video_choices()),
                 outputs=[llm_result_video],
@@ -5588,11 +5931,18 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 inputs=[llm_result_video],
                 outputs=[highlight_result_markdown, highlight_candidate_select],
             )
+            highlight_generation_mode.change(
+                highlight_generation_mode_update,
+                inputs=[highlight_generation_mode],
+                outputs=[highlight_query],
+            )
             highlight_result_generate.click(
-                do_existing_highlight_analysis,
+                do_highlight_generation,
                 inputs=[
+                    highlight_generation_mode,
                     llm_result_video,
                     llm_workspace_model_box,
+                    highlight_query,
                     highlight_count,
                     highlight_min_duration,
                     highlight_max_duration,
@@ -5620,6 +5970,19 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     *intuitive_load_and_search_outputs,
                 ],
                 concurrency_id="intuitive-editor-state",
+                concurrency_limit=1,
+            )
+            highlight_export_btn.click(
+                export_highlight_candidates,
+                inputs=[
+                    llm_result_video,
+                    highlight_candidate_select,
+                    highlight_export_scope,
+                    highlight_export_dir,
+                    highlight_export_precise,
+                ],
+                outputs=[highlight_export_log, highlight_export_files],
+                concurrency_id="highlight-export-io",
                 concurrency_limit=1,
             )
 

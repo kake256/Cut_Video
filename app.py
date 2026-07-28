@@ -3576,6 +3576,76 @@ def format_latest_llm_analysis(video_choice: str) -> str:
         conn.close()
 
 
+def _has_ready_llm_analysis(video_choice: str) -> bool:
+    """Return whether the active transcript has a reusable ready analysis."""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        return False
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        if revision is None:
+            return False
+        return db.get_latest_ready_analysis_run(conn, video_id, revision) is not None
+    finally:
+        conn.close()
+
+
+def list_llm_result_video_choices() -> list[tuple[str, str]]:
+    """List videos while making reusable summary state visible in the UI."""
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        choices = []
+        for video in db.list_videos(conn):
+            video_id = video.get("public_video_id") or video["video_id"]
+            revision = db.get_active_transcript_revision(conn, video_id)
+            ready = (
+                db.get_latest_ready_analysis_run(conn, video_id, revision)
+                if revision is not None else None
+            )
+            status = "要約済み" if ready is not None else "未要約"
+            name = video.get("display_name") or Path(video["path"]).name
+            label = (
+                f"[{status}] {name}  —  "
+                f"{utils.format_timestamp(float(video.get('duration') or 0.0))}"
+            )
+            choices.append((label, str(video_id)))
+        return choices
+    finally:
+        conn.close()
+
+
+def load_summary_highlight_workspace(video_choice: str):
+    """Load one saved summary and expose highlight generation when reusable."""
+    summary = format_latest_llm_analysis(video_choice)
+    ready = _has_ready_llm_analysis(video_choice)
+    if ready:
+        highlight_markdown, choices = _latest_highlight_view(video_choice)
+        status = (
+            "✅ 保存済みの要約・時間付き章をそのまま利用できます。"
+            "再要約せず見どころ候補を生成できます。"
+        )
+    else:
+        highlight_markdown, choices = (
+            "この動画には利用できる保存済み要約がありません。"
+            "先に上の「この動画をローカルLLMで解析」を実行してください。",
+            [],
+        )
+        status = "保存済み要約がないため、見どころ候補はまだ生成できません。"
+    return (
+        summary,
+        status,
+        highlight_markdown,
+        gr.update(
+            choices=choices,
+            value=choices[0][1] if choices else None,
+        ),
+        gr.update(interactive=ready),
+    )
+
+
 def do_existing_llm_analysis(video_choice: str, model: str):
     """Run retryable local analysis in a separate process for an existing video."""
     video_id = parse_video_choice(video_choice)
@@ -5376,7 +5446,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             )
             with gr.Row():
                 llm_result_video = gr.Dropdown(
-                    choices=list_video_choices_only(),
+                    choices=list_llm_result_video_choices(),
                     label="解析結果を確認する動画",
                     scale=3,
                 )
@@ -5401,6 +5471,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "内容が収まる範囲を作ります。映像・表情・音の盛り上がりは評価しません。"
                     "候補は自動保存せず、プレビューまたは編集画面で確認します。"
                 )
+                highlight_source_status = gr.Markdown(
+                    "要約生成済みの動画を上で選ぶと、保存済み要約を再利用できます。"
+                )
                 with gr.Row():
                     highlight_count = gr.Number(
                         value=config.LLM_HIGHLIGHT_COUNT,
@@ -5422,8 +5495,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 with gr.Row():
                     highlight_result_show = gr.Button("保存済み候補を表示")
                     highlight_result_generate = gr.Button(
-                        "見どころ候補を生成",
+                        "保存済み要約から見どころ候補を生成",
                         variant="primary",
+                        interactive=False,
                     )
                 highlight_result_log = gr.Textbox(
                     label="見どころ候補生成ログ",
@@ -5453,20 +5527,49 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "候補を選び、プレビューボタンを押してください。"
                 )
             llm_result_reload.click(
-                lambda: gr.update(choices=list_video_choices_only()),
+                lambda: gr.update(choices=list_llm_result_video_choices()),
                 outputs=[llm_result_video],
             )
-            llm_result_show.click(
-                format_latest_llm_analysis,
+            llm_result_video.input(
+                load_summary_highlight_workspace,
                 inputs=[llm_result_video],
-                outputs=[llm_result_markdown],
+                outputs=[
+                    llm_result_markdown,
+                    highlight_source_status,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                    highlight_result_generate,
+                ],
+                show_progress="minimal",
             )
-            llm_result_analyze.click(
+            llm_result_show.click(
+                load_summary_highlight_workspace,
+                inputs=[llm_result_video],
+                outputs=[
+                    llm_result_markdown,
+                    highlight_source_status,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                    highlight_result_generate,
+                ],
+            )
+            llm_analysis_event = llm_result_analyze.click(
                 do_existing_llm_analysis,
                 inputs=[llm_result_video, llm_model_box],
                 outputs=[llm_result_log, llm_result_markdown],
                 concurrency_id="library-index-io",
                 concurrency_limit=1,
+            )
+            llm_analysis_event.success(
+                load_summary_highlight_workspace,
+                inputs=[llm_result_video],
+                outputs=[
+                    llm_result_markdown,
+                    highlight_source_status,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                    highlight_result_generate,
+                ],
             )
             highlight_result_show.click(
                 load_latest_highlight_view,

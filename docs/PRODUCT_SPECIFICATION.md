@@ -656,6 +656,7 @@ preview完成とsave時間は媒体、codec、HDD/SSD、長さで大きく変わ
 - 候補はタイトル、要約、選定理由、分類、タグ、anchor segment ID、調整後segment ID、Source開始・終了、順位を持つ。文字起こし本文を候補tableへ複製保存しない。
 - 候補runと候補行はactive Transcript revisionおよび元のanalysis runに紐づく再生成可能なderived dataとする。ASR、検索、章解析を上書きしない。
 - WebUIは候補一覧、時間、尺、理由、品質指標を表示し、選択候補をローカルpreviewできる。初期実験では利用者の確認なしにclipを書き出さない。
+- WebUIの動画選択はactive Transcript revisionにreadyな解析結果がある動画を「要約済み」と明示する。選択時に保存済み要約と候補状態を読み込み、ready解析があれば再要約せず候補生成を有効化し、なければ誤操作できないよう無効化する。
 - 生成失敗や停止は文字起こし、検索、章解析、Edit planを変更しない。後から同じrevisionで再実行できる。
 - providerは17節と同じloopback Ollamaに限定する。映像・音声の抑揚・無言の出来事・画面変化は評価できないことをUIへ明示する。
 

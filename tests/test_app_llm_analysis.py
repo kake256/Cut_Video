@@ -18,6 +18,43 @@ class _Connection:
 
 
 class AppLlmAnalysisTest(unittest.TestCase):
+    def test_saved_summary_enables_highlight_generation_without_reanalysis(self):
+        with (
+            patch.object(
+                app,
+                "format_latest_llm_analysis",
+                return_value="saved summary",
+            ),
+            patch.object(app, "_has_ready_llm_analysis", return_value=True),
+            patch.object(
+                app,
+                "_latest_highlight_view",
+                return_value=("saved candidates", [("candidate", "candidate-1")]),
+            ),
+        ):
+            outputs = app.load_summary_highlight_workspace("vid_synthetic")
+
+        self.assertEqual(outputs[0], "saved summary")
+        self.assertIn("再要約せず", outputs[1])
+        self.assertEqual(outputs[2], "saved candidates")
+        self.assertEqual(outputs[3]["value"], "candidate-1")
+        self.assertTrue(outputs[4]["interactive"])
+
+    def test_video_without_saved_summary_keeps_highlight_generation_disabled(self):
+        with (
+            patch.object(
+                app,
+                "format_latest_llm_analysis",
+                return_value="no summary",
+            ),
+            patch.object(app, "_has_ready_llm_analysis", return_value=False),
+        ):
+            outputs = app.load_summary_highlight_workspace("vid_synthetic")
+
+        self.assertIn("保存済み要約がない", outputs[1])
+        self.assertIsNone(outputs[3]["value"])
+        self.assertFalse(outputs[4]["interactive"])
+
     def test_latest_ready_analysis_is_escaped_and_time_linked(self):
         ready = {
             "analysis_run_id": "analysis-ready",

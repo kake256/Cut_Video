@@ -3647,6 +3647,327 @@ def do_existing_llm_analysis(video_choice: str, model: str):
         _index_lock.release()
 
 
+def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]]]:
+    """Return escaped candidate Markdown and stable dropdown choices."""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        return "動画を選択してください。", []
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        if revision is None:
+            return "この動画には有効な文字起こしがありません。", []
+        runs = db.list_highlight_runs(conn, video_id, revision)
+        if not runs:
+            return "この文字起こしには見どころ候補がありません。", []
+        latest = runs[0]
+        ready = next((run for run in runs if run and run["status"] == "ready"), None)
+        notices = []
+        if latest and latest["status"] == "failed":
+            notices.append(
+                "> 最新の候補生成は失敗しました: "
+                + html.escape(str(latest.get("error_message") or "原因不明"))
+            )
+        elif latest and latest["status"] in {"pending", "running"}:
+            notices.append("> 最新の候補生成は処理中です。")
+        if ready is None:
+            return "\n\n".join(notices or ["候補はまだ利用できません。"]), []
+
+        candidates = db.get_highlight_candidates(conn, ready["highlight_run_id"])
+        result = ready.get("result") or {}
+        lines = notices + [
+            "### 見どころ候補",
+            (
+                "文字起こしだけを使った候補です。映像だけの出来事、表情、音の盛り上がりは "
+                "評価していません。必ずプレビューで確認してください。"
+            ),
+            "",
+            "### 生成品質",
+            f"- 候補: **{len(candidates)}件** / 要求: {int(result.get('requested_count') or ready.get('requested_count') or 0)}件",
+            "- 候補尺: "
+            f"{float(result.get('duration_min') or 0.0):.1f}〜"
+            f"{float(result.get('duration_max') or 0.0):.1f}秒 "
+            f"（中央値 {float(result.get('duration_median') or 0.0):.1f}秒）",
+            f"- 重複抑制: {int(result.get('overlap_suppressed_count') or 0)}件 / "
+            f"最小尺へ自動拡張: {int(result.get('boundary_expanded_count') or 0)}件 / "
+            f"境界警告: {int(result.get('boundary_warning_count') or 0)}件 / "
+            f"最小尺未達: {int(result.get('below_min_duration_count') or 0)}件",
+            "- segment根拠: "
+            + ("全候補で確認済み" if result.get("all_segment_linked") else "未確認"),
+            f"- 隔離した不正ASR segment: {int(result.get('invalid_segment_count') or 0)}件",
+            "",
+        ]
+        choices: list[tuple[str, str]] = []
+        for ordinal, candidate in enumerate(candidates, start=1):
+            start = float(candidate["start_sec"])
+            end = float(candidate["end_sec"])
+            title = html.escape(str(candidate.get("title") or "無題"))
+            summary = html.escape(str(candidate.get("summary") or ""))
+            reason = html.escape(str(candidate.get("reason") or ""))
+            category = html.escape(str(candidate.get("category") or "未分類"))
+            tags = " / ".join(
+                f"`{html.escape(str(tag))}`" for tag in candidate.get("tags", [])
+            )
+            duration = end - start
+            lines.append(
+                f"#### {ordinal}. {utils.format_timestamp(start)}–"
+                f"{utils.format_timestamp(end)}（{duration:.1f}秒）　{title}"
+            )
+            lines.append(f"- 分類: {category}")
+            if summary:
+                lines.append(f"- 内容: {summary}")
+            if reason:
+                lines.append(f"- 選定理由: {reason}")
+            if tags:
+                lines.append(f"- タグ: {tags}")
+            if candidate.get("boundary_warning"):
+                lines.append(
+                    "- ⚠ 最大尺内で前後関係を完結できない可能性があります。"
+                    "プレビュー後に編集画面で境界を調整してください。"
+                )
+            label = (
+                f"{ordinal}. {utils.format_timestamp(start)}–"
+                f"{utils.format_timestamp(end)}  {str(candidate.get('title') or '無題')}"
+            )
+            choices.append((label, str(candidate["highlight_candidate_id"])))
+        return "\n".join(lines), choices
+    finally:
+        conn.close()
+
+
+def load_latest_highlight_view(video_choice: str):
+    markdown, choices = _latest_highlight_view(video_choice)
+    return markdown, gr.update(
+        choices=choices,
+        value=choices[0][1] if choices else None,
+    )
+
+
+def _resolve_highlight_candidate(video_choice: str, candidate_id: str):
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("動画を選択してください。")
+    if not candidate_id:
+        raise gr.Error("見どころ候補を選択してください。")
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        revision = db.get_active_transcript_revision(conn, video_id)
+        if revision is None:
+            raise gr.Error("この動画には有効な文字起こしがありません。")
+        run = db.get_latest_ready_highlight_run(conn, video_id, revision)
+        if run is None:
+            raise gr.Error("利用できる見どころ候補がありません。")
+        candidate = next(
+            (
+                item for item in db.get_highlight_candidates(
+                    conn, run["highlight_run_id"]
+                )
+                if item["highlight_candidate_id"] == candidate_id
+            ),
+            None,
+        )
+        if candidate is None:
+            raise gr.Error("候補が更新されています。一覧を再表示してください。")
+        video = db.get_video(conn, video_id)
+        if not video:
+            raise gr.Error("候補の元動画が見つかりません。")
+        return video_id, video, candidate
+    finally:
+        conn.close()
+
+
+def preview_highlight_candidate(video_choice: str, candidate_id: str):
+    video_id, video, candidate = _resolve_highlight_candidate(
+        video_choice, candidate_id
+    )
+    start = float(candidate["start_sec"])
+    end = float(candidate["end_sec"])
+    duration = float(video.get("duration") or end)
+    preview = make_preview(
+        video["path"], start, end, duration, video_id=video_id,
+    )
+    filename = Path(video["path"]).name
+    detail = (
+        f"**{html.escape(str(candidate.get('title') or '無題'))}**　｜　"
+        f"{utils.format_timestamp(start)}–{utils.format_timestamp(end)}　｜　"
+        f"{end - start:.1f}秒\n\n"
+        f"{html.escape(str(candidate.get('summary') or ''))}"
+    )
+    return gr.update(
+        value=preview,
+        label=f"見どころ候補プレビュー: {filename}",
+    ), detail
+
+
+def _load_highlight_candidate_editor(video_choice: str, candidate_id: str):
+    """Open one fitted candidate as a clean intuitive Edit plan."""
+    video_id, video, candidate = _resolve_highlight_candidate(
+        video_choice, candidate_id
+    )
+    overall_start = float(candidate["start_sec"])
+    overall_end = float(candidate["end_sec"])
+    duration = float(video.get("duration") or overall_end)
+    if not 0 <= overall_start < overall_end <= duration:
+        raise gr.Error("候補の時刻が元動画の範囲外です。候補を再生成してください。")
+    viewport_start = max(0.0, overall_start - 10.0)
+    viewport_end = min(duration, overall_end + 10.0)
+    conn = db.get_conn()
+    try:
+        segments = db.get_segments_in_range(
+            conn, video["video_id"], viewport_start, viewport_end,
+        )
+    finally:
+        conn.close()
+    state = _new_intuitive_state(video, overall_start, overall_end)
+    state["preview_start"] = viewport_start
+    state["preview_end"] = viewport_end
+    state["viewport_start"] = viewport_start
+    state["viewport_end"] = viewport_end
+    state["playhead_sec"] = overall_start
+    _set_intuitive_transcript_focus(state, overall_start)
+    preview = make_intuitive_preview(
+        state["video_id"], state["video_path"], viewport_start, viewport_end,
+        state["duration"],
+    )
+    filename = Path(state["video_path"]).name
+    interval = (
+        f"{utils.format_timestamp(viewport_start)} - "
+        f"{utils.format_timestamp(viewport_end)}"
+    )
+    info = (
+        "**表示モード:** 元動画プレビュー（Source timeline）　｜　"
+        f"**見どころ候補:** {html.escape(filename)}　｜　**表示区間:** {interval}"
+    )
+    return (
+        state,
+        gr.update(
+            value=preview,
+            label=f"1. 動画プレビュー（Source timeline）: {filename} [{video_id}]",
+        ),
+        render_intuitive_transcript(segments, state),
+        info,
+        render_intuitive_toolbar(state),
+        render_intuitive_state_overview(state),
+        render_intuitive_state_zoom(state),
+        render_intuitive_summary(state),
+        render_intuitive_exclusion_list(state),
+        intuitive_selected_time_update(state),
+    )
+
+
+def load_highlight_candidate_into_editor(video_choice: str, candidate_id: str):
+    loaded = _load_highlight_candidate_editor(video_choice, candidate_id)
+    video_id = parse_video_choice(video_choice)
+    gr.Info("候補を編集画面へ読み込みました。検索・編集・切り抜きタブで確認できます。")
+    return (
+        gr.update(value=video_id),
+        *loaded,
+        gr.update(value=video_id),
+    )
+
+
+def do_existing_highlight_analysis(
+    video_choice: str,
+    model: str,
+    requested_count: int,
+    min_duration_sec: float,
+    max_duration_sec: float,
+):
+    """Generate segment-linked candidates in a separate local process."""
+    video_id = parse_video_choice(video_choice)
+    if not video_id:
+        raise gr.Error("候補を生成する動画を選択してください。")
+    selected_model = (model or config.LLM_HIGHLIGHT_MODEL).strip()
+    if not selected_model:
+        raise gr.Error("Ollamaモデル名を指定してください。")
+    try:
+        requested_count = int(requested_count)
+        min_duration_sec = float(min_duration_sec)
+        max_duration_sec = float(max_duration_sec)
+    except (TypeError, ValueError) as exc:
+        raise gr.Error("候補件数と候補尺を数値で指定してください。") from exc
+    if not 3 <= requested_count <= 10:
+        raise gr.Error("候補件数は3〜10件で指定してください。")
+    if (
+        not math.isfinite(min_duration_sec)
+        or not math.isfinite(max_duration_sec)
+        or not 0 < min_duration_sec <= max_duration_sec
+    ):
+        raise gr.Error("候補尺は 0 < 最小尺 <= 最大尺 となるよう指定してください。")
+    if not _index_lock.acquire(blocking=False):
+        raise gr.Error(
+            "別の動画追加・LLM解析・候補生成が実行中です。完了までお待ちください。"
+        )
+
+    import os
+    import sys
+
+    command = [
+        sys.executable,
+        "generate_highlights.py",
+        "--video-id", video_id,
+        "--model", selected_model,
+        "--count", str(requested_count),
+        "--min-duration", str(min_duration_sec),
+        "--max-duration", str(max_duration_sec),
+    ]
+    env = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+    process = None
+    log_lines = ["ローカルLLMで見どころ候補の生成を開始しました。"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            cwd=str(Path(__file__).parent),
+        )
+        INDEX_JOB_PIDFILE.write_text(str(process.pid), encoding="utf-8")
+        _index_state["proc"] = process
+        _index_state["stopped"] = False
+        yield "\n".join(log_lines), gr.update(), gr.update()
+        for line in iter(process.stdout.readline, ""):
+            text = line.rstrip()
+            if text:
+                log_lines.append(text)
+                yield "\n".join(log_lines), gr.update(), gr.update()
+        code = process.wait()
+        if code == 0:
+            markdown, choices = _latest_highlight_view(video_choice)
+            yield (
+                "\n".join(log_lines),
+                markdown,
+                gr.update(
+                    choices=choices,
+                    value=choices[0][1] if choices else None,
+                ),
+            )
+        elif _index_state["stopped"]:
+            log_lines.append(
+                "候補生成を停止しました。文字起こし・検索・編集内容は変更されていません。"
+            )
+            yield "\n".join(log_lines), gr.update(), gr.update()
+        else:
+            log_lines.append(
+                "候補生成に失敗しました。文字起こし・検索・編集内容は変更されていません。"
+            )
+            yield "\n".join(log_lines), gr.update(), gr.update()
+    finally:
+        INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+        _index_state["proc"] = None
+        _index_lock.release()
+
+
 # 終了ボタン押下時にブラウザ側で実行するJS。まずタブを閉じようとし、
 # ブラウザのセキュリティ制約で閉じられない場合は画面を終了表示に差し替える
 # (サーバー停止による接続エラー画面になるより分かりやすい)。
@@ -5074,6 +5395,63 @@ with gr.Blocks(title="動画シーン検索") as demo:
             llm_result_markdown = gr.Markdown(
                 "動画を選択して保存済み結果を表示してください。"
             )
+            with gr.Accordion("見どころ候補（実験）", open=False):
+                gr.Markdown(
+                    "保存済みの章から候補章を選び、選んだ章の元文字起こしへ戻って"
+                    "内容が収まる範囲を作ります。映像・表情・音の盛り上がりは評価しません。"
+                    "候補は自動保存せず、プレビューまたは編集画面で確認します。"
+                )
+                with gr.Row():
+                    highlight_count = gr.Number(
+                        value=config.LLM_HIGHLIGHT_COUNT,
+                        minimum=3,
+                        maximum=10,
+                        precision=0,
+                        label="候補件数（3〜10）",
+                    )
+                    highlight_min_duration = gr.Number(
+                        value=config.LLM_HIGHLIGHT_MIN_DURATION_SEC,
+                        minimum=1,
+                        label="最小尺（秒・目安）",
+                    )
+                    highlight_max_duration = gr.Number(
+                        value=config.LLM_HIGHLIGHT_MAX_DURATION_SEC,
+                        minimum=1,
+                        label="最大尺（秒）",
+                    )
+                with gr.Row():
+                    highlight_result_show = gr.Button("保存済み候補を表示")
+                    highlight_result_generate = gr.Button(
+                        "見どころ候補を生成",
+                        variant="primary",
+                    )
+                highlight_result_log = gr.Textbox(
+                    label="見どころ候補生成ログ",
+                    interactive=False,
+                    lines=4,
+                )
+                highlight_result_markdown = gr.Markdown(
+                    "先に動画と保存済みLLM解析結果を選択してください。"
+                )
+                highlight_candidate_select = gr.Dropdown(
+                    choices=[],
+                    label="プレビュー・編集する候補",
+                )
+                with gr.Row():
+                    highlight_preview_btn = gr.Button("選択候補をプレビュー")
+                    highlight_edit_btn = gr.Button(
+                        "選択候補を編集画面で開く",
+                        variant="secondary",
+                    )
+                highlight_preview = gr.Video(
+                    label="見どころ候補プレビュー",
+                    autoplay=False,
+                    interactive=False,
+                    height=360,
+                )
+                highlight_preview_detail = gr.Markdown(
+                    "候補を選び、プレビューボタンを押してください。"
+                )
             llm_result_reload.click(
                 lambda: gr.update(choices=list_video_choices_only()),
                 outputs=[llm_result_video],
@@ -5088,6 +5466,45 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 inputs=[llm_result_video, llm_model_box],
                 outputs=[llm_result_log, llm_result_markdown],
                 concurrency_id="library-index-io",
+                concurrency_limit=1,
+            )
+            highlight_result_show.click(
+                load_latest_highlight_view,
+                inputs=[llm_result_video],
+                outputs=[highlight_result_markdown, highlight_candidate_select],
+            )
+            highlight_result_generate.click(
+                do_existing_highlight_analysis,
+                inputs=[
+                    llm_result_video,
+                    llm_model_box,
+                    highlight_count,
+                    highlight_min_duration,
+                    highlight_max_duration,
+                ],
+                outputs=[
+                    highlight_result_log,
+                    highlight_result_markdown,
+                    highlight_candidate_select,
+                ],
+                concurrency_id="library-index-io",
+                concurrency_limit=1,
+            )
+            highlight_preview_btn.click(
+                preview_highlight_candidate,
+                inputs=[llm_result_video, highlight_candidate_select],
+                outputs=[highlight_preview, highlight_preview_detail],
+                concurrency_id="highlight-preview-io",
+                concurrency_limit=1,
+            )
+            highlight_edit_btn.click(
+                load_highlight_candidate_into_editor,
+                inputs=[llm_result_video, highlight_candidate_select],
+                outputs=[
+                    intuitive_video_select,
+                    *intuitive_load_and_search_outputs,
+                ],
+                concurrency_id="intuitive-editor-state",
                 concurrency_limit=1,
             )
 

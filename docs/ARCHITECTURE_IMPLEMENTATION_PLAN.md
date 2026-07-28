@@ -719,6 +719,13 @@ Phase 5合格時だけ、pywebviewとTauriを比較する。sidecar、installer�
 ASR公開後の失敗許容derived-data stage、revision紐付け、loopback限定provider、
 時間根拠の検証を評価するための分離ブランチ実験とする。
 
+`experiment/llm-highlight-candidates` はその解析結果を入力にする第二段の分離実験とする。
+章要約だけを読む候補章選択、選択章の元ASRを読むanchor選択、pureな許可窓生成、
+許可窓内segment IDだけを使う意味境界選択を分離し、
+LLMへ自由な時刻を生成させない。候補はTranscript revisionとanalysis runへ紐づくderived dataとして
+別run/tableへ保存し、Edit planや成果物へ自動反映しない。採用判断はsegment根拠・尺・重複の
+機械検証と、ローカルでの候補preview評価を分けて行う。
+
 ## 15. 各フェーズ共通の完了条件
 
 - `data/`、`video/`、`clips/`、`exports/`、private transcriptを読まない・commitしない。

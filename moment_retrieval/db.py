@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -161,6 +161,50 @@ CREATE TABLE IF NOT EXISTS analysis_chapters (
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_chapters_run
 ON analysis_chapters(analysis_run_id, ordinal);
+
+-- Highlight generation is separately rerunnable derived data.  It references
+-- immutable ASR IDs but never rewrites ASR or transcript-analysis records.
+CREATE TABLE IF NOT EXISTS highlight_runs (
+    highlight_run_id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(video_id),
+    transcript_revision TEXT NOT NULL REFERENCES transcript_revisions(transcript_revision),
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'ready', 'failed')),
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    requested_count INTEGER NOT NULL,
+    min_duration_sec REAL NOT NULL,
+    max_duration_sec REAL NOT NULL,
+    result_json TEXT,
+    error_message TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_highlight_runs_revision
+ON highlight_runs(video_id, transcript_revision, analysis_run_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS highlight_candidates (
+    highlight_candidate_id TEXT PRIMARY KEY,
+    highlight_run_id TEXT NOT NULL REFERENCES highlight_runs(highlight_run_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    source_chapter_ordinal INTEGER NOT NULL,
+    anchor_start_segment_id INTEGER NOT NULL,
+    anchor_end_segment_id INTEGER NOT NULL,
+    start_segment_id INTEGER NOT NULL,
+    end_segment_id INTEGER NOT NULL,
+    start_sec REAL NOT NULL,
+    end_sec REAL NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    category TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    boundary_warning INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(highlight_run_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_highlight_candidates_run
+ON highlight_candidates(highlight_run_id, ordinal);
 """
 
 
@@ -254,6 +298,21 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
     for name, declaration in additions.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE videos ADD COLUMN {name} {declaration}")
+
+    # highlight-candidates v1 briefly existed without a persisted source
+    # chapter ordinal.  Keep that local experimental database readable while
+    # new rows record the exact chapter selected by the ranking pass.
+    highlight_columns = _columns(conn, "highlight_candidates")
+    if highlight_columns and "source_chapter_ordinal" not in highlight_columns:
+        conn.execute(
+            "ALTER TABLE highlight_candidates ADD COLUMN "
+            "source_chapter_ordinal INTEGER NOT NULL DEFAULT 0"
+        )
+    if highlight_columns and "boundary_warning" not in highlight_columns:
+        conn.execute(
+            "ALTER TABLE highlight_candidates ADD COLUMN "
+            "boundary_warning INTEGER NOT NULL DEFAULT 0"
+        )
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS legacy_video_aliases ("
@@ -860,6 +919,7 @@ def get_segments(
 
 
 ANALYSIS_STATUSES = frozenset({"pending", "running", "ready", "failed"})
+HIGHLIGHT_STATUSES = ANALYSIS_STATUSES
 
 
 def create_analysis_run(
@@ -993,6 +1053,139 @@ def list_analysis_runs(
         (storage_id, transcript_revision),
     ).fetchall()
     return [get_analysis_run(conn, str(row["analysis_run_id"])) for row in rows]
+
+
+def get_latest_ready_analysis_run(
+    conn: sqlite3.Connection, video_id: str, transcript_revision: str
+) -> dict | None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    row = conn.execute(
+        "SELECT analysis_run_id FROM analysis_runs WHERE video_id = ? "
+        "AND transcript_revision = ? AND status = 'ready' "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (storage_id, transcript_revision),
+    ).fetchone()
+    return get_analysis_run(conn, str(row["analysis_run_id"])) if row else None
+
+
+def create_highlight_run(
+    conn: sqlite3.Connection, video_id: str, transcript_revision: str, analysis_run_id: str,
+    *, provider: str, model: str, prompt_version: str, requested_count: int,
+    min_duration_sec: float, max_duration_sec: float, commit: bool = True,
+) -> str:
+    storage_id = _storage_id(conn, video_id) or video_id
+    valid = conn.execute(
+        "SELECT 1 FROM analysis_runs WHERE analysis_run_id = ? AND video_id = ? "
+        "AND transcript_revision = ? AND status = 'ready'",
+        (analysis_run_id, storage_id, transcript_revision),
+    ).fetchone()
+    if valid is None:
+        raise ValueError("ready analysis run does not belong to this video revision")
+    run_id = f"highlight_{uuid.uuid4().hex}"
+    conn.execute(
+        "INSERT INTO highlight_runs(highlight_run_id, video_id, transcript_revision, analysis_run_id, "
+        "status, provider, model, prompt_version, requested_count, min_duration_sec, max_duration_sec) "
+        "VALUES(?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+        (run_id, storage_id, transcript_revision, analysis_run_id, provider, model,
+         prompt_version, requested_count, min_duration_sec, max_duration_sec),
+    )
+    if commit:
+        conn.commit()
+    return run_id
+
+
+def update_highlight_run(
+    conn: sqlite3.Connection, highlight_run_id: str, *, status: str,
+    result: dict | None = None, error_message: str | None = None, commit: bool = True,
+) -> None:
+    if status not in HIGHLIGHT_STATUSES:
+        raise ValueError(f"invalid highlight status: {status}")
+    cursor = conn.execute(
+        "UPDATE highlight_runs SET status = ?, result_json = ?, error_message = ?, "
+        "updated_at = datetime('now') WHERE highlight_run_id = ?",
+        (status, json.dumps(result, ensure_ascii=False, sort_keys=True) if result is not None else None,
+         error_message, highlight_run_id),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("highlight run does not exist")
+    if commit:
+        conn.commit()
+
+
+def replace_highlight_candidates(
+    conn: sqlite3.Connection, highlight_run_id: str, candidates: Iterable[dict], *, commit: bool = True,
+) -> None:
+    conn.execute("DELETE FROM highlight_candidates WHERE highlight_run_id = ?", (highlight_run_id,))
+    rows = [(
+        f"highlight_candidate_{uuid.uuid4().hex}", highlight_run_id, ordinal,
+        int(item["source_chapter_ordinal"]),
+        int(item["anchor_start_segment_id"]), int(item["anchor_end_segment_id"]),
+        int(item["start_segment_id"]), int(item["end_segment_id"]),
+        float(item["start_sec"]), float(item["end_sec"]), str(item["title"]),
+        str(item["summary"]), str(item["reason"]), str(item["category"]),
+        json.dumps(item.get("tags", []), ensure_ascii=False),
+        int(bool(item.get("boundary_warning"))),
+    ) for ordinal, item in enumerate(candidates)]
+    conn.executemany(
+        "INSERT INTO highlight_candidates(highlight_candidate_id, highlight_run_id, ordinal, "
+        "source_chapter_ordinal, anchor_start_segment_id, anchor_end_segment_id, "
+        "start_segment_id, end_segment_id, "
+        "start_sec, end_sec, title, summary, reason, category, tags_json, boundary_warning) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
+    )
+    if commit:
+        conn.commit()
+
+
+def get_highlight_run(conn: sqlite3.Connection, highlight_run_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM highlight_runs WHERE highlight_run_id = ?", (highlight_run_id,)).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    if result.get("result_json"):
+        result["result"] = json.loads(result["result_json"])
+    return result
+
+
+def get_highlight_candidates(conn: sqlite3.Connection, highlight_run_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM highlight_candidates WHERE highlight_run_id = ? ORDER BY ordinal",
+        (highlight_run_id,),
+    ).fetchall()
+    candidates = []
+    for row in rows:
+        candidate = dict(row)
+        candidate["tags"] = json.loads(candidate.pop("tags_json") or "[]")
+        candidate["boundary_warning"] = bool(candidate["boundary_warning"])
+        candidates.append(candidate)
+    return candidates
+
+
+def list_highlight_runs(
+    conn: sqlite3.Connection, video_id: str, transcript_revision: str
+) -> list[dict]:
+    storage_id = _storage_id(conn, video_id) or video_id
+    rows = conn.execute(
+        "SELECT highlight_run_id FROM highlight_runs WHERE video_id = ? "
+        "AND transcript_revision = ? ORDER BY created_at DESC, rowid DESC",
+        (storage_id, transcript_revision),
+    ).fetchall()
+    return [
+        get_highlight_run(conn, str(row["highlight_run_id"]))
+        for row in rows
+    ]
+
+
+def get_latest_ready_highlight_run(
+    conn: sqlite3.Connection, video_id: str, transcript_revision: str
+) -> dict | None:
+    return next(
+        (
+            run for run in list_highlight_runs(conn, video_id, transcript_revision)
+            if run is not None and run["status"] == "ready"
+        ),
+        None,
+    )
 
 
 def get_segments_in_range(

@@ -174,6 +174,28 @@ Ollama endpointはloopbackだけを許可し、クラウド送信機能は含み
 解析は日本語出力を検証し、約5分単位の決定的な範囲へ章ラベルを付けます。
 全体要約・代表タグは第2段階で統合し、WebUIには文字起こしセグメント網羅率も表示します。
 
+### 実験ブランチ: 見どころ候補
+
+`experiment/llm-highlight-candidates` では、保存済みのLLM解析結果から3〜10件の
+見どころ候補を作成できます。章の要約で候補章を絞った後、その章の元ASRを再評価して
+30秒以内の核心となる実在segment IDを1件選び、アプリ側で最大尺以下の許可窓を作ります。
+LLMはその窓内の実在segment IDだけで導入・本題・着地が収まる境界を選び、アプリが
+anchor包含・順序・最小/最大尺を再検証します。
+LLMが自由な時刻を生成することはありません。
+
+WebUIでは「動画の追加」タブ内の「LLM解析結果（実験）」から候補を生成し、個別preview、
+または「検索・編集・切り抜き」画面へcleanな初期範囲として読み込めます。候補だけで
+clipを自動保存することはありません。映像だけの出来事、表情、音の盛り上がりは評価対象外です。
+
+既にreadyなLLM解析がある動画ではCLIからも生成できます。
+
+```powershell
+venv\Scripts\python.exe generate_highlights.py --video-id <公開動画ID> --count 6 --min-duration 20 --max-duration 90
+```
+
+候補runは元のTranscript revisionとanalysis runに紐づく派生データとしてSQLiteへ保存され、
+ASR原文、検索index、編集内容は変更されません。
+
 ## ブラウザE2E（開発者向け）
 
 合成動画と隔離DBだけを使用し、実際の `data/` や動画には触れません。Microsoft Edgeと

@@ -89,3 +89,10 @@ LLM_ANALYSIS_CONTEXT_LENGTH = int(
 LLM_ANALYSIS_MAX_WINDOW_CHARS = int(
     os.environ.get("CUT_VIDEO_LLM_ANALYSIS_MAX_WINDOW_CHARS", "24000")
 )
+
+# Experimental local-only highlight candidates.  These deliberately reuse the
+# loopback-only Ollama connection settings from transcript analysis.
+LLM_HIGHLIGHT_MODEL = os.environ.get("CUT_VIDEO_LLM_HIGHLIGHT_MODEL", LLM_ANALYSIS_MODEL)
+LLM_HIGHLIGHT_COUNT = int(os.environ.get("CUT_VIDEO_LLM_HIGHLIGHT_COUNT", "6"))
+LLM_HIGHLIGHT_MIN_DURATION_SEC = float(os.environ.get("CUT_VIDEO_LLM_HIGHLIGHT_MIN_DURATION_SEC", "20"))
+LLM_HIGHLIGHT_MAX_DURATION_SEC = float(os.environ.get("CUT_VIDEO_LLM_HIGHLIGHT_MAX_DURATION_SEC", "90"))

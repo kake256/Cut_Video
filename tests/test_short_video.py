@@ -51,6 +51,11 @@ class ShortVideoUnitTests(unittest.TestCase):
         self.assertIsNone(source.width)
         with self.assertRaises(ValueError):
             OutputProfile(canvas_mode="source", width=720, height=1280).validate()
+        square = OutputProfile.square(720)
+        self.assertEqual(square.canvas_mode, "square_fit")
+        self.assertEqual((square.width, square.height), (720, 720))
+        with self.assertRaisesRegex(ValueError, "equal dimensions"):
+            replace(square, height=718).validate()
 
     def test_audio_profile_manifest_contains_no_local_path(self):
         profile = AudioProfile(
@@ -163,6 +168,15 @@ class ShortVideoUnitTests(unittest.TestCase):
         )
         self.assertIn("crop=720:1280", crop)
         self.assertNotIn("subtitles", crop)
+        square = build_short_filter(
+            OutputProfile.square(
+                720, caption=CaptionProfile(enabled=False),
+            ),
+            include_captions=False,
+        )
+        self.assertIn("scale=720:720", square)
+        self.assertIn("boxblur", square)
+        self.assertIn("overlay", square)
         source = build_source_caption_filter()
         self.assertIn("setpts=PTS-STARTPTS", source)
         self.assertIn("subtitles=filename=captions.ass", source)
@@ -498,6 +512,30 @@ class ShortVideoIntegrationTests(unittest.TestCase):
                 "-show_entries", "stream=codec_type", "-of", "json", str(output),
             ], check=True, capture_output=True, text=True)
             self.assertEqual(json.loads(probe.stdout)["streams"][0]["codec_type"], "audio")
+
+    def test_real_ffmpeg_renders_square_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            output = root / "square.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=1",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+            ], check=True, capture_output=True)
+            render_short_clip(
+                source, 0, 1, output,
+                options=OutputProfile.square(
+                    360, caption=CaptionProfile(enabled=False),
+                ),
+                duration=1,
+            )
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "json", str(output),
+            ], check=True, capture_output=True, text=True)
+            stream = json.loads(probe.stdout)["streams"][0]
+            self.assertEqual((stream["width"], stream["height"]), (360, 360))
 
 
 if __name__ == "__main__":

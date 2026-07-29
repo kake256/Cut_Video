@@ -72,6 +72,7 @@ from moment_retrieval.output_profile import (
     validate_font_glyphs,
 )
 from moment_retrieval.publication import private_source_fingerprint
+from moment_retrieval.posting_metadata import posting_metadata_from_candidate
 from moment_retrieval.ui_experiment import UIExperimentRecorder, compare_ui_runs
 from moment_retrieval.subtitles import SubtitleCue, format_srt_time, map_subtitles
 from moment_retrieval.short_video import (
@@ -3199,6 +3200,10 @@ def _intuitive_output_profile(
         ).validate()
         if output_format == "standard":
             return OutputProfile.source(caption=caption, audio=audio_profile)
+        if output_format == "square":
+            return OutputProfile.square(
+                1080, caption=caption, audio=audio_profile,
+            )
         if output_format != "short":
             raise ValueError("出力形式を選択してください。")
         width, height = parse_short_resolution(short_resolution)
@@ -3353,7 +3358,10 @@ def preview_intuitive_output(
             )
     except (OSError, RuntimeError, ValueError, EditPlanError) as exc:
         raise gr.Error("出力プレビューの作成に失敗しました。") from exc
-    mode = "縦型9:16" if output_format == "short" else "元の縦横比"
+    mode = {
+        "short": "縦型9:16",
+        "square": "正方形1:1",
+    }.get(output_format, "元の縦横比")
     if output_format == "short":
         mode += f"（{short_layout} / {short_resolution}）"
     status = f"**出力プレビュー:** {mode}　｜　**{caption_kind}**"
@@ -5018,9 +5026,11 @@ def _available_highlight_output_path(
         stem = f"{stem}_{safe_variant}"
     candidate = output_dir / f"{stem}.mp4"
     suffix = 2
-    while candidate.exists() or candidate.with_name(
-        f".{candidate.name}.cut-video-claim"
-    ).exists():
+    while (
+        candidate.exists()
+        or candidate.with_suffix(".metadata.json").exists()
+        or candidate.with_name(f".{candidate.name}.cut-video-claim").exists()
+    ):
         candidate = output_dir / f"{stem}_{suffix}.mp4"
         suffix += 1
     return candidate
@@ -5422,6 +5432,10 @@ def export_highlight_candidates(
     short_captions: bool = False,
     editor_rows=None,
     editor_state=None,
+    write_metadata: bool = False,
+    metadata_title: str = "",
+    metadata_description: str = "",
+    metadata_tags: str = "",
     export_job_id: str | None = None,
 ):
     """Cut selected/generated candidates locally with atomic final publish."""
@@ -5444,6 +5458,13 @@ def export_highlight_candidates(
                 raise gr.Error("保存する候補を選択してください。")
         elif export_scope != "all":
             raise gr.Error("保存対象を選択してください。")
+        if export_scope != "selected" and any(
+            str(value or "").strip()
+            for value in (metadata_title, metadata_description, metadata_tags)
+        ):
+            raise gr.Error(
+                "メタデータの手動上書きは「選択候補のみ」で利用してください。"
+            )
         output_dir = Path(
             str(output_dir_text or "").strip()
             or str(config.ARTIFACT_ROOT / "highlights")
@@ -5525,6 +5546,11 @@ def export_highlight_candidates(
                 temporary = output.with_name(
                     f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
                 )
+                metadata_output = output.with_suffix(".metadata.json")
+                metadata_temporary = output.with_name(
+                    f".{output.stem}.{secrets.token_hex(4)}.partial.metadata.json"
+                )
+                metadata_published = False
                 claim = output.with_name(f".{output.name}.cut-video-claim")
                 try:
                     try:
@@ -5533,6 +5559,16 @@ def export_highlight_candidates(
                         raise gr.Error(
                             "同じ候補の保存処理が競合しました。もう一度実行してください。"
                         ) from exc
+                    metadata = None
+                    if write_metadata:
+                        metadata = posting_metadata_from_candidate(
+                            candidate,
+                            title_override=metadata_title,
+                            description_override=metadata_description,
+                            tags_override=metadata_tags,
+                        )
+                        if metadata_output.exists():
+                            raise gr.Error("同名の投稿用メタデータが既にあります。")
                     if export_format == "short":
                         render_short_clip(
                             Path(video["path"]), start, end, temporary,
@@ -5569,13 +5605,30 @@ def export_highlight_candidates(
                             export_job_id, ExportStage.PUBLISHING,
                             progress=10 + round(75 * ordinal / max(1, len(candidates))),
                         )
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("highlight export cancelled")
+                    if metadata is not None:
+                        metadata_temporary.write_text(
+                            json.dumps(
+                                metadata.to_dict(), ensure_ascii=False, indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                        _publish_highlight_without_overwrite(
+                            metadata_temporary, metadata_output,
+                        )
+                        metadata_published = True
                     _publish_highlight_without_overwrite(temporary, output)
                 finally:
                     temporary.unlink(missing_ok=True)
+                    metadata_temporary.unlink(missing_ok=True)
+                    if metadata_published and not output.exists():
+                        metadata_output.unlink(missing_ok=True)
                     claim.unlink(missing_ok=True)
                 outputs.append(str(output.resolve()))
                 log_lines.append(
                     f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
+                    + ("（投稿用JSON付き）" if write_metadata else "")
                 )
             except Exception:
                 if cancel_event is not None and cancel_event.is_set():
@@ -6805,6 +6858,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                             choices=[
                                 ("元の縦横比（通常）", "standard"),
                                 ("縦型9:16（ショート）", "short"),
+                                ("正方形1:1", "square"),
                             ], value="standard", label="画面サイズ",
                         )
                         with gr.Row():
@@ -7578,6 +7632,24 @@ with gr.Blocks(title="動画シーン検索") as demo:
                             label="フレーム精度で保存",
                             scale=1,
                         )
+                    with gr.Accordion("投稿用メタデータ（任意・ローカル保存のみ）", open=False):
+                        highlight_write_metadata = gr.Checkbox(
+                            value=False,
+                            label="動画と同名の投稿用JSONを保存する",
+                        )
+                        gr.Markdown(
+                            "LLM由来の候補です。外部送信は行いません。"
+                            " 下の上書き欄は「選択候補のみ」の場合に利用できます。"
+                        )
+                        highlight_metadata_title = gr.Textbox(
+                            value="", label="タイトル（空なら候補タイトル）",
+                        )
+                        highlight_metadata_description = gr.Textbox(
+                            value="", label="説明（空なら候補の要約）", lines=3,
+                        )
+                        highlight_metadata_tags = gr.Textbox(
+                            value="", label="タグ（空なら候補タグ・カンマ区切り）",
+                        )
                     highlight_export_btn = gr.Button(
                         "候補を切り抜いて保存",
                         variant="primary",
@@ -7882,7 +7954,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     highlight_export_precise,
                     gr.State("standard"), gr.State("blur"),
                     gr.State("1080x1920"), gr.State(False),
-                    gr.State([]), gr.State({}), highlight_export_job_id,
+                    gr.State([]), gr.State({}),
+                    highlight_write_metadata, highlight_metadata_title,
+                    highlight_metadata_description, highlight_metadata_tags,
+                    highlight_export_job_id,
                 ],
                 outputs=[
                     highlight_export_log, highlight_export_files,

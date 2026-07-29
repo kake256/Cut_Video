@@ -342,8 +342,10 @@ def build_short_filter(
     options: ShortVideoOptions | OutputProfile, *, include_captions: bool,
 ) -> str:
     profile = resolve_output_profile(options)
-    if profile.canvas_mode not in {"portrait_blur", "portrait_crop"}:
-        raise ValueError("short-video filter requires a portrait output profile")
+    if profile.canvas_mode not in {
+        "portrait_blur", "portrait_crop", "square_fit",
+    }:
+        raise ValueError("canvas filter requires a portrait or square output profile")
     width, height = int(profile.width or 0), int(profile.height or 0)
     captions = ",subtitles=filename=captions.ass" if include_captions else ""
     if profile.canvas_mode == "portrait_crop":
@@ -607,14 +609,18 @@ def render_short_clip(
     cancel_event: threading.Event | None = None,
     bgm_path: Path | None = None,
 ) -> Path:
-    """Render one source interval as a portrait MP4.
+    """Render one source interval as a portrait or square MP4.
 
     Captions are written only to a temporary ASS file next to the staging
     output. Keeping the filter filename relative avoids Windows drive-letter
     escaping in libass.
     """
     profile = resolve_output_profile(options)
-    short_options = ShortVideoOptions.from_output_profile(profile)
+    if profile.canvas_mode not in {
+        "portrait_blur", "portrait_crop", "square_fit",
+    }:
+        raise ValueError("canvas renderer requires a portrait or square output profile")
+    output_width, output_height = int(profile.width or 0), int(profile.height or 0)
     start_value, end_value = float(start), float(end)
     if not math.isfinite(start_value) or not math.isfinite(end_value):
         raise ValueError("ショート動画の開始・終了時刻は有限値で指定してください")
@@ -631,7 +637,7 @@ def render_short_clip(
     # canvas-width safety wrapping is applied by ``captions_to_ass``.
     prepared = (
         prepare_short_captions(captions, caption_profile=profile.caption)
-        if short_options.burn_captions else ()
+        if profile.caption.enabled else ()
     )
     with tempfile.TemporaryDirectory(
         prefix="cut_video_short_", dir=str(output_path.parent),
@@ -640,7 +646,7 @@ def render_short_clip(
         if prepared:
             (temporary / "captions.ass").write_text(
                 captions_to_ass(
-                    prepared, short_options.width, short_options.height,
+                    prepared, output_width, output_height,
                     caption_profile=profile.caption,
                 ),
                 encoding="utf-8",

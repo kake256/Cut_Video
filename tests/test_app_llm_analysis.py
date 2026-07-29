@@ -168,6 +168,48 @@ class AppLlmAnalysisTest(unittest.TestCase):
             self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
             self.assertFalse(list(Path(temporary).glob("*.cut-video-claim")))
 
+    def test_highlight_export_can_write_reviewable_metadata_sidecar(self):
+        video = {
+            "path": "private-source.mp4",
+            "display_name": "synthetic_source.mp4",
+            "duration": 120.0,
+        }
+        candidate = {
+            "highlight_candidate_id": "candidate-1",
+            "start_sec": 10.0,
+            "end_sec": 20.0,
+            "title": "候補タイトル",
+            "export_title": "章タイトル",
+            "summary": "候補の要約",
+            "tags": ["配信", "要点"],
+            "transcript": "private transcript",
+        }
+
+        def fake_cut(_source, _start, _end, output, **_kwargs):
+            Path(output).write_bytes(b"video")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(app, "_highlight_export_context", return_value=(video, [candidate])),
+                patch.object(app, "cut_clip", side_effect=fake_cut),
+            ):
+                outputs = list(app.export_highlight_candidates(
+                    "vid_synthetic", "candidate-1", "selected", temporary, True,
+                    write_metadata=True,
+                    metadata_title="編集タイトル",
+                    metadata_description="編集した説明",
+                    metadata_tags="Tag, 別タグ",
+                ))
+            video_path = Path(outputs[-1][1][0])
+            sidecar = video_path.with_suffix(".metadata.json")
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            raw = json.dumps(payload, ensure_ascii=False)
+            self.assertEqual(payload["title"], "編集タイトル")
+            self.assertEqual(payload["tags"], ["Tag", "別タグ"])
+            self.assertTrue(payload["requires_review"])
+            self.assertNotIn("private transcript", raw)
+            self.assertNotIn(video["path"], raw)
+
     def test_highlight_export_can_render_captioned_short_video(self):
         video = {
             "path": "synthetic.mp4",
@@ -1000,6 +1042,9 @@ class AppLlmAnalysisTest(unittest.TestCase):
         portrait = app._intuitive_output_profile(
             "short", "crop", "720x1280", True, "large", "center",
         )
+        square = app._intuitive_output_profile(
+            "square", "blur", "1080x1920", False,
+        )
         self.assertEqual(source.canvas_mode, "source")
         self.assertEqual(source.caption.preset, "boxed")
         self.assertEqual(source.caption.position, "top")
@@ -1007,6 +1052,8 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertEqual((portrait.width, portrait.height), (720, 1280))
         self.assertEqual(portrait.caption.preset, "large")
         self.assertEqual(portrait.caption.position, "center")
+        self.assertEqual(square.canvas_mode, "square_fit")
+        self.assertEqual((square.width, square.height), (1080, 1080))
 
     def test_intuitive_audio_profile_keeps_bgm_path_ephemeral(self):
         with tempfile.TemporaryDirectory() as temporary:

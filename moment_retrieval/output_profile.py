@@ -15,7 +15,7 @@ from typing import Literal, Protocol
 from ctypes import wintypes
 
 
-CanvasMode = Literal["source", "portrait_blur", "portrait_crop"]
+CanvasMode = Literal["source", "portrait_blur", "portrait_crop", "square_fit"]
 CaptionPreset = Literal["standard", "large", "boxed"]
 CaptionPosition = Literal["top", "center", "bottom"]
 
@@ -157,16 +157,25 @@ class OutputProfile:
     def validate(self) -> "OutputProfile":
         if not self.profile_id or any(ch in self.profile_id for ch in "\r\n"):
             raise ValueError("output profile_id is invalid")
-        if self.canvas_mode not in {"source", "portrait_blur", "portrait_crop"}:
+        if self.canvas_mode not in {
+            "source", "portrait_blur", "portrait_crop", "square_fit",
+        }:
             raise ValueError("output canvas mode is invalid")
         if self.canvas_mode == "source":
             if self.width is not None or self.height is not None:
                 raise ValueError("source output profiles must not set a canvas size")
         else:
             if self.width is None or self.height is None:
-                raise ValueError("portrait output profiles require width and height")
-            if self.width <= 0 or self.height <= 0 or self.width >= self.height:
-                raise ValueError("portrait output profile requires positive portrait dimensions")
+                raise ValueError("canvas output profiles require width and height")
+            if self.width <= 0 or self.height <= 0:
+                raise ValueError("canvas output profile requires positive dimensions")
+            if (
+                self.canvas_mode in {"portrait_blur", "portrait_crop"}
+                and self.width >= self.height
+            ):
+                raise ValueError("portrait output profile requires portrait dimensions")
+            if self.canvas_mode == "square_fit" and self.width != self.height:
+                raise ValueError("square output profile requires equal dimensions")
             if self.width % 2 or self.height % 2:
                 raise ValueError("portrait output profile requires even dimensions")
         if self.video_codec != "libx264" or self.pixel_format != "yuv420p":
@@ -198,6 +207,17 @@ class OutputProfile:
             profile_id=f"portrait-{layout}-{width}x{height}", canvas_mode=mode,
             width=width, height=height, caption=caption or CaptionProfile(),
             audio=audio or AudioProfile(),
+        ).validate()
+
+    @classmethod
+    def square(
+        cls, size: int = 1080, *, caption: CaptionProfile | None = None,
+        audio: AudioProfile | None = None,
+    ) -> "OutputProfile":
+        return cls(
+            profile_id=f"square-fit-{size}x{size}",
+            canvas_mode="square_fit", width=size, height=size,
+            caption=caption or CaptionProfile(), audio=audio or AudioProfile(),
         ).validate()
 
     def to_manifest(self) -> dict[str, object]:

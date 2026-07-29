@@ -2,13 +2,22 @@
 
 ## 0. 文書の扱い
 
-- 状態: **提案 Draft 1**
+- 状態: **実験実装済み（統合判断前）**
 - 調査日: 2026-07-30
 - 調査対象: [harry0703/MoneyPrinterTurbo](https://github.com/harry0703/MoneyPrinterTurbo) の公式README、主要schema・video/task service、MIT LICENSE、v1.2.7 release notes
 - CutVideoの基準: [PRODUCT_SPECIFICATION.md](PRODUCT_SPECIFICATION.md) と [ARCHITECTURE_IMPLEMENTATION_PLAN.md](ARCHITECTURE_IMPLEMENTATION_PLAN.md)
 - 目的: MoneyPrinterTurboを組み込むことではなく、CutVideoの「既存の長時間動画から発言を探し、確認して切り抜く」流れに適合する機能を抽出し、CutVideoの責務として再定義する
 
 この文書は採用前の要件提案であり、現行の製品仕様を自動的に変更しない。採用判断後に、製品仕様の対象範囲、字幕仕様、保存仕様とarchitecture planを更新する。
+
+### 0.1 実験実装の記録
+
+- 実装branch: `experiment/short-video-finishing`
+- 実験前へ戻るbranch: `checkpoint/pre-finishing-20260730`
+- 実験前commit: `c752471`
+- F0〜F5は機能群ごとに独立commitへ固定した。復帰は`git switch checkpoint/pre-finishing-20260730`で行える。
+- MoneyPrinterTurboのcode・楽曲・素材は複製していない。CutVideo既存のffmpeg、EditPlan、ArtifactTransactionを拡張した。
+- synthetic動画による生成・停止・probe・privacy testは実施済み。利用者所有の実動画/BGMを用いた主観的な音量・可読性評価は、private dataを自動閲覧しないため統合前の手動確認事項として残す。
 
 MoneyPrinterTurboのコードは本調査で複製していない。同repositoryはMIT Licenseだが、将来コードを利用する場合は著作権表示と許諾表示を同梱し、依存package、font、楽曲、素材それぞれのlicenseを別に確認する。README自身も同梱楽曲に著作権上の注意を記載しているため、CutVideoへ楽曲を転載しない。
 
@@ -396,7 +405,7 @@ UI、CLI、LLM見どころ画面はffmpeg commandを直接構築せず、同じE
 
 ## 9. 実装フェーズ案
 
-### Phase F0: 現行機能のprofile化
+### Phase F0: 現行機能のprofile化（実装済み）
 
 - `ShortVideoOptions`と元比率字幕経路を`OutputProfile`の下へ統合
 - preview/save共通resolver
@@ -406,35 +415,35 @@ UI、CLI、LLM見どころ画面はffmpeg commandを直接構築せず、同じE
 
 このphaseではUI選択肢を増やさない。
 
-### Phase F1: 字幕presetとfont validation
+### Phase F1: 字幕presetとfont validation（実装済み）
 
 - 3 preset、上/中央/下、safe margin
 - font discoveryとglyph validation
 - proxy previewへの同一style反映
 - `AC-FINISH-CAPTION`
 
-### Phase F2: ExportJob統一
+### Phase F2: ExportJob統一（実装済み）
 
 - progress stage、cancel、structured error
 - current ArtifactTransactionとの統合
 - browser E2Eで保存、停止、再試行
 - `AC-FINISH-JOB`
 
-### Phase F3: candidate batchとjob内再利用
+### Phase F3: candidate batchとjob内再利用（実装済み）
 
 - batch summaryと失敗分retry
 - join済み中間videoのjob内fan-out
 - 見どころの字幕なし一括保存を同じjobへ移行
 - `AC-FINISH-BATCH`
 
-### Phase F4: 音声仕上げ実験
+### Phase F4: 音声仕上げ実験（実装済み・聴取評価待ち）
 
 - source loudness normalization spike
 - local BGM、volume、fade
 - local聴取評価後に採否決定
 - `AC-FINISH-AUDIO`
 
-### Phase F5: 追加canvasとmetadata
+### Phase F5: 追加canvasとmetadata（実装済み）
 
 - 利用要求が確認できた場合だけ1:1 profile
 - title/summary/tag sidecar

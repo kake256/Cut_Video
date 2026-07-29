@@ -392,7 +392,7 @@ save sequenceはdocument単位で採番する。保存開始時とartifact公開
 
 字幕焼き込みと画面形式は「検索・編集・切り抜き」の直感編集における第3段階「出力・字幕」で扱う。LLM要約・見どころは候補の確認、編集画面への遷移、通常動画の一括保存だけを扱う。
 
-- 画面サイズは「元の縦横比」または「縦型9:16」を選べる。縦型9:16は1080x1920または720x1280を選べる。
+- 画面サイズは「元の縦横比」「縦型9:16」「正方形1:1」を選べる。縦型9:16は1080x1920または720x1280、正方形は1080x1080とする。
 - 既定の画面配置は、元映像全体を中央へ残し、余白を同じ映像のぼかし背景で埋める。利用者が明示した場合だけ中央cropを使う。
 - 字幕焼き込みは画面サイズと独立してON/OFFを選べる。字幕はactive Transcript revisionの実在時刻を候補区間のResult timelineへ写し、読める長さへ表示ブロックを分割してlibassで焼き込む。ASR本文、ASS中間ファイル、動画内容をログ・DB・外部サービスへ送らない。
 - 字幕焼き込みまたは縦型化は再エンコードを必須とし、高速stream copyとして表示しない。元の縦横比かつ字幕OFFだけは従来の高速・精密選択を維持する。
@@ -400,6 +400,9 @@ save sequenceはdocument単位で採番する。保存開始時とartifact公開
 - Windowsのdrive-letter escapingを避けるため、字幕filterはjob固有の同一filesystem staging directoryに置いた相対名を参照する。
 - 通常動画保存は従来の高速・精密選択を維持し、ショート動画の設定によって変更しない。
 - 初期実装は顔追従、被写体推定、翻訳、単語karaoke強調を含まない。第3段階ではセッション内に限り、編集結果の先頭からの相対時刻と字幕本文を手動編集して焼き込みプレビュー・保存に反映できる。字幕一覧の行を選ぶと、大きな本文欄と開始・終了欄へ読み込み、前後移動・反映・削除を行える。一覧表への直接入力を主操作にはしない。元のASR、候補、DBには書き戻さない。字幕編集状態は動画、active Transcript revision、EditPlanのsemantic signatureに紐付け、いずれかが変わった場合は編集字幕を使わずactive ASRから再生成する。
+- 画面、字幕、音声、encode条件は型付き`OutputProfile`へ解決し、previewと保存で同じ実効値を使う。字幕はstandard/large/boxedと上/中央/下だけを基本選択肢にし、Windows保存前に日本語glyphを検査する。
+- 音声正規化と利用者所有のローカルBGMは任意かつ既定OFFとする。BGMは音量とfadeだけを扱い、楽曲を同梱・自動取得しない。BGM絶対pathはmanifestへ保存せず、basenameとcontent fingerprintだけを記録する。処理後は音声streamと最大音量を検証する。
+- 保存はqueued、validating、joining、rendering、probing、publishing、completed/failed/cancelledを報告し、停止をffmpegへ伝播する。見どころ一括保存は候補ごとの失敗を分離し、成功済み成果物を削除しない。
 
 ### 10.5 機械可読出力
 
@@ -410,6 +413,8 @@ CLIと将来UIのため、保存結果は少なくとも次を構造化して返
 - precise/fast、padding
 - 成果物パスと成功/失敗
 - subtitle warning
+- OutputProfileのversion、canvas、字幕、音声の実効値
+- 任意の投稿補助metadata sidecar。LLM由来・要確認を明記し、title、description、tags以外の文字起こし本文・private path・credentialを含めない。SNSへの送信は行わない。
 
 ローカル絶対パスを外部HTTP APIの公開識別子として使わない。
 

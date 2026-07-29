@@ -6,6 +6,7 @@ from pathlib import Path
 
 from moment_retrieval.application import DocumentRepository
 from moment_retrieval.edit_domain import EditPlan, TimeRange
+from moment_retrieval.output_profile import CaptionProfile, OutputProfile
 from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.save_service import (
     ProbedArtifact, SaveError, recover_artifact_transactions, save_document,
@@ -64,6 +65,33 @@ class ApplicationSaveTest(unittest.TestCase):
             self.assertTrue(result.subtitle_path.exists())
             self.assertTrue(result.manifest_path.exists())
             self.assertFalse(self.documents.get(doc.document_id).history.dirty)
+
+    def test_manifest_records_output_profile_without_private_source_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "private-source.mp4"
+            source.write_bytes(b"source")
+            output = root / "clip.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+
+            result = save_document(
+                doc.document_id, source, output, True,
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                output_profile=OutputProfile.portrait(
+                    720, 1280, layout="blur",
+                    caption=CaptionProfile(preset="large", position="top"),
+                ),
+            )
+            raw = result.manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(raw)
+            self.assertEqual(manifest["output_profile"]["canvas_mode"], "portrait_blur")
+            self.assertEqual(manifest["output_profile"]["caption"]["preset"], "large")
+            self.assertNotIn(str(source), raw)
 
     def test_cancel_before_cut_leaves_no_artifact(self):
         with tempfile.TemporaryDirectory() as directory:

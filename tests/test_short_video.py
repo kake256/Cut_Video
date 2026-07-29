@@ -17,10 +17,91 @@ from moment_retrieval.short_video import (
     render_short_clip,
     wrap_caption_for_canvas,
 )
+from moment_retrieval.output_profile import (
+    CaptionProfile,
+    OutputProfile,
+    caption_style_for_canvas,
+    validate_font_glyphs,
+)
 from moment_retrieval.subtitles import SubtitleCue
 
 
 class ShortVideoUnitTests(unittest.TestCase):
+    def test_legacy_short_options_round_trip_through_output_profile(self):
+        legacy = ShortVideoOptions(720, 1280, "crop", False)
+        profile = legacy.to_output_profile()
+        self.assertEqual(profile.canvas_mode, "portrait_crop")
+        self.assertEqual(profile.width, 720)
+        self.assertFalse(profile.caption.enabled)
+        self.assertEqual(ShortVideoOptions.from_output_profile(profile), legacy)
+        self.assertEqual(
+            build_short_filter(profile, include_captions=False),
+            build_short_filter(legacy, include_captions=False),
+        )
+
+    def test_output_profile_keeps_source_canvas_separate_from_portrait_canvas(self):
+        source = OutputProfile.source()
+        self.assertEqual(source.canvas_mode, "source")
+        self.assertIsNone(source.width)
+        with self.assertRaises(ValueError):
+            OutputProfile(canvas_mode="source", width=720, height=1280).validate()
+
+    def test_caption_presets_resolve_safe_margins_and_positions(self):
+        standard = caption_style_for_canvas(CaptionProfile(), 720, 1280)
+        large_top = caption_style_for_canvas(
+            CaptionProfile(preset="large", position="top"), 720, 1280,
+        )
+        boxed_center = caption_style_for_canvas(
+            CaptionProfile(preset="boxed", position="center"), 720, 1280,
+        )
+        self.assertEqual(standard.alignment, 2)
+        self.assertEqual(large_top.alignment, 8)
+        self.assertGreater(large_top.font_size, standard.font_size)
+        self.assertEqual(boxed_center.alignment, 5)
+        self.assertEqual(boxed_center.border_style, 3)
+        self.assertGreaterEqual(standard.margin_left, 40)
+        self.assertGreaterEqual(standard.margin_vertical, 64)
+
+    def test_ass_uses_preset_and_position_without_changing_safe_wrapping(self):
+        output = captions_to_ass(
+            [SubtitleCue(0, 1_500, "字幕テスト", 1)], 720, 1280,
+            caption_profile=CaptionProfile(preset="boxed", position="top"),
+        )
+        style = next(line for line in output.splitlines() if line.startswith("Style:"))
+        self.assertIn(",3,0,0,8,", style)
+        self.assertIn("&H50000000", style)
+
+    def test_standard_preset_keeps_the_legacy_ass_style_values(self):
+        output = captions_to_ass([SubtitleCue(0, 1_000, "字幕", 1)], 720, 1280)
+        style = next(line for line in output.splitlines() if line.startswith("Style:"))
+        self.assertEqual(
+            style,
+            "Style: Default,Yu Gothic UI,52,&H00FFFFFF,&H000000FF,&H00000000,"
+            "&H78000000,-1,0,0,0,100,100,0,0,1,4,2,2,47,47,134,1",
+        )
+
+    def test_font_validation_is_pure_when_an_inspector_is_supplied(self):
+        class FakeInspector:
+            def resolve_face(self, _font_name):
+                return "Yu Gothic UI"
+
+            def missing_glyphs(self, _font_name, _text):
+                return ("□",)
+
+        result = validate_font_glyphs("Yu Gothic UI", "字幕□", inspector=FakeInspector())
+        self.assertTrue(result.font_available)
+        self.assertFalse(result.glyphs_supported)
+        self.assertEqual(result.missing_glyph_count, 1)
+        self.assertEqual(result.warning, "FONT_FALLBACK_REQUIRED")
+
+    def test_caption_font_name_rejects_ass_field_separator(self):
+        with self.assertRaisesRegex(ValueError, "font name"):
+            CaptionProfile(font_name="unsafe,font").validate()
+
+    def test_low_resolution_caption_keeps_legacy_vertical_safe_margin(self):
+        style = caption_style_for_canvas(CaptionProfile(), 640, 360)
+        self.assertEqual(style.margin_vertical, 64)
+
     def test_supported_resolutions_are_portrait(self):
         self.assertEqual(parse_short_resolution("1080x1920"), (1080, 1920))
         self.assertEqual(parse_short_resolution("720X1280"), (720, 1280))

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .output_profile import CaptionProfile, OutputProfile, caption_style_for_canvas
 from .subtitles import SubtitleCue
 
 
@@ -33,6 +34,35 @@ class ShortVideoOptions:
         if self.width % 2 or self.height % 2:
             raise ValueError("short-video resolution must use even dimensions")
         return self
+
+    def to_output_profile(self) -> OutputProfile:
+        """Adapt the legacy short-only API to the shared profile contract."""
+        self.validate()
+        return OutputProfile.portrait(
+            self.width, self.height, layout=self.layout,
+            caption=CaptionProfile(enabled=self.burn_captions),
+        )
+
+    @classmethod
+    def from_output_profile(cls, profile: OutputProfile) -> "ShortVideoOptions":
+        """Keep portrait rendering compatible while rejecting source profiles."""
+        profile.validate()
+        if profile.canvas_mode not in {"portrait_blur", "portrait_crop"}:
+            raise ValueError("a short-video option requires a portrait output profile")
+        return cls(
+            width=int(profile.width or 0), height=int(profile.height or 0),
+            layout="blur" if profile.canvas_mode == "portrait_blur" else "crop",
+            burn_captions=profile.caption.enabled,
+        ).validate()
+
+
+def resolve_output_profile(value: ShortVideoOptions | OutputProfile) -> OutputProfile:
+    """Single resolver for callers which still use ``ShortVideoOptions``."""
+    if isinstance(value, ShortVideoOptions):
+        return value.to_output_profile()
+    if isinstance(value, OutputProfile):
+        return value.validate()
+    raise TypeError("output profile must be ShortVideoOptions or OutputProfile")
 
 
 def parse_short_resolution(value: str) -> tuple[int, int]:
@@ -74,13 +104,19 @@ def _split_caption_text(value: str, max_chars: int) -> list[str]:
 
 
 def prepare_short_captions(
-    cues: Iterable[SubtitleCue], *, max_chars: int = 10, minimum_part_ms: int = 500,
+    cues: Iterable[SubtitleCue], *, max_chars: int | None = None,
+    minimum_part_ms: int | None = None, caption_profile: CaptionProfile | None = None,
 ) -> tuple[SubtitleCue, ...]:
     """Split long ASR cues into concise, readable caption blocks.
 
     Timing remains inside the already-mapped output cue. No transcript text is
     logged or persisted by this function.
     """
+    profile = (caption_profile or CaptionProfile()).validate()
+    max_chars = profile.max_chars if max_chars is None else int(max_chars)
+    minimum_part_ms = (
+        profile.minimum_part_ms if minimum_part_ms is None else int(minimum_part_ms)
+    )
     prepared: list[SubtitleCue] = []
     for cue in cues:
         duration = int(cue.end_ms) - int(cue.start_ms)
@@ -205,11 +241,9 @@ def wrap_caption_for_canvas(
 
 def captions_to_ass(
     cues: Iterable[SubtitleCue], width: int, height: int,
+    *, caption_profile: CaptionProfile | None = None,
 ) -> str:
-    font_size = max(32, round(height * 0.041))
-    outline = max(2, round(height * 0.003))
-    margin_v = max(64, round(height * 0.105))
-    margin_h = max(40, round(width * 0.065))
+    style = caption_style_for_canvas(caption_profile or CaptionProfile(), width, height)
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -223,10 +257,12 @@ def captions_to_ass(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        "Style: Default,Yu Gothic UI,"
-        f"{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H78000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline},2,2,"
-        f"{margin_h},{margin_h},{margin_v},1",
+        f"Style: Default,{style.font_name},"
+        f"{style.font_size},{style.primary_colour},{style.secondary_colour},"
+        f"{style.outline_colour},{style.back_colour},"
+        f"{style.bold},0,0,0,100,100,0,0,{style.border_style},{style.outline},"
+        f"{style.shadow},{style.alignment},{style.margin_left},{style.margin_right},"
+        f"{style.margin_vertical},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -235,19 +271,26 @@ def captions_to_ass(
     for cue in cues:
         if cue.end_ms <= cue.start_ms or not str(cue.text or "").strip():
             continue
+        wrapped_text = wrap_caption_for_canvas(
+            cue.text, width, style.font_size, style.margin_left, style.margin_right,
+        )
         lines.append(
             f"Dialogue: 0,{_ass_time(cue.start_ms)},{_ass_time(cue.end_ms)},"
             "Default,,0,0,0,,"
-            f"{_ass_text(wrap_caption_for_canvas(cue.text, width, font_size, margin_h, margin_h))}"
+            f"{_ass_text(wrapped_text)}"
         )
     return "\n".join(lines) + "\n"
 
 
-def build_short_filter(options: ShortVideoOptions, *, include_captions: bool) -> str:
-    options.validate()
-    width, height = options.width, options.height
+def build_short_filter(
+    options: ShortVideoOptions | OutputProfile, *, include_captions: bool,
+) -> str:
+    profile = resolve_output_profile(options)
+    if profile.canvas_mode not in {"portrait_blur", "portrait_crop"}:
+        raise ValueError("short-video filter requires a portrait output profile")
+    width, height = int(profile.width or 0), int(profile.height or 0)
     captions = ",subtitles=filename=captions.ass" if include_captions else ""
-    if options.layout == "crop":
+    if profile.canvas_mode == "portrait_crop":
         return (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},setsar=1{captions}[vout]"
@@ -301,6 +344,7 @@ def render_captioned_source_clip(
     output_path: Path,
     *,
     captions: Iterable[SubtitleCue],
+    caption_profile: CaptionProfile | None = None,
     duration: float | None = None,
     timeout_sec: float | None = None,
 ) -> Path:
@@ -313,7 +357,10 @@ def render_captioned_source_clip(
     if duration is not None and end_value > float(duration) + 0.001:
         raise ValueError("字幕付き動画の終了時刻が元動画の長さを超えています")
 
-    prepared = prepare_short_captions(captions)
+    profile = (caption_profile or CaptionProfile()).validate()
+    if not profile.enabled:
+        raise ValueError("caption profile is disabled")
+    prepared = prepare_short_captions(captions, caption_profile=profile)
     if not prepared:
         raise ValueError("焼き込める字幕がありません")
     video_path = Path(video_path).resolve()
@@ -325,7 +372,7 @@ def render_captioned_source_clip(
     ) as temporary_name:
         temporary = Path(temporary_name)
         (temporary / "captions.ass").write_text(
-            captions_to_ass(prepared, width, height), encoding="utf-8",
+            captions_to_ass(prepared, width, height, caption_profile=profile), encoding="utf-8",
         )
         command = [
             "ffmpeg", "-y", "-loglevel", "error",
@@ -355,7 +402,7 @@ def render_short_clip(
     output_path: Path,
     *,
     captions: Iterable[SubtitleCue] = (),
-    options: ShortVideoOptions = ShortVideoOptions(),
+    options: ShortVideoOptions | OutputProfile = ShortVideoOptions(),
     duration: float | None = None,
     timeout_sec: float | None = None,
 ) -> Path:
@@ -365,7 +412,8 @@ def render_short_clip(
     output. Keeping the filter filename relative avoids Windows drive-letter
     escaping in libass.
     """
-    options.validate()
+    profile = resolve_output_profile(options)
+    short_options = ShortVideoOptions.from_output_profile(profile)
     start_value, end_value = float(start), float(end)
     if not math.isfinite(start_value) or not math.isfinite(end_value):
         raise ValueError("ショート動画の開始・終了時刻は有限値で指定してください")
@@ -380,14 +428,20 @@ def render_short_clip(
     # Keep the behavior that the former LLM-highlight path already provided:
     # long ASR cues become sequential, concise blocks before the final
     # canvas-width safety wrapping is applied by ``captions_to_ass``.
-    prepared = prepare_short_captions(captions) if options.burn_captions else ()
+    prepared = (
+        prepare_short_captions(captions, caption_profile=profile.caption)
+        if short_options.burn_captions else ()
+    )
     with tempfile.TemporaryDirectory(
         prefix="cut_video_short_", dir=str(output_path.parent),
     ) as temporary_name:
         temporary = Path(temporary_name)
         if prepared:
             (temporary / "captions.ass").write_text(
-                captions_to_ass(prepared, options.width, options.height),
+                captions_to_ass(
+                    prepared, short_options.width, short_options.height,
+                    caption_profile=profile.caption,
+                ),
                 encoding="utf-8",
             )
         command = [
@@ -396,11 +450,14 @@ def render_short_clip(
             "-i", str(video_path),
             "-t", f"{end_value - start_value:.3f}",
             "-filter_complex", build_short_filter(
-                options, include_captions=bool(prepared),
+                profile, include_captions=bool(prepared),
             ),
             "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", profile.video_codec,
+            "-preset", profile.encoding_preset,
+            "-crf", str(profile.crf),
+            "-pix_fmt", profile.pixel_format,
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(output_path),
         ]
         try:

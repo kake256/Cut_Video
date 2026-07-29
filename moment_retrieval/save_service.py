@@ -18,6 +18,7 @@ from cut_clip import cut_clips
 from . import db
 from .application import ApplicationError, DOCUMENTS, DocumentRepository, SaveTicket
 from .edit_domain import EffectiveExportPlan, make_effective_export_plan, ms_to_seconds
+from .output_profile import OutputProfile
 from .publication import private_source_fingerprint
 from .subtitles import SubtitleValidationError, validate_srt_text
 
@@ -133,6 +134,7 @@ class ArtifactTransaction:
         cutter: Callable = cut_clips,
         probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
         postprocessor: Callable[[Path, Path, float], None] | None = None,
+        output_profile: OutputProfile | None = None,
     ):
         self.output_path = Path(output_path)
         self.source_path = Path(source_path)
@@ -146,6 +148,9 @@ class ArtifactTransaction:
         # (not the original source) and writes the final staging artifact.  This
         # keeps captions and portrait transforms aligned with multi-range edits.
         self.postprocessor = postprocessor
+        # This is render metadata only.  It intentionally contains no source
+        # path or transcript and is therefore safe for the local artifact manifest.
+        self.output_profile = output_profile.validate() if output_profile else None
 
     def execute(
         self, ticket: SaveTicket, subtitle_text: str | None = None,
@@ -270,6 +275,8 @@ class ArtifactTransaction:
                 "duration_matches_plan": duration_matches_plan,
                 "warnings": manifest_warnings,
             }
+            if self.output_profile is not None:
+                manifest["output_profile"] = self.output_profile.to_manifest()
             staged_manifest.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -305,6 +312,7 @@ def save_document(
     cutter: Callable = cut_clips,
     probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
     postprocessor: Callable[[Path, Path, float], None] | None = None,
+    output_profile: OutputProfile | None = None,
     source_fingerprint_resolver: Callable[[str, str], str | None] = (
         _resolve_expected_source_fingerprint
     ),
@@ -328,7 +336,7 @@ def save_document(
     effective_precise = bool(precise or subtitle_text is not None or postprocessor is not None)
     transaction = ArtifactTransaction(
         output_path, source_path, effective, effective_precise,
-        expected_fingerprint, cancel_event, cutter, probe, postprocessor,
+        expected_fingerprint, cancel_event, cutter, probe, postprocessor, output_profile,
     )
     result = transaction.execute(ticket, subtitle_text, warnings)
     documents.complete_save(ticket, result.commit_id)

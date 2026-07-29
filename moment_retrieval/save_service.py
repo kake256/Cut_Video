@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -32,6 +33,42 @@ class SaveError(RuntimeError):
 class ProbedArtifact:
     duration_ms: int
     tolerance_ms: int
+
+
+@dataclass(frozen=True)
+class ProbedAudioArtifact:
+    present: bool
+    max_volume_db: float | None
+
+
+def probe_staged_audio(path: Path) -> ProbedAudioArtifact:
+    """Verify an output audio stream and measure its maximum sample level."""
+    try:
+        completed = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=index", "-of", "json", str(path),
+        ], capture_output=True, text=True, check=True)
+        if not (json.loads(completed.stdout).get("streams") or []):
+            return ProbedAudioArtifact(False, None)
+        volume = subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+            "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-",
+        ], capture_output=True, text=True, check=True)
+        match = re.search(
+            r"max_volume:\s*(-?(?:inf|\d+(?:\.\d+)?))\s*dB",
+            volume.stderr,
+        )
+        if not match:
+            raise ValueError("max volume is missing")
+        raw = match.group(1)
+        return ProbedAudioArtifact(
+            True, -120.0 if raw == "-inf" else float(raw),
+        )
+    except (
+        OSError, ValueError, TypeError, json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        raise SaveError("AUDIO_PROBE_FAILED: staged audio could not be verified") from exc
 
 
 def _positive_fraction(value: object) -> Fraction | None:
@@ -155,6 +192,7 @@ class ArtifactTransaction:
         cancel_event: threading.Event | None = None,
         cutter: Callable = cut_clips,
         probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+        audio_probe: Callable[[Path], ProbedAudioArtifact] = probe_staged_audio,
         postprocessor: Callable[[Path, Path, float], None] | None = None,
         output_profile: OutputProfile | None = None,
         progress_callback: Callable[[ExportStage], None] | None = None,
@@ -167,6 +205,7 @@ class ArtifactTransaction:
         self.cancel_event = cancel_event or threading.Event()
         self.cutter = cutter
         self.probe = probe
+        self.audio_probe = audio_probe
         # A postprocessor receives a precisely joined result-timeline artifact
         # (not the original source) and writes the final staging artifact.  This
         # keeps captions and portrait transforms aligned with multi-range edits.
@@ -278,6 +317,32 @@ class ArtifactTransaction:
                     "FAST_MODE_DURATION_DRIFT: staged video differs from the planned "
                     f"duration by {duration_delta_ms} ms"
                 )
+            audio_verification = None
+            if self.output_profile is not None and (
+                self.output_profile.audio.normalize_source
+                or self.output_profile.audio.bgm_enabled
+            ):
+                audio_probe = self.audio_probe(staged_video)
+                expected_audio = bool(
+                    self.output_profile.audio.normalization_applied is True
+                    or self.output_profile.audio.bgm_applied is True
+                )
+                if expected_audio and not audio_probe.present:
+                    raise SaveError(
+                        "AUDIO_STREAM_MISSING: processed output has no audio stream"
+                    )
+                clipped = bool(
+                    audio_probe.present
+                    and audio_probe.max_volume_db is not None
+                    and audio_probe.max_volume_db > -0.1
+                )
+                if clipped:
+                    manifest_warnings.append("AUDIO_CLIPPING_DETECTED")
+                audio_verification = {
+                    "present": audio_probe.present,
+                    "max_volume_db": audio_probe.max_volume_db,
+                    "clipping_detected": clipped,
+                }
             subtitle_path = None
             if subtitle_text is not None:
                 try:
@@ -308,6 +373,8 @@ class ArtifactTransaction:
             }
             if self.output_profile is not None:
                 manifest["output_profile"] = self.output_profile.to_manifest()
+            if audio_verification is not None:
+                manifest["audio_verification"] = audio_verification
             staged_manifest.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -343,6 +410,7 @@ def save_document(
     documents: DocumentRepository = DOCUMENTS,
     cutter: Callable = cut_clips,
     probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+    audio_probe: Callable[[Path], ProbedAudioArtifact] = probe_staged_audio,
     postprocessor: Callable[[Path, Path, float], None] | None = None,
     output_profile: OutputProfile | None = None,
     export_job_id: str | None = None,
@@ -384,8 +452,8 @@ def save_document(
         )
         transaction = ArtifactTransaction(
             output_path, source_path, effective, effective_precise,
-            expected_fingerprint, cancel_event, cutter, probe, postprocessor,
-            output_profile, report,
+            expected_fingerprint, cancel_event, cutter, probe, audio_probe,
+            postprocessor, output_profile, report,
         )
         result = transaction.execute(ticket, subtitle_text, warnings)
         documents.complete_save(ticket, result.commit_id)
@@ -425,6 +493,7 @@ def save_document_variants(
     documents: DocumentRepository = DOCUMENTS,
     cutter: Callable = cut_clips,
     probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+    audio_probe: Callable[[Path], ProbedAudioArtifact] = probe_staged_audio,
     source_fingerprint_resolver: Callable[[str, str], str | None] = (
         _resolve_expected_source_fingerprint
     ),
@@ -498,6 +567,7 @@ def save_document_variants(
                     cancel_event,
                     reuse_joined,
                     probe,
+                    audio_probe,
                     variant.postprocessor,
                     variant.output_profile,
                 )

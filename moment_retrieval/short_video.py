@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .output_profile import CaptionProfile, OutputProfile, caption_style_for_canvas
+from .output_profile import (
+    AudioProfile,
+    CaptionProfile,
+    OutputProfile,
+    caption_style_for_canvas,
+)
+from .publication import private_source_fingerprint
 from .subtitles import SubtitleCue
 
 
@@ -380,11 +386,124 @@ def probe_video_dimensions(video_path: Path) -> tuple[int, int]:
         raise ShortVideoError("元動画の画面サイズを確認できませんでした") from exc
 
 
-def build_source_caption_filter() -> str:
-    return (
-        "[0:v]setpts=PTS-STARTPTS,"
-        "subtitles=filename=captions.ass[vout]"
+def probe_audio_stream(media_path: Path) -> bool:
+    """Return whether a local media file has at least one decodable audio stream."""
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=index", "-of", "json",
+        str(Path(media_path).resolve()),
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+        )
+        payload = json.loads(completed.stdout)
+        return bool(payload.get("streams"))
+    except (
+        OSError, ValueError, TypeError, json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        raise ShortVideoError("音声ストリームを確認できませんでした") from exc
+
+
+def build_source_caption_filter(*, include_captions: bool = True) -> str:
+    captions = ",subtitles=filename=captions.ass" if include_captions else ""
+    return f"[0:v]setpts=PTS-STARTPTS{captions}[vout]"
+
+
+def build_audio_filter(
+    profile: AudioProfile, *, duration: float,
+    source_has_audio: bool, bgm_has_audio: bool,
+) -> str | None:
+    """Build a path-free ffmpeg audio graph from validated effective settings."""
+    profile.validate()
+    duration = max(0.001, float(duration))
+    normalize = bool(profile.normalize_source and source_has_audio)
+    if (
+        profile.normalization_applied is not None
+        and bool(profile.normalization_applied) != normalize
+    ):
+        raise ShortVideoError("音量正規化の事前確認結果が変わりました")
+    if profile.bgm_enabled and not bgm_has_audio:
+        raise ShortVideoError("指定したBGMを音声として読み込めません")
+    if profile.bgm_applied is False and profile.bgm_enabled:
+        raise ShortVideoError("BGMを適用できない出力設定です")
+
+    filters: list[str] = []
+    source_label: str | None = None
+    if source_has_audio:
+        source_chain = "asetpts=PTS-STARTPTS"
+        if normalize:
+            source_chain += (
+                f",loudnorm=I={float(profile.target_lufs):g}"
+                f":LRA={float(profile.loudness_range):g}"
+                f":TP={float(profile.true_peak_db):g}"
+            )
+        filters.append(f"[0:a]{source_chain}[source_audio]")
+        source_label = "[source_audio]"
+
+    bgm_label: str | None = None
+    if profile.bgm_enabled and bgm_has_audio:
+        fade_in = min(duration, float(profile.bgm_fade_in_sec))
+        fade_out = min(duration, float(profile.bgm_fade_out_sec))
+        bgm_chain = (
+            f"atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,"
+            f"volume={float(profile.bgm_gain_db):g}dB"
+        )
+        if fade_in > 0:
+            bgm_chain += f",afade=t=in:st=0:d={fade_in:.3f}"
+        if fade_out > 0:
+            bgm_chain += (
+                f",afade=t=out:st={max(0.0, duration - fade_out):.3f}"
+                f":d={fade_out:.3f}"
+            )
+        filters.append(f"[1:a]{bgm_chain}[bgm_audio]")
+        bgm_label = "[bgm_audio]"
+
+    if source_label and bgm_label:
+        filters.append(
+            f"{source_label}{bgm_label}"
+            "amix=inputs=2:duration=longest:dropout_transition=0,"
+            "alimiter=limit=0.95[aout]"
+        )
+    elif source_label:
+        filters.append(f"{source_label}anull[aout]")
+    elif bgm_label:
+        filters.append(f"{bgm_label}anull[aout]")
+    else:
+        return None
+    return ";".join(filters)
+
+
+def _audio_render_parts(
+    video_path: Path, profile: AudioProfile, duration: float,
+    bgm_path: Path | None,
+) -> tuple[list[str], str | None]:
+    profile.validate()
+    if not profile.normalize_source and not profile.bgm_enabled:
+        return [], None
+    source_has_audio = probe_audio_stream(video_path)
+    bgm_has_audio = False
+    input_args: list[str] = []
+    if profile.bgm_enabled:
+        if bgm_path is None:
+            raise ShortVideoError("BGMファイルが指定されていません")
+        resolved_bgm = Path(bgm_path).expanduser().resolve()
+        if not resolved_bgm.is_file():
+            raise ShortVideoError("BGMファイルを読み込めません")
+        try:
+            fingerprint = private_source_fingerprint(resolved_bgm)
+        except OSError as exc:
+            raise ShortVideoError("BGMファイルを読み込めません") from exc
+        if fingerprint != profile.bgm_fingerprint:
+            raise ShortVideoError("BGMファイルが設定時から変更されています")
+        bgm_has_audio = probe_audio_stream(resolved_bgm)
+        input_args = ["-stream_loop", "-1", "-i", str(resolved_bgm)]
+    audio_filter = build_audio_filter(
+        profile, duration=duration, source_has_audio=source_has_audio,
+        bgm_has_audio=bgm_has_audio,
     )
+    return input_args, audio_filter
 
 
 def render_captioned_source_clip(
@@ -399,8 +518,9 @@ def render_captioned_source_clip(
     duration: float | None = None,
     timeout_sec: float | None = None,
     cancel_event: threading.Event | None = None,
+    bgm_path: Path | None = None,
 ) -> Path:
-    """Burn captions while preserving the source video's canvas and aspect."""
+    """Render a source-canvas clip with optional captions and audio finishing."""
     start_value, end_value = float(start), float(end)
     if not math.isfinite(start_value) or not math.isfinite(end_value):
         raise ValueError("字幕付き動画の開始・終了時刻は有限値で指定してください")
@@ -419,28 +539,40 @@ def render_captioned_source_clip(
     else:
         profile = (caption_profile or CaptionProfile()).validate()
         render_profile = OutputProfile.source(caption=profile)
-    if not profile.enabled:
-        raise ValueError("caption profile is disabled")
-    prepared = prepare_short_captions(captions, caption_profile=profile)
-    if not prepared:
+    prepared = (
+        prepare_short_captions(captions, caption_profile=profile)
+        if profile.enabled else ()
+    )
+    if profile.enabled and not prepared:
         raise ValueError("焼き込める字幕がありません")
     video_path = Path(video_path).resolve()
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    width, height = probe_video_dimensions(video_path)
+    width, height = probe_video_dimensions(video_path) if prepared else (0, 0)
     with tempfile.TemporaryDirectory(
         prefix="cut_video_captioned_", dir=str(output_path.parent),
     ) as temporary_name:
         temporary = Path(temporary_name)
-        (temporary / "captions.ass").write_text(
-            captions_to_ass(prepared, width, height, caption_profile=profile), encoding="utf-8",
+        if prepared:
+            (temporary / "captions.ass").write_text(
+                captions_to_ass(prepared, width, height, caption_profile=profile),
+                encoding="utf-8",
+            )
+        audio_inputs, audio_filter = _audio_render_parts(
+            video_path, render_profile.audio, end_value - start_value, bgm_path,
         )
+        filter_complex = build_source_caption_filter(
+            include_captions=bool(prepared),
+        )
+        if audio_filter:
+            filter_complex += ";" + audio_filter
         command = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-ss", f"{start_value:.3f}", "-i", str(video_path),
+            *audio_inputs,
             "-t", f"{end_value - start_value:.3f}",
-            "-filter_complex", build_source_caption_filter(),
-            "-map", "[vout]", "-map", "0:a?",
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]" if audio_filter else "0:a?",
             "-c:v", render_profile.video_codec,
             "-preset", render_profile.encoding_preset,
             "-crf", str(render_profile.crf),
@@ -473,6 +605,7 @@ def render_short_clip(
     duration: float | None = None,
     timeout_sec: float | None = None,
     cancel_event: threading.Event | None = None,
+    bgm_path: Path | None = None,
 ) -> Path:
     """Render one source interval as a portrait MP4.
 
@@ -512,15 +645,22 @@ def render_short_clip(
                 ),
                 encoding="utf-8",
             )
+        audio_inputs, audio_filter = _audio_render_parts(
+            video_path, profile.audio, end_value - start_value, bgm_path,
+        )
+        filter_complex = build_short_filter(
+            profile, include_captions=bool(prepared),
+        )
+        if audio_filter:
+            filter_complex += ";" + audio_filter
         command = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-ss", f"{start_value:.3f}",
             "-i", str(video_path),
+            *audio_inputs,
             "-t", f"{end_value - start_value:.3f}",
-            "-filter_complex", build_short_filter(
-                profile, include_captions=bool(prepared),
-            ),
-            "-map", "[vout]", "-map", "0:a?",
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]" if audio_filter else "0:a?",
             "-c:v", profile.video_codec,
             "-preset", profile.encoding_preset,
             "-crf", str(profile.crf),

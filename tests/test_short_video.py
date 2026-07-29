@@ -11,6 +11,7 @@ from unittest.mock import patch
 from moment_retrieval.short_video import (
     ShortVideoOptions,
     ShortVideoCancelled,
+    build_audio_filter,
     build_source_caption_filter,
     build_short_filter,
     captions_to_ass,
@@ -21,11 +22,13 @@ from moment_retrieval.short_video import (
     wrap_caption_for_canvas,
 )
 from moment_retrieval.output_profile import (
+    AudioProfile,
     CaptionProfile,
     OutputProfile,
     caption_style_for_canvas,
     validate_font_glyphs,
 )
+from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.subtitles import SubtitleCue
 
 
@@ -48,6 +51,42 @@ class ShortVideoUnitTests(unittest.TestCase):
         self.assertIsNone(source.width)
         with self.assertRaises(ValueError):
             OutputProfile(canvas_mode="source", width=720, height=1280).validate()
+
+    def test_audio_profile_manifest_contains_no_local_path(self):
+        profile = AudioProfile(
+            normalize_source=True,
+            normalization_applied=True,
+            bgm_enabled=True,
+            bgm_applied=True,
+            bgm_name="music.mp3",
+            bgm_fingerprint="a" * 64,
+            bgm_gain_db=-22,
+        ).validate()
+        manifest = profile.to_manifest()
+        self.assertEqual(manifest["bgm_name"], "music.mp3")
+        self.assertNotIn("path", manifest)
+        with self.assertRaisesRegex(ValueError, "basename"):
+            replace(profile, bgm_name=r"private\music.mp3").validate()
+
+    def test_audio_filter_normalizes_speech_and_mixes_bgm(self):
+        profile = AudioProfile(
+            normalize_source=True,
+            normalization_applied=True,
+            bgm_enabled=True,
+            bgm_applied=True,
+            bgm_name="music.wav",
+            bgm_fingerprint="b" * 64,
+            bgm_gain_db=-26,
+            bgm_fade_in_sec=0.5,
+            bgm_fade_out_sec=1.0,
+        )
+        graph = build_audio_filter(
+            profile, duration=8.0, source_has_audio=True, bgm_has_audio=True,
+        )
+        self.assertIn("loudnorm=I=-16:LRA=11:TP=-1.5", graph)
+        self.assertIn("volume=-26dB", graph)
+        self.assertIn("afade=t=out:st=7.000:d=1.000", graph)
+        self.assertIn("amix=inputs=2", graph)
 
     def test_caption_presets_resolve_safe_margins_and_positions(self):
         standard = caption_style_for_canvas(CaptionProfile(), 720, 1280)
@@ -302,6 +341,68 @@ class ShortVideoUnitTests(unittest.TestCase):
         self.assertEqual(command[command.index("-crf") + 1], "24")
         self.assertEqual(command[command.index("-preset") + 1], "fast")
 
+    @patch("moment_retrieval.short_video.probe_audio_stream", return_value=True)
+    @patch("moment_retrieval.short_video.subprocess.run")
+    def test_short_renderer_applies_normalization_from_output_profile(
+        self, run, _audio_probe,
+    ):
+        def create_output(command, **_kwargs):
+            Path(command[-1]).touch()
+            return subprocess.CompletedProcess(command, 0)
+
+        run.side_effect = create_output
+        profile = OutputProfile.portrait(
+            720, 1280,
+            caption=CaptionProfile(enabled=False),
+            audio=AudioProfile(
+                normalize_source=True, normalization_applied=True,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "normalized.mp4"
+            render_short_clip(
+                Path(temporary) / "source.mp4", 0, 2, output,
+                options=profile, duration=2,
+            )
+        command = run.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("loudnorm", graph)
+        self.assertIn("[aout]", command)
+
+    @patch("moment_retrieval.short_video.probe_audio_stream", return_value=True)
+    @patch("moment_retrieval.short_video.subprocess.run")
+    def test_source_renderer_uses_ephemeral_bgm_path_without_filter_interpolation(
+        self, run, _audio_probe,
+    ):
+        def create_output(command, **_kwargs):
+            Path(command[-1]).touch()
+            return subprocess.CompletedProcess(command, 0)
+
+        run.side_effect = create_output
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bgm = root / "private music.wav"
+            bgm.write_bytes(b"synthetic-bgm")
+            audio = AudioProfile(
+                bgm_enabled=True,
+                bgm_applied=True,
+                bgm_name=bgm.name,
+                bgm_fingerprint=private_source_fingerprint(bgm),
+            )
+            profile = OutputProfile.source(
+                caption=CaptionProfile(enabled=False), audio=audio,
+            )
+            output = root / "mixed.mp4"
+            render_captioned_source_clip(
+                root / "source.mp4", 0, 2, output,
+                captions=(), output_profile=profile, bgm_path=bgm, duration=2,
+            )
+        command = run.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertNotIn(str(bgm), graph)
+        self.assertIn(str(bgm.resolve()), command)
+        self.assertIn("amix=inputs=2", graph)
+
 
 @unittest.skipUnless(
     shutil.which("ffmpeg") and shutil.which("ffprobe"),
@@ -357,6 +458,46 @@ class ShortVideoIntegrationTests(unittest.TestCase):
                 ),
                 (640, 360),
             )
+
+    def test_real_ffmpeg_normalizes_and_mixes_local_bgm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            bgm = root / "bgm.wav"
+            output = root / "mixed.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=size=320x180:rate=24:duration=1.5",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1.5",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                str(source),
+            ], check=True, capture_output=True)
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=220:duration=1.5",
+                str(bgm),
+            ], check=True, capture_output=True)
+            profile = OutputProfile.source(
+                caption=CaptionProfile(enabled=False),
+                audio=AudioProfile(
+                    normalize_source=True,
+                    normalization_applied=True,
+                    bgm_enabled=True,
+                    bgm_applied=True,
+                    bgm_name=bgm.name,
+                    bgm_fingerprint=private_source_fingerprint(bgm),
+                    bgm_gain_db=-30,
+                ),
+            )
+            render_captioned_source_clip(
+                source, 0, 1.5, output, captions=(),
+                output_profile=profile, bgm_path=bgm, duration=1.5,
+            )
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type", "-of", "json", str(output),
+            ], check=True, capture_output=True, text=True)
+            self.assertEqual(json.loads(probe.stdout)["streams"][0]["codec_type"], "audio")
 
 
 if __name__ == "__main__":

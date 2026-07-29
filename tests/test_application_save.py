@@ -7,10 +7,11 @@ from pathlib import Path
 from moment_retrieval.application import DocumentRepository
 from moment_retrieval.edit_domain import EditPlan, TimeRange
 from moment_retrieval.export_jobs import ExportJobRegistry, ExportStage
-from moment_retrieval.output_profile import CaptionProfile, OutputProfile
+from moment_retrieval.output_profile import AudioProfile, CaptionProfile, OutputProfile
 from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.save_service import (
     ExportVariantRequest,
+    ProbedAudioArtifact,
     ProbedArtifact,
     SaveError,
     recover_artifact_transactions,
@@ -98,6 +99,61 @@ class ApplicationSaveTest(unittest.TestCase):
             self.assertEqual(manifest["output_profile"]["canvas_mode"], "portrait_blur")
             self.assertEqual(manifest["output_profile"]["caption"]["preset"], "large")
             self.assertNotIn(str(source), raw)
+
+    def test_audio_finishing_is_verified_and_clipping_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "normalized.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            profile = OutputProfile.source(
+                caption=CaptionProfile(enabled=False),
+                audio=AudioProfile(
+                    normalize_source=True, normalization_applied=True,
+                ),
+            )
+            result = save_document(
+                doc.document_id, source, output, True,
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                audio_probe=lambda _path: ProbedAudioArtifact(True, -0.05),
+                output_profile=profile,
+            )
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["audio_verification"]["present"])
+            self.assertTrue(manifest["audio_verification"]["clipping_detected"])
+            self.assertIn("AUDIO_CLIPPING_DETECTED", manifest["warnings"])
+
+    def test_missing_processed_audio_rolls_back_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "normalized.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            with self.assertRaisesRegex(SaveError, "AUDIO_STREAM_MISSING"):
+                save_document(
+                    doc.document_id, source, output, True,
+                    documents=self.documents,
+                    cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                    probe=lambda _path: ProbedArtifact(7_000, 34),
+                    audio_probe=lambda _path: ProbedAudioArtifact(False, None),
+                    output_profile=OutputProfile.source(
+                        caption=CaptionProfile(enabled=False),
+                        audio=AudioProfile(
+                            normalize_source=True, normalization_applied=True,
+                        ),
+                    ),
+                )
+            self.assertFalse(output.exists())
 
     def test_export_job_tracks_save_stages_and_completion(self):
         with tempfile.TemporaryDirectory() as directory:

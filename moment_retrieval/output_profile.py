@@ -69,12 +69,73 @@ class CaptionProfile:
 
 @dataclass(frozen=True)
 class AudioProfile:
-    """Reserved output-audio contract; processing is intentionally deferred."""
+    """Manifest-safe audio finishing settings.
+
+    A local BGM path is deliberately not part of this value.  Only a basename
+    and content fingerprint may be persisted; the path remains an ephemeral
+    renderer input owned by the current process.
+    """
 
     normalize_source: bool = False
+    normalization_applied: bool | None = None
+    target_lufs: float = -16.0
+    loudness_range: float = 11.0
+    true_peak_db: float = -1.5
+    bgm_enabled: bool = False
+    bgm_applied: bool | None = None
+    bgm_name: str | None = None
+    bgm_fingerprint: str | None = None
+    bgm_gain_db: float = -24.0
+    bgm_fade_in_sec: float = 0.5
+    bgm_fade_out_sec: float = 1.0
+
+    def validate(self) -> "AudioProfile":
+        if not -30.0 <= float(self.target_lufs) <= -5.0:
+            raise ValueError("audio target loudness must be between -30 and -5 LUFS")
+        if not 1.0 <= float(self.loudness_range) <= 20.0:
+            raise ValueError("audio loudness range must be between 1 and 20 LU")
+        if not -9.0 <= float(self.true_peak_db) <= 0.0:
+            raise ValueError("audio true peak must be between -9 and 0 dBTP")
+        if not -60.0 <= float(self.bgm_gain_db) <= 0.0:
+            raise ValueError("BGM gain must be between -60 and 0 dB")
+        if not 0.0 <= float(self.bgm_fade_in_sec) <= 30.0:
+            raise ValueError("BGM fade-in must be between 0 and 30 seconds")
+        if not 0.0 <= float(self.bgm_fade_out_sec) <= 30.0:
+            raise ValueError("BGM fade-out must be between 0 and 30 seconds")
+        if self.normalization_applied is True and not self.normalize_source:
+            raise ValueError("normalization cannot be applied when it is disabled")
+        if self.bgm_applied is True and not self.bgm_enabled:
+            raise ValueError("BGM cannot be applied when it is disabled")
+        if self.bgm_enabled:
+            if (
+                not self.bgm_name
+                or self.bgm_name != os.path.basename(self.bgm_name)
+                or any(ch in self.bgm_name for ch in "\r\n")
+            ):
+                raise ValueError("BGM name must be a safe basename")
+            fingerprint = str(self.bgm_fingerprint or "")
+            if len(fingerprint) != 64 or any(ch not in "0123456789abcdef" for ch in fingerprint):
+                raise ValueError("BGM fingerprint must be a SHA-256 value")
+        elif self.bgm_name is not None or self.bgm_fingerprint is not None:
+            raise ValueError("disabled BGM must not retain file identity")
+        return self
 
     def to_manifest(self) -> dict[str, object]:
-        return {"normalize_source": self.normalize_source}
+        self.validate()
+        return {
+            "normalize_source": self.normalize_source,
+            "normalization_applied": self.normalization_applied,
+            "target_lufs": self.target_lufs,
+            "loudness_range": self.loudness_range,
+            "true_peak_db": self.true_peak_db,
+            "bgm_enabled": self.bgm_enabled,
+            "bgm_applied": self.bgm_applied,
+            "bgm_name": self.bgm_name,
+            "bgm_fingerprint": self.bgm_fingerprint,
+            "bgm_gain_db": self.bgm_gain_db,
+            "bgm_fade_in_sec": self.bgm_fade_in_sec,
+            "bgm_fade_out_sec": self.bgm_fade_out_sec,
+        }
 
 
 @dataclass(frozen=True)
@@ -115,21 +176,28 @@ class OutputProfile:
         if not self.encoding_preset:
             raise ValueError("output encoding preset is required")
         self.caption.validate()
+        self.audio.validate()
         return self
 
     @classmethod
-    def source(cls, *, caption: CaptionProfile | None = None) -> "OutputProfile":
-        return cls(caption=caption or CaptionProfile()).validate()
+    def source(
+        cls, *, caption: CaptionProfile | None = None,
+        audio: AudioProfile | None = None,
+    ) -> "OutputProfile":
+        return cls(
+            caption=caption or CaptionProfile(), audio=audio or AudioProfile(),
+        ).validate()
 
     @classmethod
     def portrait(
         cls, width: int = 1080, height: int = 1920, *, layout: Literal["blur", "crop"] = "blur",
-        caption: CaptionProfile | None = None,
+        caption: CaptionProfile | None = None, audio: AudioProfile | None = None,
     ) -> "OutputProfile":
         mode: CanvasMode = "portrait_blur" if layout == "blur" else "portrait_crop"
         return cls(
             profile_id=f"portrait-{layout}-{width}x{height}", canvas_mode=mode,
             width=width, height=height, caption=caption or CaptionProfile(),
+            audio=audio or AudioProfile(),
         ).validate()
 
     def to_manifest(self) -> dict[str, object]:

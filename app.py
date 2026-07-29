@@ -66,16 +66,19 @@ from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
 from moment_retrieval.export_jobs import EXPORT_JOBS, ExportStage
 from moment_retrieval.output_profile import (
+    AudioProfile,
     CaptionProfile,
     OutputProfile,
     validate_font_glyphs,
 )
+from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.ui_experiment import UIExperimentRecorder, compare_ui_runs
 from moment_retrieval.subtitles import SubtitleCue, format_srt_time, map_subtitles
 from moment_retrieval.short_video import (
     ShortVideoOptions,
     parse_short_resolution,
     prepare_short_captions,
+    probe_audio_stream,
     render_captioned_source_clip,
     render_short_clip,
 )
@@ -188,6 +191,14 @@ def _tk_dialog(kind: str) -> str:
     try:
         if kind == "folder":
             path = filedialog.askdirectory(title="保存先フォルダを選択")
+        elif kind == "audio":
+            path = filedialog.askopenfilename(
+                title="ローカルBGMを選択",
+                filetypes=[
+                    ("音声", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus"),
+                    ("すべて", "*.*"),
+                ],
+            )
         else:
             path = filedialog.askopenfilename(
                 title="動画ファイルを選択",
@@ -205,6 +216,11 @@ def browse_folder(current: str) -> str:
 
 def browse_video(current: str) -> str:
     path = _tk_dialog("file")
+    return path if path else current
+
+
+def browse_audio(current: str) -> str:
+    path = _tk_dialog("audio")
     return path if path else current
 
 
@@ -3110,10 +3126,70 @@ def _resolve_intuitive_output_captions(
     return captions, "自動字幕（編集範囲または動画の変更により編集内容は適用していません）", warnings
 
 
+def _resolve_intuitive_audio_profile(
+    source_path: str | Path | None,
+    normalize_audio: bool = False,
+    bgm_path: str | Path | None = None,
+    bgm_gain_db: float = -24.0,
+    bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
+) -> tuple[AudioProfile, list[str], Path | None]:
+    """Resolve local audio inputs without persisting their absolute paths."""
+    warnings: list[str] = []
+    source_has_audio: bool | None = None
+    if normalize_audio and source_path:
+        source = Path(source_path).expanduser()
+        if source.is_file():
+            try:
+                source_has_audio = probe_audio_stream(source)
+            except (OSError, RuntimeError) as exc:
+                raise gr.Error("元動画の音声を確認できませんでした。") from exc
+            if not source_has_audio:
+                warnings.append("AUDIO_NORMALIZE_SKIPPED_NO_SOURCE_AUDIO")
+
+    raw_bgm = str(bgm_path or "").strip()
+    resolved_bgm: Path | None = None
+    bgm_name = None
+    bgm_fingerprint = None
+    bgm_enabled = bool(raw_bgm)
+    if bgm_enabled:
+        resolved_bgm = Path(raw_bgm).expanduser().resolve()
+        if not resolved_bgm.is_file():
+            raise gr.Error("指定したBGMファイルを読み込めません。")
+        try:
+            if not probe_audio_stream(resolved_bgm):
+                raise gr.Error("指定したファイルには利用できる音声がありません。")
+            bgm_fingerprint = private_source_fingerprint(resolved_bgm)
+        except gr.Error:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise gr.Error("指定したBGMファイルを確認できませんでした。") from exc
+        bgm_name = resolved_bgm.name
+
+    try:
+        audio = AudioProfile(
+            normalize_source=bool(normalize_audio),
+            normalization_applied=(
+                bool(source_has_audio) if normalize_audio else False
+            ),
+            bgm_enabled=bgm_enabled,
+            bgm_applied=True if bgm_enabled else False,
+            bgm_name=bgm_name,
+            bgm_fingerprint=bgm_fingerprint,
+            bgm_gain_db=float(bgm_gain_db),
+            bgm_fade_in_sec=float(bgm_fade_in_sec),
+            bgm_fade_out_sec=float(bgm_fade_out_sec),
+        ).validate()
+    except (TypeError, ValueError) as exc:
+        raise gr.Error(str(exc)) from exc
+    return audio, warnings, resolved_bgm
+
+
 def _intuitive_output_profile(
     output_format: str, short_layout: str, short_resolution: str,
     burn_captions: bool, caption_preset: str = "standard",
     caption_position: str = "bottom",
+    audio_profile: AudioProfile | None = None,
 ) -> OutputProfile:
     try:
         caption = CaptionProfile(
@@ -3122,12 +3198,13 @@ def _intuitive_output_profile(
             enabled=bool(burn_captions),
         ).validate()
         if output_format == "standard":
-            return OutputProfile.source(caption=caption)
+            return OutputProfile.source(caption=caption, audio=audio_profile)
         if output_format != "short":
             raise ValueError("出力形式を選択してください。")
         width, height = parse_short_resolution(short_resolution)
         return OutputProfile.portrait(
             width, height, layout=short_layout, caption=caption,
+            audio=audio_profile,
         )
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
@@ -3157,6 +3234,7 @@ def _intuitive_output_preview_path(
     state: dict, captions: tuple[SubtitleCue, ...], *, output_format: str,
     short_layout: str, short_resolution: str, burn_captions: bool,
     caption_preset: str = "standard", caption_position: str = "bottom",
+    audio_profile: AudioProfile | None = None,
 ) -> Path:
     plan = edit_plan_from_intuitive(state)
     ranges = [
@@ -3175,6 +3253,7 @@ def _intuitive_output_preview_path(
         "burn": bool(burn_captions),
         "caption_preset": caption_preset,
         "caption_position": caption_position,
+        "audio": (audio_profile or AudioProfile()).to_manifest(),
         "cues": [[cue.start_ms, cue.end_ms, cue.text] for cue in captions],
     }
     digest = hashlib.sha256(
@@ -3186,6 +3265,7 @@ def _intuitive_output_preview_path(
 def _render_intuitive_output_profile(
     source: Path, plan, output: Path, *, captions: tuple[SubtitleCue, ...],
     output_profile: OutputProfile, timeout_sec: float | None = None,
+    bgm_path: Path | None = None,
 ) -> None:
     """Join kept ranges, then render the exact result timeline into ``output``."""
     output = Path(output)
@@ -3205,12 +3285,13 @@ def _render_intuitive_output_profile(
             render_short_clip(
                 joined, 0.0, duration, output, captions=captions,
                 options=output_profile, duration=duration, timeout_sec=timeout_sec,
+                bgm_path=bgm_path,
             )
         else:
             render_captioned_source_clip(
                 joined, 0.0, duration, output, captions=captions,
                 output_profile=output_profile,
-                duration=duration, timeout_sec=timeout_sec,
+                duration=duration, timeout_sec=timeout_sec, bgm_path=bgm_path,
             )
 
 
@@ -3219,6 +3300,9 @@ def preview_intuitive_output(
     short_layout: str = "blur", short_resolution: str = "1080x1920",
     burn_captions: bool = False, caption_preset: str = "standard",
     caption_position: str = "bottom",
+    normalize_audio: bool = False, bgm_path: str = "",
+    bgm_gain_db: float = -24.0, bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
 ):
     if not state:
         raise gr.Error("先に動画を読み込んでください。")
@@ -3227,17 +3311,24 @@ def preview_intuitive_output(
         captions, caption_kind, warnings = _resolve_intuitive_output_captions(
             state, editor_rows, editor_state, burn_captions=bool(burn_captions),
         )
+        audio_profile, audio_warnings, resolved_bgm = _resolve_intuitive_audio_profile(
+            state.get("video_path"), normalize_audio, bgm_path,
+            bgm_gain_db, bgm_fade_in_sec, bgm_fade_out_sec,
+        )
+        warnings.extend(audio_warnings)
         output_profile = _intuitive_output_profile(
             output_format, short_layout, short_resolution, bool(burn_captions),
-            caption_preset, caption_position,
+            caption_preset, caption_position, audio_profile,
         )
         warnings.extend(_validate_intuitive_output_font(output_profile, captions))
         output = _intuitive_output_preview_path(
             state, captions, output_format=output_format, short_layout=short_layout,
             short_resolution=short_resolution, burn_captions=bool(burn_captions),
             caption_preset=caption_preset, caption_position=caption_position,
+            audio_profile=audio_profile,
         )
-        if output_format == "standard" and not burn_captions:
+        audio_processing = bool(normalize_audio or audio_profile.bgm_enabled)
+        if output_format == "standard" and not burn_captions and not audio_processing:
             ranges = [
                 [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
                 for item in plan.kept_ranges
@@ -3257,6 +3348,7 @@ def preview_intuitive_output(
                     Path(state["video_path"]), plan, temporary, captions=captions,
                     output_profile=output_profile,
                     timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+                    bgm_path=resolved_bgm,
                 ),
             )
     except (OSError, RuntimeError, ValueError, EditPlanError) as exc:
@@ -3267,8 +3359,12 @@ def preview_intuitive_output(
     status = f"**出力プレビュー:** {mode}　｜　**{caption_kind}**"
     if burn_captions:
         status += f"　｜　字幕: {caption_preset} / {caption_position}"
+    if normalize_audio:
+        status += "　｜　音量正規化"
+    if str(bgm_path or "").strip():
+        status += f"　｜　BGM: {Path(str(bgm_path)).name}"
     if warnings:
-        status += f"（時刻警告 {len(warnings)} 件）"
+        status += f"（警告 {len(warnings)} 件）"
     return gr.update(value=preview, label="③ 出力プレビュー"), status
 
 
@@ -3278,6 +3374,9 @@ def save_intuitive_editor(
     short_resolution: str = "1080x1920", burn_captions: bool = False,
     editor_rows=None, editor_state=None, caption_preset: str = "standard",
     caption_position: str = "bottom", export_job_id: str | None = None,
+    normalize_audio: bool = False, bgm_path: str = "",
+    bgm_gain_db: float = -24.0, bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
 ):
     if not state:
         raise gr.Error("先に動画を読み込んでください。")
@@ -3322,28 +3421,38 @@ def save_intuitive_editor(
                 captions, subtitle_warnings, _revision = _intuitive_auto_captions(state)
             if include_srt:
                 subtitle_text = _cues_to_srt(captions)
+        audio_profile, audio_warnings, resolved_bgm = _resolve_intuitive_audio_profile(
+            source, normalize_audio, bgm_path, bgm_gain_db,
+            bgm_fade_in_sec, bgm_fade_out_sec,
+        )
+        subtitle_warnings.extend(audio_warnings)
         output_profile = _intuitive_output_profile(
             output_format, short_layout, short_resolution, bool(burn_captions),
-            caption_preset, caption_position,
+            caption_preset, caption_position, audio_profile,
         )
         subtitle_warnings.extend(
             _validate_intuitive_output_font(output_profile, captions)
         )
         postprocessor = None
-        if output_profile.canvas_mode != "source" or burn_captions:
+        if (
+            output_profile.canvas_mode != "source"
+            or burn_captions
+            or normalize_audio
+            or audio_profile.bgm_enabled
+        ):
             def postprocessor(joined: Path, output: Path, result_duration: float) -> None:
                 if output_profile.canvas_mode != "source":
                     render_short_clip(
                         joined, 0.0, result_duration, output, captions=captions,
                         options=output_profile, duration=result_duration,
-                        cancel_event=cancel_event,
+                        cancel_event=cancel_event, bgm_path=resolved_bgm,
                     )
                 else:
                     render_captioned_source_clip(
                         joined, 0.0, result_duration, output, captions=captions,
                         output_profile=output_profile,
                         duration=result_duration,
-                        cancel_event=cancel_event,
+                        cancel_event=cancel_event, bgm_path=resolved_bgm,
                     )
         result = save_document(
             state["document_id"], source, output_dir / output_name, bool(precise),
@@ -3353,7 +3462,10 @@ def save_intuitive_editor(
         )
         saved_path = str(result.video_path.resolve())
     else:
-        if output_format != "standard" or burn_captions or include_srt:
+        if (
+            output_format != "standard" or burn_captions or include_srt
+            or normalize_audio or str(bgm_path or "").strip()
+        ):
             raise gr.Error(
                 "この動画では出力形式・字幕を利用できません。動画を再読み込みしてからお試しください。"
             )
@@ -3418,6 +3530,9 @@ def run_intuitive_export_job(
     short_resolution: str, burn_captions: bool, editor_rows,
     editor_state, caption_preset: str, caption_position: str,
     export_job_id: str,
+    normalize_audio: bool = False, bgm_path: str = "",
+    bgm_gain_db: float = -24.0, bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
 ):
     """Keep the UI responsive while a local export reports stage changes."""
     result_box: dict[str, object] = {}
@@ -3428,7 +3543,8 @@ def run_intuitive_export_job(
                 state, precise, out_dir, filename, include_srt,
                 output_format, short_layout, short_resolution, burn_captions,
                 editor_rows, editor_state, caption_preset, caption_position,
-                export_job_id,
+                export_job_id, normalize_audio, bgm_path, bgm_gain_db,
+                bgm_fade_in_sec, bgm_fade_out_sec,
             )
         except Exception as exc:  # re-raised after the terminal state is visible
             current = EXPORT_JOBS.get(export_job_id)
@@ -6723,6 +6839,33 @@ with gr.Blocks(title="動画シーン検索") as demo:
                                 ],
                                 value="bottom", label="字幕位置", scale=2,
                             )
+                        with gr.Accordion("音声仕上げ（任意）", open=False):
+                            intuitive_normalize_audio = gr.Checkbox(
+                                value=False,
+                                label="元動画の音量をそろえる（-16 LUFS）",
+                            )
+                            with gr.Row():
+                                intuitive_bgm_path = gr.Textbox(
+                                    value="", label="ローカルBGM",
+                                    placeholder="BGMを使う場合だけローカル音声を選択",
+                                    scale=4,
+                                )
+                                intuitive_bgm_browse_btn = gr.Button(
+                                    "BGMを選択", scale=0, min_width=110,
+                                )
+                            intuitive_bgm_gain = gr.Slider(
+                                minimum=-40, maximum=-6, value=-24, step=1,
+                                label="BGM音量（dB・元音声より小さく）",
+                            )
+                            with gr.Row():
+                                intuitive_bgm_fade_in = gr.Number(
+                                    value=0.5, minimum=0, maximum=30,
+                                    label="フェードイン（秒）",
+                                )
+                                intuitive_bgm_fade_out = gr.Number(
+                                    value=1.0, minimum=0, maximum=30,
+                                    label="フェードアウト（秒）",
+                                )
                         with gr.Accordion("字幕を調整（この出力のみ）", open=True):
                             intuitive_caption_load_btn = gr.Button(
                                 "ASR字幕を読み込む", variant="secondary",
@@ -7074,6 +7217,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_caption_table, intuitive_caption_editor_state,
                 intuitive_caption_preset, intuitive_caption_position,
                 intuitive_export_job_id,
+                intuitive_normalize_audio, intuitive_bgm_path,
+                intuitive_bgm_gain, intuitive_bgm_fade_in,
+                intuitive_bgm_fade_out,
             ],
             outputs=[
                 intuitive_saved_path, intuitive_state, intuitive_toolbar,
@@ -7098,6 +7244,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_output_format, intuitive_short_layout,
                 intuitive_short_resolution, intuitive_burn_captions,
                 intuitive_caption_preset, intuitive_caption_position,
+                intuitive_normalize_audio, intuitive_bgm_path,
+                intuitive_bgm_gain, intuitive_bgm_fade_in,
+                intuitive_bgm_fade_out,
             ],
             outputs=[intuitive_output_preview, intuitive_output_status],
             concurrency_id="intuitive-output-preview-io",
@@ -7195,6 +7344,11 @@ with gr.Blocks(title="動画シーン検索") as demo:
             browse_folder,
             inputs=[intuitive_out_dir],
             outputs=[intuitive_out_dir],
+        )
+        intuitive_bgm_browse_btn.click(
+            browse_audio,
+            inputs=[intuitive_bgm_path],
+            outputs=[intuitive_bgm_path],
         )
         intuitive_open_output_btn.click(
             open_output_folder,

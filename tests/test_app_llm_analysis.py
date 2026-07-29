@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -1006,6 +1007,35 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertEqual((portrait.width, portrait.height), (720, 1280))
         self.assertEqual(portrait.caption.preset, "large")
         self.assertEqual(portrait.caption.position, "center")
+
+    def test_intuitive_audio_profile_keeps_bgm_path_ephemeral(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "private-source.mp4"
+            source.write_bytes(b"source")
+            bgm = root / "private music.wav"
+            bgm.write_bytes(b"bgm")
+            with patch.object(app, "probe_audio_stream", return_value=True):
+                audio, warnings, resolved = app._resolve_intuitive_audio_profile(
+                    source, True, bgm, -25, 0.5, 1.0,
+                )
+        manifest = audio.to_manifest()
+        self.assertEqual(warnings, [])
+        self.assertEqual(resolved, bgm.resolve())
+        self.assertEqual(manifest["bgm_name"], bgm.name)
+        self.assertTrue(manifest["normalization_applied"])
+        self.assertNotIn(str(root), json.dumps(manifest, ensure_ascii=False))
+
+    def test_intuitive_audio_profile_warns_when_source_has_no_audio(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "silent.mp4"
+            source.write_bytes(b"source")
+            with patch.object(app, "probe_audio_stream", return_value=False):
+                audio, warnings, _bgm = app._resolve_intuitive_audio_profile(
+                    source, True,
+                )
+        self.assertFalse(audio.normalization_applied)
+        self.assertEqual(warnings, ["AUDIO_NORMALIZE_SKIPPED_NO_SOURCE_AUDIO"])
 
     def test_intuitive_output_preview_key_changes_for_caption_style(self):
         state = {

@@ -2,6 +2,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from moment_retrieval.short_video import (
     ShortVideoOptions,
+    ShortVideoCancelled,
     build_source_caption_filter,
     build_short_filter,
     captions_to_ass,
@@ -202,6 +204,23 @@ class ShortVideoUnitTests(unittest.TestCase):
             self.assertIsNotNone(run.call_args.kwargs["cwd"])
             self.assertTrue(output.exists())
             self.assertFalse(list(Path(temporary).glob("cut_video_short_*")))
+
+    @patch("moment_retrieval.short_video.subprocess.run")
+    @patch("moment_retrieval.short_video.subprocess.Popen")
+    def test_renderer_honors_cancel_before_ffmpeg_start(self, popen, run):
+        cancel = threading.Event()
+        cancel.set()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "cancelled.mp4"
+            with self.assertRaises(ShortVideoCancelled):
+                render_short_clip(
+                    Path(temporary) / "source.mp4", 0, 1, output,
+                    options=ShortVideoOptions(720, 1280, "blur", False),
+                    cancel_event=cancel,
+                )
+            self.assertFalse(output.exists())
+        run.assert_not_called()
+        popen.assert_not_called()
 
     @patch("moment_retrieval.short_video.captions_to_ass", return_value="ass")
     @patch("moment_retrieval.short_video.subprocess.run")

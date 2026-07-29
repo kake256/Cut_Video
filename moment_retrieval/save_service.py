@@ -18,6 +18,7 @@ from cut_clip import cut_clips
 from . import db
 from .application import ApplicationError, DOCUMENTS, DocumentRepository, SaveTicket
 from .edit_domain import EffectiveExportPlan, make_effective_export_plan, ms_to_seconds
+from .export_jobs import EXPORT_JOBS, ExportJobRegistry, ExportStage
 from .output_profile import OutputProfile
 from .publication import private_source_fingerprint
 from .subtitles import SubtitleValidationError, validate_srt_text
@@ -135,6 +136,7 @@ class ArtifactTransaction:
         probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
         postprocessor: Callable[[Path, Path, float], None] | None = None,
         output_profile: OutputProfile | None = None,
+        progress_callback: Callable[[ExportStage], None] | None = None,
     ):
         self.output_path = Path(output_path)
         self.source_path = Path(source_path)
@@ -151,6 +153,11 @@ class ArtifactTransaction:
         # This is render metadata only.  It intentionally contains no source
         # path or transcript and is therefore safe for the local artifact manifest.
         self.output_profile = output_profile.validate() if output_profile else None
+        self.progress_callback = progress_callback
+
+    def _progress(self, stage: ExportStage) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(stage)
 
     def execute(
         self, ticket: SaveTicket, subtitle_text: str | None = None,
@@ -204,6 +211,7 @@ class ArtifactTransaction:
                 staging / f".joined-{self.output_path.name}"
                 if self.postprocessor is not None else staged_video
             )
+            self._progress(ExportStage.JOINING)
             self.cutter(
                 self.source_path, ranges, staged_joined, precise=self.precise,
                 duration=ms_to_seconds(self.effective_plan.plan.source_duration_ms),
@@ -212,6 +220,7 @@ class ArtifactTransaction:
             if self.cancel_event.is_set():
                 raise SaveError("save was cancelled")
             if self.postprocessor is not None:
+                self._progress(ExportStage.RENDERING)
                 try:
                     self.postprocessor(
                         staged_joined,
@@ -222,6 +231,7 @@ class ArtifactTransaction:
                     staged_joined.unlink(missing_ok=True)
                 if self.cancel_event.is_set():
                     raise SaveError("save was cancelled")
+            self._progress(ExportStage.PROBING)
             probed = self.probe(staged_video)
             if probed.duration_ms <= 0 or probed.tolerance_ms < 0:
                 raise SaveError("ARTIFACT_PROBE_FAILED: staged video timing is invalid")
@@ -285,6 +295,7 @@ class ArtifactTransaction:
             # Keep this as the final operation before the first public replace.
             # The manifest remains the commit marker for crash recovery.
             _verify_source(self.source_path, self.expected_source_fingerprint)
+            self._progress(ExportStage.PUBLISHING)
             os.replace(staged_video, self.output_path)
             if subtitle_path:
                 os.replace(staged_srt, subtitle_path)
@@ -313,34 +324,73 @@ def save_document(
     probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
     postprocessor: Callable[[Path, Path, float], None] | None = None,
     output_profile: OutputProfile | None = None,
+    export_job_id: str | None = None,
+    export_jobs: ExportJobRegistry = EXPORT_JOBS,
     source_fingerprint_resolver: Callable[[str, str], str | None] = (
         _resolve_expected_source_fingerprint
     ),
 ) -> SaveResult:
-    document = documents.get(document_id)
-    if not document or document.closed:
-        raise ApplicationError("document is closed or missing")
-    expected_fingerprint = document.expected_source_fingerprint
-    if expected_fingerprint is None:
-        expected_fingerprint = source_fingerprint_resolver(
-            document.public_video_id, document.source_generation,
+    if export_job_id is not None:
+        if export_jobs.get(export_job_id) is None:
+            raise ApplicationError("export job is missing")
+        if cancel_event is None:
+            cancel_event = export_jobs.cancel_event(export_job_id)
+
+    def report(stage: ExportStage) -> None:
+        if export_job_id is not None:
+            export_jobs.transition(export_job_id, stage)
+
+    try:
+        report(ExportStage.VALIDATING)
+        document = documents.get(document_id)
+        if not document or document.closed:
+            raise ApplicationError("document is closed or missing")
+        expected_fingerprint = document.expected_source_fingerprint
+        if expected_fingerprint is None:
+            expected_fingerprint = source_fingerprint_resolver(
+                document.public_video_id, document.source_generation,
+            )
+        # Validate before creating a SaveTicket, staging directory, or output claim.
+        _verify_source(Path(source_path), expected_fingerprint)
+        ticket = documents.begin_save(document_id, expected_fingerprint)
+        recover_artifact_transactions(Path(output_path).parent)
+        effective = make_effective_export_plan(ticket.snapshot, pad_before_ms, pad_after_ms)
+        # A second rendering pass (caption burn-in / portrait layout) must start
+        # from frame-accurate joined ranges.  The fast stream-copy path remains
+        # available only for the unchanged standard export.
+        effective_precise = bool(
+            precise or subtitle_text is not None or postprocessor is not None
         )
-    # Validate before creating a SaveTicket, staging directory, or output claim.
-    _verify_source(Path(source_path), expected_fingerprint)
-    ticket = documents.begin_save(document_id, expected_fingerprint)
-    recover_artifact_transactions(Path(output_path).parent)
-    effective = make_effective_export_plan(ticket.snapshot, pad_before_ms, pad_after_ms)
-    # A second rendering pass (caption burn-in / portrait layout) must start
-    # from frame-accurate joined ranges.  The fast stream-copy path remains
-    # available only for the unchanged standard export.
-    effective_precise = bool(precise or subtitle_text is not None or postprocessor is not None)
-    transaction = ArtifactTransaction(
-        output_path, source_path, effective, effective_precise,
-        expected_fingerprint, cancel_event, cutter, probe, postprocessor, output_profile,
-    )
-    result = transaction.execute(ticket, subtitle_text, warnings)
-    documents.complete_save(ticket, result.commit_id)
-    return result
+        transaction = ArtifactTransaction(
+            output_path, source_path, effective, effective_precise,
+            expected_fingerprint, cancel_event, cutter, probe, postprocessor,
+            output_profile, report,
+        )
+        result = transaction.execute(ticket, subtitle_text, warnings)
+        documents.complete_save(ticket, result.commit_id)
+        if export_job_id is not None:
+            export_jobs.complete(export_job_id)
+        return result
+    except Exception as exc:
+        if export_job_id is not None:
+            current = export_jobs.get(export_job_id)
+            if current is not None and not current.terminal:
+                if cancel_event is not None and cancel_event.is_set():
+                    export_jobs.acknowledge_cancel(export_job_id)
+                else:
+                    export_jobs.fail(export_job_id, _export_error_code(exc))
+        raise
+
+
+def _export_error_code(exc: Exception) -> str:
+    if isinstance(exc, ApplicationError):
+        return getattr(exc, "code", "APPLICATION_ERROR")
+    prefix = str(exc or "").partition(":")[0].strip().upper()
+    if prefix and all(ch.isalnum() or ch == "_" for ch in prefix):
+        return prefix[:80]
+    if isinstance(exc, SaveError):
+        return "SAVE_FAILED"
+    return "EXPORT_FAILED"
 
 
 def recover_artifact_transactions(output_root: Path) -> list[Path]:

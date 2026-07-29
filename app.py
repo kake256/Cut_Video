@@ -64,6 +64,7 @@ from moment_retrieval.share import ShareError, export_index, import_index, relin
 from moment_retrieval.vector_index import VectorIndex
 from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
+from moment_retrieval.export_jobs import EXPORT_JOBS, ExportStage
 from moment_retrieval.output_profile import (
     CaptionProfile,
     OutputProfile,
@@ -3276,7 +3277,7 @@ def save_intuitive_editor(
     output_format: str = "standard", short_layout: str = "blur",
     short_resolution: str = "1080x1920", burn_captions: bool = False,
     editor_rows=None, editor_state=None, caption_preset: str = "standard",
-    caption_position: str = "bottom",
+    caption_position: str = "bottom", export_job_id: str | None = None,
 ):
     if not state:
         raise gr.Error("先に動画を読み込んでください。")
@@ -3294,6 +3295,7 @@ def save_intuitive_editor(
         "duration": state["duration"],
     }
     source = Path(state["video_path"])
+    cancel_event = EXPORT_JOBS.cancel_event(export_job_id) if export_job_id else None
     if source.is_file() and state.get("document_id"):
         domain_plan = edit_plan_from_intuitive(state)
         DOCUMENTS.sync_adapter_plan(state["document_id"], domain_plan)
@@ -3334,17 +3336,20 @@ def save_intuitive_editor(
                     render_short_clip(
                         joined, 0.0, result_duration, output, captions=captions,
                         options=output_profile, duration=result_duration,
+                        cancel_event=cancel_event,
                     )
                 else:
                     render_captioned_source_clip(
                         joined, 0.0, result_duration, output, captions=captions,
                         output_profile=output_profile,
                         duration=result_duration,
+                        cancel_event=cancel_event,
                     )
         result = save_document(
             state["document_id"], source, output_dir / output_name, bool(precise),
             subtitle_text=subtitle_text, warnings=subtitle_warnings, cutter=cut_clips,
             postprocessor=postprocessor, output_profile=output_profile,
+            cancel_event=cancel_event, export_job_id=export_job_id,
         )
         saved_path = str(result.video_path.resolve())
     else:
@@ -3356,10 +3361,103 @@ def save_intuitive_editor(
             state["overall_start"], state["overall_end"], ctx,
             intuitive_state_to_clip_plan(state), precise, out_dir, filename,
         )
+        if export_job_id:
+            EXPORT_JOBS.complete(export_job_id)
     saved_state = copy.deepcopy(state)
     saved_state["baseline_plan"] = _intuitive_plan_snapshot(saved_state)
     saved_state["edit_dirty"] = False
     return saved_path, saved_state, render_intuitive_toolbar(saved_state)
+
+
+_EXPORT_STAGE_LABELS = {
+    ExportStage.QUEUED: "保存待ち",
+    ExportStage.VALIDATING: "入力を確認中",
+    ExportStage.JOINING: "編集区間を結合中",
+    ExportStage.RENDERING: "画面・字幕を生成中",
+    ExportStage.PROBING: "成果物を検証中",
+    ExportStage.PUBLISHING: "保存を確定中",
+    ExportStage.COMPLETED: "保存完了",
+    ExportStage.FAILED: "保存失敗",
+    ExportStage.CANCELLED: "停止済み",
+}
+
+
+def _intuitive_export_job_status(job_id: str) -> str:
+    state = EXPORT_JOBS.get(job_id)
+    if state is None:
+        return "保存jobが見つかりません。"
+    label = _EXPORT_STAGE_LABELS[state.stage]
+    detail = f"　エラーコード: `{state.error_code}`" if state.error_code else ""
+    return f"**保存処理:** {label}（{state.progress}%）{detail}"
+
+
+def start_intuitive_export_job():
+    job = EXPORT_JOBS.create()
+    return (
+        job.job_id,
+        _intuitive_export_job_status(job.job_id),
+        gr.update(visible=True, interactive=True),
+    )
+
+
+def cancel_intuitive_export_job(job_id: str):
+    if not job_id or EXPORT_JOBS.get(job_id) is None:
+        return "停止できる保存処理はありません。", gr.update(interactive=False)
+    state = EXPORT_JOBS.request_cancel(job_id)
+    if state.terminal:
+        return _intuitive_export_job_status(job_id), gr.update(interactive=False)
+    return (
+        "停止を要求しました。現在の処理を安全に終了しています。",
+        gr.update(interactive=False),
+    )
+
+
+def run_intuitive_export_job(
+    state: dict, precise: bool, out_dir: str, filename: str,
+    include_srt: bool, output_format: str, short_layout: str,
+    short_resolution: str, burn_captions: bool, editor_rows,
+    editor_state, caption_preset: str, caption_position: str,
+    export_job_id: str,
+):
+    """Keep the UI responsive while a local export reports stage changes."""
+    result_box: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            result_box["result"] = save_intuitive_editor(
+                state, precise, out_dir, filename, include_srt,
+                output_format, short_layout, short_resolution, burn_captions,
+                editor_rows, editor_state, caption_preset, caption_position,
+                export_job_id,
+            )
+        except Exception as exc:  # re-raised after the terminal state is visible
+            current = EXPORT_JOBS.get(export_job_id)
+            if current is not None and not current.terminal:
+                if current.cancel_requested:
+                    EXPORT_JOBS.acknowledge_cancel(export_job_id)
+                else:
+                    EXPORT_JOBS.fail(export_job_id, "EXPORT_PREPARE_FAILED")
+            result_box["error"] = exc
+
+    thread = threading.Thread(
+        target=worker, name=f"cut-video-{export_job_id}", daemon=True,
+    )
+    thread.start()
+    while thread.is_alive():
+        yield (
+            gr.update(), gr.update(), gr.update(),
+            _intuitive_export_job_status(export_job_id),
+            gr.update(visible=True, interactive=True),
+        )
+        thread.join(0.2)
+    if "error" in result_box:
+        raise gr.Error(_intuitive_export_job_status(export_job_id)) from result_box["error"]
+    saved_path, saved_state, toolbar = result_box["result"]
+    yield (
+        saved_path, saved_state, toolbar,
+        _intuitive_export_job_status(export_job_id),
+        gr.update(visible=False, interactive=False),
+    )
 
 
 def get_region_sentences(conn, video_id: str, lo: float, hi: float) -> list:
@@ -6634,6 +6732,16 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 show_label=False, container=False,
                 elem_id="intuitive-saved-path",
             )
+            intuitive_export_job_id = gr.State("")
+            with gr.Row(elem_classes=["intuitive-compact-row"]):
+                intuitive_export_status = gr.Markdown(
+                    "**保存処理:** 待機中",
+                    elem_id="intuitive-export-status",
+                )
+                intuitive_export_stop_btn = gr.Button(
+                    "保存処理を停止", variant="stop", visible=False,
+                    scale=0, min_width=140, elem_id="intuitive-export-stop",
+                )
             intuitive_open_folder_status = gr.Markdown("")
 
         with gr.Accordion("UI比較計測（匿名・ローカル保存）", open=False):
@@ -6884,8 +6992,16 @@ with gr.Blocks(title="動画シーン検索") as demo:
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
         )
-        intuitive_save_btn.click(
-            save_intuitive_editor,
+        intuitive_save_event = intuitive_save_btn.click(
+            start_intuitive_export_job,
+            inputs=None,
+            outputs=[
+                intuitive_export_job_id, intuitive_export_status,
+                intuitive_export_stop_btn,
+            ],
+            show_progress="hidden",
+        ).then(
+            run_intuitive_export_job,
             inputs=[
                 intuitive_state, intuitive_precise,
                 intuitive_out_dir, intuitive_filename, intuitive_srt,
@@ -6893,10 +7009,23 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_short_resolution, intuitive_burn_captions,
                 intuitive_caption_table, intuitive_caption_editor_state,
                 intuitive_caption_preset, intuitive_caption_position,
+                intuitive_export_job_id,
             ],
-            outputs=[intuitive_saved_path, intuitive_state, intuitive_toolbar],
+            outputs=[
+                intuitive_saved_path, intuitive_state, intuitive_toolbar,
+                intuitive_export_status, intuitive_export_stop_btn,
+            ],
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
+            api_name="save_intuitive_editor",
+        )
+        intuitive_export_stop_btn.click(
+            cancel_intuitive_export_job,
+            inputs=[intuitive_export_job_id],
+            outputs=[intuitive_export_status, intuitive_export_stop_btn],
+            concurrency_id="intuitive-export-control",
+            concurrency_limit=2,
+            show_progress="hidden",
         )
         intuitive_output_preview_btn.click(
             preview_intuitive_output,

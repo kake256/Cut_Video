@@ -6,6 +6,7 @@ from pathlib import Path
 
 from moment_retrieval.application import DocumentRepository
 from moment_retrieval.edit_domain import EditPlan, TimeRange
+from moment_retrieval.export_jobs import ExportJobRegistry, ExportStage
 from moment_retrieval.output_profile import CaptionProfile, OutputProfile
 from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.save_service import (
@@ -92,6 +93,77 @@ class ApplicationSaveTest(unittest.TestCase):
             self.assertEqual(manifest["output_profile"]["canvas_mode"], "portrait_blur")
             self.assertEqual(manifest["output_profile"]["caption"]["preset"], "large")
             self.assertNotIn(str(source), raw)
+
+    def test_export_job_tracks_save_stages_and_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "clip.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            class RecordingJobs(ExportJobRegistry):
+                def __init__(self):
+                    super().__init__()
+                    self.stages = []
+
+                def transition(self, job_id, stage, **kwargs):
+                    self.stages.append(ExportStage(stage))
+                    return super().transition(job_id, stage, **kwargs)
+
+            jobs = RecordingJobs()
+            job = jobs.create(job_id="export_save_success")
+
+            result = save_document(
+                doc.document_id, source, output, True,
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                export_job_id=job.job_id,
+                export_jobs=jobs,
+            )
+
+            self.assertTrue(result.video_path.exists())
+            state = jobs.get(job.job_id)
+            self.assertIsNotNone(state)
+            self.assertEqual(state.stage, ExportStage.COMPLETED)
+            self.assertEqual(state.progress, 100)
+            self.assertEqual(jobs.stages, [
+                ExportStage.VALIDATING,
+                ExportStage.JOINING,
+                ExportStage.PROBING,
+                ExportStage.PUBLISHING,
+            ])
+
+    def test_cancelled_export_job_is_acknowledged_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "clip.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            jobs = ExportJobRegistry()
+            job = jobs.create(job_id="export_save_cancel")
+            jobs.request_cancel(job.job_id)
+
+            with self.assertRaisesRegex(SaveError, "cancelled"):
+                save_document(
+                    doc.document_id, source, output, True,
+                    documents=self.documents,
+                    cutter=lambda *_args, **_kwargs: self.fail("cutter must not run"),
+                    probe=lambda _path: ProbedArtifact(7_000, 34),
+                    export_job_id=job.job_id,
+                    export_jobs=jobs,
+                )
+
+            state = jobs.get(job.job_id)
+            self.assertEqual(state.stage, ExportStage.CANCELLED)
+            self.assertFalse(output.exists())
 
     def test_cancel_before_cut_leaves_no_artifact(self):
         with tempfile.TemporaryDirectory() as directory:

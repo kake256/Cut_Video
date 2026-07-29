@@ -3515,13 +3515,21 @@ class ClipPlanTest(unittest.TestCase):
             dependency for dependency in config["dependencies"]
             if dependency.get("api_name") == "save_intuitive_editor"
         )
-        self.assertEqual(len(save_dependency["outputs"]), 3)
+        self.assertEqual(len(save_dependency["outputs"]), 5)
         self.assertEqual(
-            save_dependency["outputs"][-1],
+            save_dependency["outputs"][2],
             next(
                 component["id"] for component in components
                 if component.get("props", {}).get("elem_id") == "intuitive-toolbox"
             ),
+        )
+        self.assertEqual(
+            save_dependency["outputs"][3],
+            components_by_elem_id["intuitive-export-status"]["id"],
+        )
+        self.assertEqual(
+            save_dependency["outputs"][4],
+            components_by_elem_id["intuitive-export-stop"]["id"],
         )
 
         html_values = "\n".join(

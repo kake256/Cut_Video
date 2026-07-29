@@ -997,6 +997,40 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertEqual(warnings, ["FONT_CHECK_UNAVAILABLE"])
         self.assertEqual(validate.call_args.args[1], cue.text)
 
+    def test_intuitive_export_job_can_be_started_and_cancelled(self):
+        job_id, status, _button = app.start_intuitive_export_job()
+        self.assertIn("保存待ち", status)
+        cancelled_status, _button = app.cancel_intuitive_export_job(job_id)
+        self.assertIn("停止を要求", cancelled_status)
+        state = app.EXPORT_JOBS.get(job_id)
+        self.assertTrue(state.cancel_requested)
+
+    def test_intuitive_export_job_wrapper_reports_completion(self):
+        job = app.EXPORT_JOBS.create()
+        state = {
+            "video_id": "vid_synthetic",
+            "video_path": "missing-synthetic.mp4",
+            "duration": 30.0,
+            "overall_start": 0.0,
+            "overall_end": 10.0,
+            "exclusions": [],
+        }
+        with (
+            patch.object(app, "on_save", return_value="saved.mp4"),
+            patch.object(app, "render_intuitive_toolbar", return_value="toolbar"),
+        ):
+            updates = list(app.run_intuitive_export_job(
+                state, True, "clips", "sample.mp4", False,
+                "standard", "blur", "1080x1920", False,
+                [], {}, "standard", "bottom", job.job_id,
+            ))
+        self.assertEqual(updates[-1][0], "saved.mp4")
+        self.assertIn("保存完了", updates[-1][3])
+        self.assertEqual(
+            app.EXPORT_JOBS.get(job.job_id).stage,
+            app.ExportStage.COMPLETED,
+        )
+
     def test_intuitive_output_preview_key_changes_with_caption_renderer(self):
         state = {
             "video_id": "vid_synthetic",

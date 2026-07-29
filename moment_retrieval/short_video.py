@@ -6,6 +6,8 @@ import json
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +19,54 @@ from .subtitles import SubtitleCue
 
 class ShortVideoError(RuntimeError):
     pass
+
+
+class ShortVideoCancelled(ShortVideoError):
+    pass
+
+
+def _run_render_command(
+    command: list[str], *, cwd: Path, timeout_sec: float | None,
+    cancel_event: threading.Event | None,
+) -> None:
+    """Run ffmpeg with cooperative cancellation when a job owns an event."""
+    if cancel_event is None:
+        subprocess.run(
+            command, cwd=cwd, check=True, capture_output=True,
+            timeout=timeout_sec,
+        )
+        return
+    if cancel_event.is_set():
+        raise ShortVideoCancelled("動画生成を停止しました")
+    process = subprocess.Popen(
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + timeout_sec if timeout_sec is not None else None
+    while True:
+        if cancel_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise ShortVideoCancelled("動画生成を停止しました")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            process.kill()
+            process.wait()
+            raise subprocess.TimeoutExpired(command, timeout_sec)
+        try:
+            stdout, stderr = process.communicate(
+                timeout=min(0.1, remaining) if remaining is not None else 0.1,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if process.returncode:
+            raise subprocess.CalledProcessError(
+                process.returncode, command, output=stdout, stderr=stderr,
+            )
+        return
 
 
 @dataclass(frozen=True)
@@ -348,6 +398,7 @@ def render_captioned_source_clip(
     output_profile: OutputProfile | None = None,
     duration: float | None = None,
     timeout_sec: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """Burn captions while preserving the source video's canvas and aspect."""
     start_value, end_value = float(start), float(end)
@@ -398,10 +449,13 @@ def render_captioned_source_clip(
             "-movflags", "+faststart", str(output_path),
         ]
         try:
-            subprocess.run(
-                command, cwd=temporary, check=True, capture_output=True,
-                timeout=timeout_sec,
+            _run_render_command(
+                command, cwd=temporary, timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
             )
+        except ShortVideoCancelled:
+            output_path.unlink(missing_ok=True)
+            raise
         except (OSError, subprocess.SubprocessError) as exc:
             output_path.unlink(missing_ok=True)
             raise ShortVideoError("字幕付き動画の生成に失敗しました") from exc
@@ -418,6 +472,7 @@ def render_short_clip(
     options: ShortVideoOptions | OutputProfile = ShortVideoOptions(),
     duration: float | None = None,
     timeout_sec: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """Render one source interval as a portrait MP4.
 
@@ -474,10 +529,13 @@ def render_short_clip(
             "-movflags", "+faststart", str(output_path),
         ]
         try:
-            subprocess.run(
-                command, cwd=temporary, check=True, capture_output=True,
-                timeout=timeout_sec,
+            _run_render_command(
+                command, cwd=temporary, timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
             )
+        except ShortVideoCancelled:
+            output_path.unlink(missing_ok=True)
+            raise
         except (OSError, subprocess.SubprocessError) as exc:
             output_path.unlink(missing_ok=True)
             raise ShortVideoError("ショート動画の生成に失敗しました") from exc

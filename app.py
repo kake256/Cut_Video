@@ -64,6 +64,11 @@ from moment_retrieval.share import ShareError, export_index, import_index, relin
 from moment_retrieval.vector_index import VectorIndex
 from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
+from moment_retrieval.output_profile import (
+    CaptionProfile,
+    OutputProfile,
+    validate_font_glyphs,
+)
 from moment_retrieval.ui_experiment import UIExperimentRecorder, compare_ui_runs
 from moment_retrieval.subtitles import SubtitleCue, format_srt_time, map_subtitles
 from moment_retrieval.short_video import (
@@ -3106,25 +3111,51 @@ def _resolve_intuitive_output_captions(
 
 def _intuitive_output_profile(
     output_format: str, short_layout: str, short_resolution: str,
-    burn_captions: bool,
-) -> ShortVideoOptions | None:
-    if output_format == "standard":
-        return None
-    if output_format != "short":
-        raise gr.Error("出力形式を選択してください。")
+    burn_captions: bool, caption_preset: str = "standard",
+    caption_position: str = "bottom",
+) -> OutputProfile:
     try:
-        width, height = parse_short_resolution(short_resolution)
-        return ShortVideoOptions(
-            width=width, height=height, layout=short_layout,
-            burn_captions=bool(burn_captions),
+        caption = CaptionProfile(
+            preset=caption_preset,
+            position=caption_position,
+            enabled=bool(burn_captions),
         ).validate()
+        if output_format == "standard":
+            return OutputProfile.source(caption=caption)
+        if output_format != "short":
+            raise ValueError("出力形式を選択してください。")
+        width, height = parse_short_resolution(short_resolution)
+        return OutputProfile.portrait(
+            width, height, layout=short_layout, caption=caption,
+        )
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
+
+
+def _validate_intuitive_output_font(
+    profile: OutputProfile, captions: tuple[SubtitleCue, ...],
+) -> list[str]:
+    """Preflight the effective font without retaining caption text or paths."""
+    if not profile.caption.enabled or not captions:
+        return []
+    result = validate_font_glyphs(
+        profile.caption.font_name,
+        "".join(cue.text for cue in captions),
+    )
+    if result.warning == "FONT_FALLBACK_REQUIRED":
+        raise gr.Error(
+            "選択した字幕フォントでは一部の文字を表示できません。"
+            "字幕スタイルまたはフォント環境を確認してください。"
+        )
+    if result.warning in {"FONT_NAME_INVALID"}:
+        raise gr.Error("字幕フォントの設定が不正です。")
+    return [result.warning] if result.warning else []
 
 
 def _intuitive_output_preview_path(
     state: dict, captions: tuple[SubtitleCue, ...], *, output_format: str,
     short_layout: str, short_resolution: str, burn_captions: bool,
+    caption_preset: str = "standard", caption_position: str = "bottom",
 ) -> Path:
     plan = edit_plan_from_intuitive(state)
     ranges = [
@@ -3141,6 +3172,8 @@ def _intuitive_output_preview_path(
         "layout": short_layout,
         "resolution": short_resolution,
         "burn": bool(burn_captions),
+        "caption_preset": caption_preset,
+        "caption_position": caption_position,
         "cues": [[cue.start_ms, cue.end_ms, cue.text] for cue in captions],
     }
     digest = hashlib.sha256(
@@ -3151,7 +3184,7 @@ def _intuitive_output_preview_path(
 
 def _render_intuitive_output_profile(
     source: Path, plan, output: Path, *, captions: tuple[SubtitleCue, ...],
-    short_options: ShortVideoOptions | None, timeout_sec: float | None = None,
+    output_profile: OutputProfile, timeout_sec: float | None = None,
 ) -> None:
     """Join kept ranges, then render the exact result timeline into ``output``."""
     output = Path(output)
@@ -3167,14 +3200,15 @@ def _render_intuitive_output_profile(
             duration=ms_to_seconds(plan.source_duration_ms), pad=0.0,
             timeout_sec=timeout_sec,
         )
-        if short_options is not None:
+        if output_profile.canvas_mode != "source":
             render_short_clip(
                 joined, 0.0, duration, output, captions=captions,
-                options=short_options, duration=duration, timeout_sec=timeout_sec,
+                options=output_profile, duration=duration, timeout_sec=timeout_sec,
             )
         else:
             render_captioned_source_clip(
                 joined, 0.0, duration, output, captions=captions,
+                output_profile=output_profile,
                 duration=duration, timeout_sec=timeout_sec,
             )
 
@@ -3182,7 +3216,8 @@ def _render_intuitive_output_profile(
 def preview_intuitive_output(
     state: dict, editor_rows, editor_state, output_format: str = "standard",
     short_layout: str = "blur", short_resolution: str = "1080x1920",
-    burn_captions: bool = False,
+    burn_captions: bool = False, caption_preset: str = "standard",
+    caption_position: str = "bottom",
 ):
     if not state:
         raise gr.Error("先に動画を読み込んでください。")
@@ -3191,12 +3226,15 @@ def preview_intuitive_output(
         captions, caption_kind, warnings = _resolve_intuitive_output_captions(
             state, editor_rows, editor_state, burn_captions=bool(burn_captions),
         )
-        short_options = _intuitive_output_profile(
+        output_profile = _intuitive_output_profile(
             output_format, short_layout, short_resolution, bool(burn_captions),
+            caption_preset, caption_position,
         )
+        warnings.extend(_validate_intuitive_output_font(output_profile, captions))
         output = _intuitive_output_preview_path(
             state, captions, output_format=output_format, short_layout=short_layout,
             short_resolution=short_resolution, burn_captions=bool(burn_captions),
+            caption_preset=caption_preset, caption_position=caption_position,
         )
         if output_format == "standard" and not burn_captions:
             ranges = [
@@ -3216,7 +3254,8 @@ def preview_intuitive_output(
                 output,
                 lambda temporary: _render_intuitive_output_profile(
                     Path(state["video_path"]), plan, temporary, captions=captions,
-                    short_options=short_options, timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+                    output_profile=output_profile,
+                    timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
                 ),
             )
     except (OSError, RuntimeError, ValueError, EditPlanError) as exc:
@@ -3225,6 +3264,8 @@ def preview_intuitive_output(
     if output_format == "short":
         mode += f"（{short_layout} / {short_resolution}）"
     status = f"**出力プレビュー:** {mode}　｜　**{caption_kind}**"
+    if burn_captions:
+        status += f"　｜　字幕: {caption_preset} / {caption_position}"
     if warnings:
         status += f"（時刻警告 {len(warnings)} 件）"
     return gr.update(value=preview, label="③ 出力プレビュー"), status
@@ -3234,7 +3275,8 @@ def save_intuitive_editor(
     state: dict, precise: bool, out_dir: str, filename: str, include_srt: bool = False,
     output_format: str = "standard", short_layout: str = "blur",
     short_resolution: str = "1080x1920", burn_captions: bool = False,
-    editor_rows=None, editor_state=None,
+    editor_rows=None, editor_state=None, caption_preset: str = "standard",
+    caption_position: str = "bottom",
 ):
     if not state:
         raise gr.Error("先に動画を読み込んでください。")
@@ -3278,26 +3320,31 @@ def save_intuitive_editor(
                 captions, subtitle_warnings, _revision = _intuitive_auto_captions(state)
             if include_srt:
                 subtitle_text = _cues_to_srt(captions)
-        short_options = _intuitive_output_profile(
+        output_profile = _intuitive_output_profile(
             output_format, short_layout, short_resolution, bool(burn_captions),
+            caption_preset, caption_position,
+        )
+        subtitle_warnings.extend(
+            _validate_intuitive_output_font(output_profile, captions)
         )
         postprocessor = None
-        if short_options is not None or burn_captions:
+        if output_profile.canvas_mode != "source" or burn_captions:
             def postprocessor(joined: Path, output: Path, result_duration: float) -> None:
-                if short_options is not None:
+                if output_profile.canvas_mode != "source":
                     render_short_clip(
                         joined, 0.0, result_duration, output, captions=captions,
-                        options=short_options, duration=result_duration,
+                        options=output_profile, duration=result_duration,
                     )
                 else:
                     render_captioned_source_clip(
                         joined, 0.0, result_duration, output, captions=captions,
+                        output_profile=output_profile,
                         duration=result_duration,
                     )
         result = save_document(
             state["document_id"], source, output_dir / output_name, bool(precise),
             subtitle_text=subtitle_text, warnings=subtitle_warnings, cutter=cut_clips,
-            postprocessor=postprocessor,
+            postprocessor=postprocessor, output_profile=output_profile,
         )
         saved_path = str(result.video_path.resolve())
     else:
@@ -6497,6 +6544,23 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         intuitive_burn_captions = gr.Checkbox(
                             value=False, label="字幕を動画へ焼き込む",
                         )
+                        with gr.Row():
+                            intuitive_caption_preset = gr.Radio(
+                                choices=[
+                                    ("標準", "standard"),
+                                    ("大きめ", "large"),
+                                    ("背景付き", "boxed"),
+                                ],
+                                value="standard", label="字幕スタイル", scale=2,
+                            )
+                            intuitive_caption_position = gr.Radio(
+                                choices=[
+                                    ("下", "bottom"),
+                                    ("中央", "center"),
+                                    ("上", "top"),
+                                ],
+                                value="bottom", label="字幕位置", scale=2,
+                            )
                         with gr.Accordion("字幕を調整（この出力のみ）", open=True):
                             intuitive_caption_load_btn = gr.Button(
                                 "ASR字幕を読み込む", variant="secondary",
@@ -6828,6 +6892,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_output_format, intuitive_short_layout,
                 intuitive_short_resolution, intuitive_burn_captions,
                 intuitive_caption_table, intuitive_caption_editor_state,
+                intuitive_caption_preset, intuitive_caption_position,
             ],
             outputs=[intuitive_saved_path, intuitive_state, intuitive_toolbar],
             concurrency_id="intuitive-editor-state",
@@ -6839,6 +6904,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 intuitive_state, intuitive_caption_table, intuitive_caption_editor_state,
                 intuitive_output_format, intuitive_short_layout,
                 intuitive_short_resolution, intuitive_burn_captions,
+                intuitive_caption_preset, intuitive_caption_position,
             ],
             outputs=[intuitive_output_preview, intuitive_output_status],
             concurrency_id="intuitive-output-preview-io",

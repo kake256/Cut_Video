@@ -945,6 +945,58 @@ class AppLlmAnalysisTest(unittest.TestCase):
         )
         self.assertNotEqual(first, second)
 
+    def test_intuitive_output_profile_resolves_canvas_and_caption_style(self):
+        source = app._intuitive_output_profile(
+            "standard", "blur", "1080x1920", True, "boxed", "top",
+        )
+        portrait = app._intuitive_output_profile(
+            "short", "crop", "720x1280", True, "large", "center",
+        )
+        self.assertEqual(source.canvas_mode, "source")
+        self.assertEqual(source.caption.preset, "boxed")
+        self.assertEqual(source.caption.position, "top")
+        self.assertEqual(portrait.canvas_mode, "portrait_crop")
+        self.assertEqual((portrait.width, portrait.height), (720, 1280))
+        self.assertEqual(portrait.caption.preset, "large")
+        self.assertEqual(portrait.caption.position, "center")
+
+    def test_intuitive_output_preview_key_changes_for_caption_style(self):
+        state = {
+            "video_id": "vid_synthetic",
+            "video_path": "synthetic.mp4",
+            "duration": 30.0,
+            "overall_start": 0.0,
+            "overall_end": 10.0,
+            "exclusions": [],
+        }
+        standard = app._intuitive_output_preview_path(
+            state, (app.SubtitleCue(0, 500, "字幕", 1),),
+            output_format="short", short_layout="blur",
+            short_resolution="720x1280", burn_captions=True,
+            caption_preset="standard", caption_position="bottom",
+        )
+        boxed = app._intuitive_output_preview_path(
+            state, (app.SubtitleCue(0, 500, "字幕", 1),),
+            output_format="short", short_layout="blur",
+            short_resolution="720x1280", burn_captions=True,
+            caption_preset="boxed", caption_position="top",
+        )
+        self.assertNotEqual(standard, boxed)
+
+    def test_intuitive_output_font_preflight_does_not_expose_caption_text(self):
+        profile = app._intuitive_output_profile(
+            "short", "blur", "720x1280", True,
+        )
+        cue = app.SubtitleCue(0, 500, "private synthetic caption", 1)
+        with patch.object(
+            app,
+            "validate_font_glyphs",
+            return_value=SimpleNamespace(warning="FONT_CHECK_UNAVAILABLE"),
+        ) as validate:
+            warnings = app._validate_intuitive_output_font(profile, (cue,))
+        self.assertEqual(warnings, ["FONT_CHECK_UNAVAILABLE"])
+        self.assertEqual(validate.call_args.args[1], cue.text)
+
     def test_intuitive_output_preview_key_changes_with_caption_renderer(self):
         state = {
             "video_id": "vid_synthetic",

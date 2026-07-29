@@ -345,6 +345,7 @@ def render_captioned_source_clip(
     *,
     captions: Iterable[SubtitleCue],
     caption_profile: CaptionProfile | None = None,
+    output_profile: OutputProfile | None = None,
     duration: float | None = None,
     timeout_sec: float | None = None,
 ) -> Path:
@@ -357,7 +358,16 @@ def render_captioned_source_clip(
     if duration is not None and end_value > float(duration) + 0.001:
         raise ValueError("字幕付き動画の終了時刻が元動画の長さを超えています")
 
-    profile = (caption_profile or CaptionProfile()).validate()
+    if output_profile is not None:
+        render_profile = output_profile.validate()
+        if render_profile.canvas_mode != "source":
+            raise ValueError("source caption renderer requires a source output profile")
+        if caption_profile is not None and caption_profile != render_profile.caption:
+            raise ValueError("caption profile conflicts with the output profile")
+        profile = render_profile.caption
+    else:
+        profile = (caption_profile or CaptionProfile()).validate()
+        render_profile = OutputProfile.source(caption=profile)
     if not profile.enabled:
         raise ValueError("caption profile is disabled")
     prepared = prepare_short_captions(captions, caption_profile=profile)
@@ -380,8 +390,11 @@ def render_captioned_source_clip(
             "-t", f"{end_value - start_value:.3f}",
             "-filter_complex", build_source_caption_filter(),
             "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", render_profile.video_codec,
+            "-preset", render_profile.encoding_preset,
+            "-crf", str(render_profile.crf),
+            "-pix_fmt", render_profile.pixel_format,
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(output_path),
         ]
         try:

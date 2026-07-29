@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -253,6 +254,34 @@ class ShortVideoUnitTests(unittest.TestCase):
             self.assertTrue(output.exists())
             self.assertFalse(list(Path(temporary).glob("cut_video_captioned_*")))
         probe.assert_called_once_with(source.resolve())
+
+    @patch(
+        "moment_retrieval.short_video.probe_video_dimensions",
+        return_value=(640, 360),
+    )
+    @patch("moment_retrieval.short_video.subprocess.run")
+    def test_source_renderer_uses_output_profile_encoding_values(self, run, _probe):
+        def create_output(command, **_kwargs):
+            Path(command[-1]).touch()
+            return subprocess.CompletedProcess(command, 0)
+
+        run.side_effect = create_output
+        profile = replace(
+            OutputProfile.source(caption=CaptionProfile(enabled=True)),
+            crf=24,
+            encoding_preset="fast",
+        ).validate()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "captioned.mp4"
+            render_captioned_source_clip(
+                Path(temporary) / "source.mp4", 0, 1, output,
+                captions=[SubtitleCue(0, 800, "字幕", 1)],
+                output_profile=profile,
+                duration=1,
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-crf") + 1], "24")
+        self.assertEqual(command[command.index("-preset") + 1], "fast")
 
 
 @unittest.skipUnless(

@@ -132,6 +132,7 @@ class ArtifactTransaction:
         cancel_event: threading.Event | None = None,
         cutter: Callable = cut_clips,
         probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+        postprocessor: Callable[[Path, Path, float], None] | None = None,
     ):
         self.output_path = Path(output_path)
         self.source_path = Path(source_path)
@@ -141,6 +142,10 @@ class ArtifactTransaction:
         self.cancel_event = cancel_event or threading.Event()
         self.cutter = cutter
         self.probe = probe
+        # A postprocessor receives a precisely joined result-timeline artifact
+        # (not the original source) and writes the final staging artifact.  This
+        # keeps captions and portrait transforms aligned with multi-range edits.
+        self.postprocessor = postprocessor
 
     def execute(
         self, ticket: SaveTicket, subtitle_text: str | None = None,
@@ -190,13 +195,28 @@ class ArtifactTransaction:
                 [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
                 for item in self.effective_plan.plan.kept_ranges
             ]
+            staged_joined = (
+                staging / f".joined-{self.output_path.name}"
+                if self.postprocessor is not None else staged_video
+            )
             self.cutter(
-                self.source_path, ranges, staged_video, precise=self.precise,
+                self.source_path, ranges, staged_joined, precise=self.precise,
                 duration=ms_to_seconds(self.effective_plan.plan.source_duration_ms),
                 pad=0.0, cancel_event=self.cancel_event,
             )
             if self.cancel_event.is_set():
                 raise SaveError("save was cancelled")
+            if self.postprocessor is not None:
+                try:
+                    self.postprocessor(
+                        staged_joined,
+                        staged_video,
+                        ms_to_seconds(self.effective_plan.timeline_map.result_duration_ms),
+                    )
+                finally:
+                    staged_joined.unlink(missing_ok=True)
+                if self.cancel_event.is_set():
+                    raise SaveError("save was cancelled")
             probed = self.probe(staged_video)
             if probed.duration_ms <= 0 or probed.tolerance_ms < 0:
                 raise SaveError("ARTIFACT_PROBE_FAILED: staged video timing is invalid")
@@ -284,6 +304,7 @@ def save_document(
     documents: DocumentRepository = DOCUMENTS,
     cutter: Callable = cut_clips,
     probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+    postprocessor: Callable[[Path, Path, float], None] | None = None,
     source_fingerprint_resolver: Callable[[str, str], str | None] = (
         _resolve_expected_source_fingerprint
     ),
@@ -301,10 +322,13 @@ def save_document(
     ticket = documents.begin_save(document_id, expected_fingerprint)
     recover_artifact_transactions(Path(output_path).parent)
     effective = make_effective_export_plan(ticket.snapshot, pad_before_ms, pad_after_ms)
-    effective_precise = bool(precise or subtitle_text is not None)
+    # A second rendering pass (caption burn-in / portrait layout) must start
+    # from frame-accurate joined ranges.  The fast stream-copy path remains
+    # available only for the unchanged standard export.
+    effective_precise = bool(precise or subtitle_text is not None or postprocessor is not None)
     transaction = ArtifactTransaction(
         output_path, source_path, effective, effective_precise,
-        expected_fingerprint, cancel_event, cutter, probe,
+        expected_fingerprint, cancel_event, cutter, probe, postprocessor,
     )
     result = transaction.execute(ticket, subtitle_text, warnings)
     documents.complete_save(ticket, result.commit_id)

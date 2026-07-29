@@ -468,6 +468,36 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         )
         self.assertLessEqual(layout["#intuitive-save-bar"]["bottom"], 900)
 
+        output_tab = page.get_by_role("tab", name="③ 出力・字幕", exact=True)
+        output_tab.click()
+        page.get_by_label("選択字幕の本文").wait_for(state="visible")
+        page.get_by_role("button", name="ASR字幕を読み込む", exact=True).wait_for(
+            state="visible"
+        )
+        page.get_by_role("button", name="この字幕を反映", exact=True).wait_for(
+            state="visible"
+        )
+        page.get_by_role("paragraph").filter(
+            has_text="字幕一覧（行をクリックして選択）"
+        ).wait_for(state="visible")
+        page.get_by_role("button", name="ASR字幕を読み込む", exact=True).click()
+        caption_text = page.get_by_label("選択字幕の本文")
+        page.wait_for_function(
+            "(selector) => document.querySelector(selector)?.value.includes('alpha')",
+            arg="#intuitive-output-workspace textarea",
+        )
+        caption_text.fill("edited caption")
+        page.get_by_role("button", name="この字幕を反映", exact=True).click()
+        page.get_by_text(
+            "確認するには「出力プレビューを更新」を押してください。",
+            exact=False,
+        ).wait_for(state="visible")
+        self.assertIn(
+            "edited caption",
+            page.locator("#intuitive-output-workspace").inner_text(),
+        )
+        overall_timeline_tab.click()
+
         def run_editor_command(action):
             revision = int(root.get_attribute("data-revision"))
             action()

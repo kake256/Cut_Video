@@ -161,6 +161,40 @@ class ApplicationSaveTest(unittest.TestCase):
             self.assertTrue(received_precise)
             self.assertTrue(result.subtitle_path.exists())
 
+    def test_postprocessor_receives_precisely_joined_result_timeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            received = {}
+
+            def cutter(_source, ranges, target, **kwargs):
+                received["ranges"] = ranges
+                received["precise"] = kwargs["precise"]
+                Path(target).write_bytes(b"joined")
+
+            def postprocessor(joined, output, duration):
+                received["joined"] = Path(joined).read_bytes()
+                received["duration"] = duration
+                Path(output).write_bytes(b"rendered")
+
+            result = save_document(
+                doc.document_id, source, root / "clip.mp4", False,
+                documents=self.documents, cutter=cutter,
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                postprocessor=postprocessor,
+            )
+
+            self.assertTrue(received["precise"])
+            self.assertEqual(received["ranges"], [[1.0, 4.0], [5.0, 9.0]])
+            self.assertEqual(received["joined"], b"joined")
+            self.assertEqual(received["duration"], 7.0)
+            self.assertEqual(result.video_path.read_bytes(), b"rendered")
+
     def test_duration_mismatch_stops_before_subtitle_or_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -5306,13 +5306,18 @@ def export_highlight_candidates(
     short_captions: bool = False,
     editor_rows=None,
     editor_state=None,
+    export_job_id: str | None = None,
 ):
     """Cut selected/generated candidates locally with atomic final publish."""
     if not _highlight_export_lock.acquire(blocking=False):
         raise gr.Error("別の見どころ候補を保存中です。完了までお待ちください。")
     outputs: list[str] = []
     log_lines: list[str] = []
+    failed_count = 0
+    cancel_event = EXPORT_JOBS.cancel_event(export_job_id) if export_job_id else None
     try:
+        if export_job_id:
+            EXPORT_JOBS.transition(export_job_id, ExportStage.VALIDATING)
         video, candidates = _highlight_export_context(video_choice)
         if export_scope == "selected":
             candidates = [
@@ -5351,95 +5356,154 @@ def export_highlight_candidates(
             )
         else:
             log_lines.append(f"{len(candidates)}件の候補をローカル保存します。")
+        log_lines.append(
+            f"出力予定: {len(candidates)}件 / "
+            f"再エンコード: {'あり' if export_format == 'short' or short_captions or precise else 'なし'}"
+        )
         yield "\n".join(log_lines), outputs
         video_name = str(
             video.get("display_name") or Path(video["path"]).name
         )
         for ordinal, candidate in enumerate(candidates, start=1):
-            start = float(candidate["start_sec"])
-            end = float(candidate["end_sec"])
-            captions = ()
-            subtitle_warnings: list[str] = []
-            if short_captions:
-                try:
+            if cancel_event is not None and cancel_event.is_set():
+                log_lines.append("保存処理を停止しました。未処理の候補は保存していません。")
+                break
+            try:
+                if export_job_id:
+                    EXPORT_JOBS.transition(
+                        export_job_id,
+                        ExportStage.RENDERING,
+                        progress=10 + round(75 * (ordinal - 1) / max(1, len(candidates))),
+                    )
+                start = float(candidate["start_sec"])
+                end = float(candidate["end_sec"])
+                captions = ()
+                subtitle_warnings: list[str] = []
+                if short_captions:
                     edited_captions = _edited_highlight_captions_or_none(
                         video, candidate, editor_rows, editor_state,
                     )
-                except ValueError as exc:
-                    raise gr.Error(str(exc)) from exc
-                if edited_captions is not None:
-                    captions = edited_captions
-                    log_lines.append(
-                        f"{ordinal}/{len(candidates)} 編集済み字幕 {len(captions)} 行を使用します。"
-                    )
-                else:
-                    captions, subtitle_warnings = _highlight_short_captions(
-                        video, candidate,
-                    )
-                if not captions:
-                    log_lines.append(
-                        f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
-                        "字幕なしで生成します。"
-                    )
-            variant = "short" if export_format == "short" else (
-                "字幕付き" if captions else ""
-            )
-            output = _available_highlight_output_path(
-                output_dir,
-                video_name,
-                str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
-                variant=variant,
-            )
-            temporary = output.with_name(
-                f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
-            )
-            claim = output.with_name(f".{output.name}.cut-video-claim")
-            try:
+                    if edited_captions is not None:
+                        captions = edited_captions
+                        log_lines.append(
+                            f"{ordinal}/{len(candidates)} 編集済み字幕 {len(captions)} 行を使用します。"
+                        )
+                    else:
+                        captions, subtitle_warnings = _highlight_short_captions(
+                            video, candidate,
+                        )
+                    if not captions:
+                        log_lines.append(
+                            f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
+                            "字幕なしで生成します。"
+                        )
+                variant = "short" if export_format == "short" else (
+                    "字幕付き" if captions else ""
+                )
+                output = _available_highlight_output_path(
+                    output_dir,
+                    video_name,
+                    str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
+                    variant=variant,
+                )
+                temporary = output.with_name(
+                    f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
+                )
+                claim = output.with_name(f".{output.name}.cut-video-claim")
                 try:
-                    claim.touch(exist_ok=False)
-                except FileExistsError as exc:
-                    raise gr.Error(
-                        "同じ候補の保存処理が競合しました。もう一度実行してください。"
-                    ) from exc
-                if export_format == "short":
-                    render_short_clip(
-                        Path(video["path"]), start, end, temporary,
-                        captions=captions,
-                        options=short_options or ShortVideoOptions(),
-                        duration=float(video.get("duration") or end),
-                    )
-                elif captions:
-                    render_captioned_source_clip(
-                        Path(video["path"]), start, end, temporary,
-                        captions=captions,
-                        duration=float(video.get("duration") or end),
-                    )
-                else:
-                    cut_clip(
-                        Path(video["path"]),
-                        start,
-                        end,
-                        temporary,
-                        pad=0.0,
-                        precise=bool(precise),
-                        duration=float(video.get("duration") or end),
-                    )
-                if subtitle_warnings:
-                    log_lines.append(
-                        f"{ordinal}/{len(candidates)} 字幕時刻の警告: "
-                        f"{len(subtitle_warnings)}件（本文はログに表示しません）"
-                    )
-                _publish_highlight_without_overwrite(temporary, output)
-            finally:
-                temporary.unlink(missing_ok=True)
-                claim.unlink(missing_ok=True)
-            outputs.append(str(output.resolve()))
-            log_lines.append(
-                f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
-            )
+                    try:
+                        claim.touch(exist_ok=False)
+                    except FileExistsError as exc:
+                        raise gr.Error(
+                            "同じ候補の保存処理が競合しました。もう一度実行してください。"
+                        ) from exc
+                    if export_format == "short":
+                        render_short_clip(
+                            Path(video["path"]), start, end, temporary,
+                            captions=captions,
+                            options=short_options or ShortVideoOptions(),
+                            duration=float(video.get("duration") or end),
+                            cancel_event=cancel_event,
+                        )
+                    elif captions:
+                        render_captioned_source_clip(
+                            Path(video["path"]), start, end, temporary,
+                            captions=captions,
+                            duration=float(video.get("duration") or end),
+                            cancel_event=cancel_event,
+                        )
+                    else:
+                        cut_clip(
+                            Path(video["path"]),
+                            start,
+                            end,
+                            temporary,
+                            pad=0.0,
+                            precise=bool(precise),
+                            duration=float(video.get("duration") or end),
+                            cancel_event=cancel_event,
+                        )
+                    if subtitle_warnings:
+                        log_lines.append(
+                            f"{ordinal}/{len(candidates)} 字幕時刻の警告: "
+                            f"{len(subtitle_warnings)}件（本文はログに表示しません）"
+                        )
+                    if export_job_id:
+                        EXPORT_JOBS.transition(
+                            export_job_id, ExportStage.PUBLISHING,
+                            progress=10 + round(75 * ordinal / max(1, len(candidates))),
+                        )
+                    _publish_highlight_without_overwrite(temporary, output)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                    claim.unlink(missing_ok=True)
+                outputs.append(str(output.resolve()))
+                log_lines.append(
+                    f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
+                )
+            except Exception:
+                if cancel_event is not None and cancel_event.is_set():
+                    log_lines.append("保存処理を停止しました。未処理の候補は保存していません。")
+                    break
+                failed_count += 1
+                log_lines.append(
+                    f"{ordinal}/{len(candidates)} 保存失敗 "
+                    "（HIGHLIGHT_ITEM_FAILED。ほかの候補は続行します）"
+                )
             yield "\n".join(log_lines), list(outputs)
+        log_lines.append(
+            f"一括保存結果: 成功 {len(outputs)}件 / 失敗 {failed_count}件 / "
+            f"未処理 {max(0, len(candidates) - len(outputs) - failed_count)}件"
+        )
+        if export_job_id:
+            if cancel_event is not None and cancel_event.is_set():
+                EXPORT_JOBS.acknowledge_cancel(export_job_id)
+            elif failed_count:
+                EXPORT_JOBS.fail(export_job_id, "BATCH_PARTIAL_FAILURE")
+            else:
+                EXPORT_JOBS.complete(export_job_id)
+        yield "\n".join(log_lines), list(outputs)
+    except Exception:
+        if export_job_id:
+            current = EXPORT_JOBS.get(export_job_id)
+            if current is not None and not current.terminal:
+                EXPORT_JOBS.fail(export_job_id, "BATCH_PREPARE_FAILED")
+        raise
     finally:
         _highlight_export_lock.release()
+
+
+def run_highlight_export_job(*args):
+    export_job_id = str(args[-1])
+    for log_text, files in export_highlight_candidates(*args):
+        state = EXPORT_JOBS.get(export_job_id)
+        stop_visible = bool(state is not None and not state.terminal)
+        yield (
+            log_text,
+            files,
+            _intuitive_export_job_status(export_job_id),
+            gr.update(visible=stop_visible, interactive=stop_visible),
+        )
 
 
 def do_existing_highlight_analysis(
@@ -7374,6 +7438,17 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         file_count="multiple",
                         interactive=False,
                     )
+                    highlight_export_job_id = gr.State("")
+                    with gr.Row():
+                        highlight_export_status = gr.Markdown(
+                            "**保存処理:** 待機中",
+                            elem_id="highlight-export-status",
+                        )
+                        highlight_export_stop_btn = gr.Button(
+                            "一括保存を停止", variant="stop", visible=False,
+                            scale=0, min_width=140,
+                            elem_id="highlight-export-stop",
+                        )
                     with gr.Row():
                         highlight_open_saved_btn = gr.Button(
                             "保存したファイルの場所を開く",
@@ -7636,17 +7711,40 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 concurrency_limit=1,
             ).success(fn=None, js=_OPEN_INTUITIVE_MAIN_TAB_JS)
             highlight_export_btn.click(
-                export_highlight_candidates,
+                start_intuitive_export_job,
+                inputs=None,
+                outputs=[
+                    highlight_export_job_id, highlight_export_status,
+                    highlight_export_stop_btn,
+                ],
+                show_progress="hidden",
+            ).then(
+                run_highlight_export_job,
                 inputs=[
                     llm_highlight_video,
                     highlight_candidate_select,
                     highlight_export_scope,
                     highlight_export_dir,
                     highlight_export_precise,
+                    gr.State("standard"), gr.State("blur"),
+                    gr.State("1080x1920"), gr.State(False),
+                    gr.State([]), gr.State({}), highlight_export_job_id,
                 ],
-                outputs=[highlight_export_log, highlight_export_files],
+                outputs=[
+                    highlight_export_log, highlight_export_files,
+                    highlight_export_status, highlight_export_stop_btn,
+                ],
                 concurrency_id="highlight-export-io",
                 concurrency_limit=1,
+                api_name="export_highlight_candidates",
+            )
+            highlight_export_stop_btn.click(
+                cancel_intuitive_export_job,
+                inputs=[highlight_export_job_id],
+                outputs=[highlight_export_status, highlight_export_stop_btn],
+                concurrency_id="highlight-export-control",
+                concurrency_limit=2,
+                show_progress="hidden",
             )
             highlight_open_saved_btn.click(
                 open_saved_highlight_location,

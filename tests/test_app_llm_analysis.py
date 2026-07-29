@@ -120,6 +120,53 @@ class AppLlmAnalysisTest(unittest.TestCase):
             )
             self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
 
+    def test_highlight_batch_keeps_successes_after_one_candidate_fails(self):
+        video = {
+            "path": "synthetic.mp4",
+            "display_name": "synthetic.mp4",
+            "duration": 120.0,
+        }
+        candidates = [
+            {
+                "highlight_candidate_id": "candidate-fail",
+                "start_sec": 10.0,
+                "end_sec": 20.0,
+                "export_title": "失敗候補",
+            },
+            {
+                "highlight_candidate_id": "candidate-ok",
+                "start_sec": 30.0,
+                "end_sec": 40.0,
+                "export_title": "成功候補",
+            },
+        ]
+        job = app.EXPORT_JOBS.create()
+        with tempfile.TemporaryDirectory() as temporary:
+            def fake_cut(_source, start, _end, output, **_kwargs):
+                if start == 10.0:
+                    raise RuntimeError("synthetic private failure detail")
+                Path(output).write_bytes(b"synthetic-video")
+
+            with (
+                patch.object(
+                    app, "_highlight_export_context", return_value=(video, candidates),
+                ),
+                patch.object(app, "cut_clip", side_effect=fake_cut),
+            ):
+                updates = list(app.export_highlight_candidates(
+                    "vid_synthetic", "candidate-fail", "all", temporary, True,
+                    export_job_id=job.job_id,
+                ))
+
+            self.assertEqual(len(updates[-1][1]), 1)
+            self.assertIn("成功 1件 / 失敗 1件", updates[-1][0])
+            self.assertNotIn("private failure detail", updates[-1][0])
+            job_state = app.EXPORT_JOBS.get(job.job_id)
+            self.assertEqual(job_state.stage, app.ExportStage.FAILED)
+            self.assertEqual(job_state.error_code, "BATCH_PARTIAL_FAILURE")
+            self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
+            self.assertFalse(list(Path(temporary).glob("*.cut-video-claim")))
+
     def test_highlight_export_can_render_captioned_short_video(self):
         video = {
             "path": "synthetic.mp4",

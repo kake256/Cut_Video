@@ -10,7 +10,12 @@ from moment_retrieval.export_jobs import ExportJobRegistry, ExportStage
 from moment_retrieval.output_profile import CaptionProfile, OutputProfile
 from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.save_service import (
-    ProbedArtifact, SaveError, recover_artifact_transactions, save_document,
+    ExportVariantRequest,
+    ProbedArtifact,
+    SaveError,
+    recover_artifact_transactions,
+    save_document,
+    save_document_variants,
 )
 
 
@@ -164,6 +169,83 @@ class ApplicationSaveTest(unittest.TestCase):
             state = jobs.get(job.job_id)
             self.assertEqual(state.stage, ExportStage.CANCELLED)
             self.assertFalse(output.exists())
+
+    def test_variant_export_joins_snapshot_once_and_publishes_each_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            join_calls = []
+
+            def join_once(_source, ranges, target, **_kwargs):
+                join_calls.append(tuple(tuple(item) for item in ranges))
+                Path(target).write_bytes(b"joined")
+
+            variants = [
+                ExportVariantRequest(
+                    root / "source-profile.mp4",
+                    OutputProfile.source(caption=CaptionProfile(enabled=False)),
+                ),
+                ExportVariantRequest(
+                    root / "portrait-profile.mp4",
+                    OutputProfile.portrait(
+                        720, 1280,
+                        caption=CaptionProfile(enabled=False),
+                    ),
+                    postprocessor=lambda joined, output, _duration: Path(output).write_bytes(
+                        Path(joined).read_bytes() + b"-portrait"
+                    ),
+                ),
+            ]
+
+            result = save_document_variants(
+                doc.document_id,
+                source,
+                variants,
+                documents=self.documents,
+                cutter=join_once,
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+            )
+
+            self.assertEqual(len(join_calls), 1)
+            self.assertEqual(len(result.results), 2)
+            self.assertEqual(result.failures, ())
+            self.assertTrue((root / "source-profile.mp4").is_file())
+            self.assertTrue((root / "portrait-profile.mp4").is_file())
+            self.assertFalse(list(root.glob(".variant-export-job-*")))
+
+    def test_variant_export_keeps_success_when_another_output_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            conflict = root / "existing.mp4"
+            conflict.write_bytes(b"existing")
+            successful = root / "successful.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            result = save_document_variants(
+                doc.document_id,
+                source,
+                [
+                    ExportVariantRequest(conflict, OutputProfile.source()),
+                    ExportVariantRequest(successful, OutputProfile.source()),
+                ],
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"joined"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+            )
+            self.assertEqual(len(result.results), 1)
+            self.assertEqual(len(result.failures), 1)
+            self.assertEqual(result.failures[0].output_name, "existing.mp4")
+            self.assertEqual(conflict.read_bytes(), b"existing")
+            self.assertTrue(successful.exists())
 
     def test_cancel_before_cut_leaves_no_artifact(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -127,6 +127,27 @@ class SaveResult:
     ticket: SaveTicket
 
 
+@dataclass(frozen=True)
+class ExportVariantRequest:
+    output_path: Path
+    output_profile: OutputProfile
+    subtitle_text: str | None = None
+    warnings: tuple[str, ...] = ()
+    postprocessor: Callable[[Path, Path, float], None] | None = None
+
+
+@dataclass(frozen=True)
+class ExportVariantFailure:
+    output_name: str
+    error_code: str
+
+
+@dataclass(frozen=True)
+class BatchSaveResult:
+    results: tuple[SaveResult, ...]
+    failures: tuple[ExportVariantFailure, ...]
+
+
 class ArtifactTransaction:
     def __init__(
         self, output_path: Path, source_path: Path, effective_plan: EffectiveExportPlan,
@@ -391,6 +412,110 @@ def _export_error_code(exc: Exception) -> str:
     if isinstance(exc, SaveError):
         return "SAVE_FAILED"
     return "EXPORT_FAILED"
+
+
+def save_document_variants(
+    document_id: str,
+    source_path: Path,
+    variants: list[ExportVariantRequest] | tuple[ExportVariantRequest, ...],
+    *,
+    pad_before_ms: int = 0,
+    pad_after_ms: int = 0,
+    cancel_event: threading.Event | None = None,
+    documents: DocumentRepository = DOCUMENTS,
+    cutter: Callable = cut_clips,
+    probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+    source_fingerprint_resolver: Callable[[str, str], str | None] = (
+        _resolve_expected_source_fingerprint
+    ),
+) -> BatchSaveResult:
+    """Join one immutable edit snapshot once, then fan out output profiles.
+
+    Each public artifact still uses its own claim, staging directory, probe and
+    manifest.  A failed variant therefore does not roll back another variant
+    which has already been verified and published.
+    """
+    requested = tuple(variants)
+    if not requested:
+        raise ValueError("at least one export variant is required")
+    document = documents.get(document_id)
+    if not document or document.closed:
+        raise ApplicationError("document is closed or missing")
+    expected_fingerprint = document.expected_source_fingerprint
+    if expected_fingerprint is None:
+        expected_fingerprint = source_fingerprint_resolver(
+            document.public_video_id, document.source_generation,
+        )
+    source_path = Path(source_path)
+    _verify_source(source_path, expected_fingerprint)
+    ticket = documents.begin_save(document_id, expected_fingerprint)
+    effective = make_effective_export_plan(
+        ticket.snapshot, pad_before_ms, pad_after_ms,
+    )
+    if cancel_event is not None and cancel_event.is_set():
+        raise SaveError("save was cancelled")
+    output_parents = {Path(item.output_path).parent for item in requested}
+    for output_parent in output_parents:
+        output_parent.mkdir(parents=True, exist_ok=True)
+        # Recover public artifact transactions before creating the shared
+        # intermediate.  Running recovery inside the fan-out loop could remove
+        # the active batch workspace because both are intentionally hidden.
+        recover_artifact_transactions(output_parent)
+    common_parent = Path(requested[0].output_path).parent
+    results: list[SaveResult] = []
+    failures: list[ExportVariantFailure] = []
+    with tempfile.TemporaryDirectory(
+        prefix=".variant-export-job-", dir=common_parent,
+    ) as temporary_name:
+        joined = Path(temporary_name) / "joined.mp4"
+        ranges = [
+            [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
+            for item in effective.plan.kept_ranges
+        ]
+        cutter(
+            source_path, ranges, joined, precise=True,
+            duration=ms_to_seconds(effective.plan.source_duration_ms),
+            pad=0.0, cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise SaveError("save was cancelled")
+
+        def reuse_joined(
+            _source: Path, _ranges, target: Path, **_kwargs,
+        ) -> Path:
+            shutil.copy2(joined, target)
+            return Path(target)
+
+        for variant in requested:
+            output_path = Path(variant.output_path)
+            try:
+                transaction = ArtifactTransaction(
+                    output_path,
+                    source_path,
+                    effective,
+                    True,
+                    expected_fingerprint,
+                    cancel_event,
+                    reuse_joined,
+                    probe,
+                    variant.postprocessor,
+                    variant.output_profile,
+                )
+                result = transaction.execute(
+                    ticket,
+                    variant.subtitle_text,
+                    list(variant.warnings),
+                )
+                documents.complete_save(ticket, result.commit_id)
+                results.append(result)
+            except Exception as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise
+                failures.append(ExportVariantFailure(
+                    output_path.name,
+                    _export_error_code(exc),
+                ))
+    return BatchSaveResult(tuple(results), tuple(failures))
 
 
 def recover_artifact_transactions(output_root: Path) -> list[Path]:

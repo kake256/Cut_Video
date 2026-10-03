@@ -61,7 +61,7 @@ from moment_retrieval.edit_domain import (
     make_effective_export_plan,
 )
 from moment_retrieval.share import ShareError, export_index, import_index, relink_video
-from moment_retrieval import source_origin
+from moment_retrieval import source_origin, youtube_upload
 from moment_retrieval.vector_index import VectorIndex
 from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
@@ -269,6 +269,79 @@ def open_exported_index_location(export_path_text: str) -> str:
         return "書き出したインデックスを表示しました。"
     _launch_explorer(DEFAULT_INDEX_EXPORT_DIR)
     return "インデックス保存フォルダを開きました。"
+
+
+def _saved_highlight_paths(saved_files, output_dir_text: str) -> list[Path]:
+    """Map the File component's (possibly cached) entries back to saved clips."""
+    root = Path(
+        str(output_dir_text or "").strip() or str(config.ARTIFACT_ROOT / "highlights")
+    ).expanduser()
+    entries = saved_files if isinstance(saved_files, (list, tuple)) else [saved_files]
+    resolved: list[Path] = []
+    for entry in entries:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            raw = entry.get("path") or entry.get("name")
+        else:
+            raw = getattr(entry, "path", None) or getattr(entry, "name", None) or entry
+        try:
+            shown = Path(str(raw)).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        if not shown.is_file():
+            continue
+        try:
+            shown.relative_to(root.resolve())
+            resolved.append(shown)
+            continue
+        except (OSError, ValueError):
+            pass
+        # Gradio serves a cached copy; find the original by name and size.
+        size = shown.stat().st_size
+        matches = [
+            item for item in root.rglob(shown.name)
+            if item.is_file() and item.stat().st_size == size
+        ] if root.is_dir() else []
+        if matches:
+            resolved.append(max(matches, key=lambda item: item.stat().st_mtime))
+    return list(dict.fromkeys(resolved))
+
+
+def upload_saved_highlights_to_youtube(saved_files, output_dir_text: str, confirmed: bool):
+    """Upload just-saved clips as private videos; publishing stays manual."""
+    if confirmed is not True:
+        raise gr.Error("内容と権利（配信者の許可など）を確認してからアップロードしてください。")
+    paths = [
+        path for path in _saved_highlight_paths(saved_files, output_dir_text)
+        if path.suffix.lower() == ".mp4"
+    ]
+    if not paths:
+        raise gr.Error("先に「候補を切り抜いて保存」で動画を保存してください。")
+    problems = youtube_upload.setup_problems()
+    if problems:
+        raise gr.Error(" ".join(problems))
+    log_lines = [f"{len(paths)}件をYouTubeへ非公開でアップロードします。"]
+    yield "\n".join(log_lines)
+    for path in paths:
+        try:
+            for message, _receipt in youtube_upload.upload_private(path):
+                if (
+                    message.startswith("  アップロード中")
+                    and log_lines[-1].startswith("  アップロード中")
+                ):
+                    log_lines[-1] = message
+                else:
+                    log_lines.append(message)
+                yield "\n".join(log_lines)
+        except youtube_upload.UploadError as exc:
+            log_lines.append(f"失敗: {path.name}: {exc}")
+            yield "\n".join(log_lines)
+        except Exception as exc:  # network/API errors must not hide other clips
+            log_lines.append(f"失敗: {path.name}: {type(exc).__name__}: {exc}")
+            yield "\n".join(log_lines)
+    log_lines.append("公開する場合は、YouTube Studioで内容を確認してから公開設定を変更してください。")
+    yield "\n".join(log_lines)
 
 
 def open_saved_highlight_location(saved_files, output_dir_text: str) -> str:
@@ -7813,6 +7886,25 @@ with gr.Blocks(title="動画シーン検索") as demo:
                             scale=1,
                         )
                         highlight_open_saved_status = gr.Markdown("", scale=3)
+                    with gr.Accordion("YouTubeへ非公開アップロード（任意）", open=False):
+                        gr.Markdown(
+                            "上で保存した動画を、あなたのYouTubeチャンネルへ**非公開**で"
+                            "アップロードします。公開はYouTube Studioで確認してから行ってください。"
+                            "タイトル等は投稿用JSONがあればそれを、なければファイル名を使います。"
+                            "初回はブラウザでGoogleアカウントの許可を求められます。"
+                            "準備手順: docs/YOUTUBE_UPLOAD.md"
+                        )
+                        youtube_upload_confirm = gr.Checkbox(
+                            value=False,
+                            label="動画の内容と権利（配信者の許可・ガイドライン）を確認しました",
+                        )
+                        youtube_upload_btn = gr.Button(
+                            "保存した動画をYouTubeへ非公開でアップロード",
+                            variant="secondary",
+                        )
+                        youtube_upload_log = gr.Textbox(
+                            label="アップロードログ", interactive=False, lines=4,
+                        )
             llm_result_reload.click(
                 refresh_llm_video_picker,
                 inputs=[llm_summary_video_filter, llm_result_video],
@@ -8111,6 +8203,13 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 inputs=[highlight_export_files, highlight_export_dir],
                 outputs=[highlight_open_saved_status],
                 show_progress="hidden",
+            )
+            youtube_upload_btn.click(
+                upload_saved_highlights_to_youtube,
+                inputs=[highlight_export_files, highlight_export_dir, youtube_upload_confirm],
+                outputs=[youtube_upload_log],
+                concurrency_id="youtube-upload",
+                concurrency_limit=1,
             )
 
     with gr.Tab("動画保存"):

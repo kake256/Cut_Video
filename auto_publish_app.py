@@ -268,7 +268,35 @@ def auto_jobs_view():
     )
 
 
-def auto_submit(sources: str, agent: str, clip_count, min_sec, max_sec, layout: str, upload: bool):
+def model_choices(agent: str) -> list[tuple[str, str]]:
+    if agent == "claude":
+        return list(agent_runner.CLAUDE_MODELS)
+    return agent_runner.codex_models()
+
+
+def default_model(agent: str) -> str:
+    return agent_runner.DEFAULT_CODEX_MODEL if agent == "codex" else ""
+
+
+def on_agent_change(agent: str):
+    return (
+        gr.update(choices=model_choices(agent), value=default_model(agent)),
+        gr.update(visible=agent == "codex"),
+    )
+
+
+def summary_status() -> str:
+    """One line for the main tab: is everything needed for a run ready?"""
+    youtube = auto_account_status().replace("**YouTube:** ", "")
+    if youtube.startswith("連携中"):
+        youtube_part = f"YouTube: {youtube}"
+    else:
+        youtube_part = "YouTube: 未連携（「設定」タブで連携すると非公開アップロードまで自動。未連携なら書き出しまで）"
+    return f"{youtube_part}　|　AI: {auto_agent_status()}"
+
+
+def auto_submit(sources: str, agent: str, model: str, clip_count, effort: str,
+                min_sec, max_sec, layout: str, upload: bool):
     lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
     if not lines:
         raise gr.Error("切り抜きたい動画のURLかファイルのパスを入力してください。")
@@ -278,6 +306,7 @@ def auto_submit(sources: str, agent: str, clip_count, min_sec, max_sec, layout: 
             job = _auto_pipeline().submit(
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
                 max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                model=model or "", effort=(effort or "") if agent == "codex" else "",
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -309,140 +338,154 @@ def auto_cancel(job_id: str):
 
 with gr.Blocks(title="CUT 自動投稿") as demo:
     gr.Markdown("# CUT 自動投稿")
-    with gr.Column():
-        gr.Markdown(
-            "動画のURL（YouTube / Twitch など）か、動画フォルダ内のファイルを貼り付けると、"
-            "文字起こし → AIによる場面選び → 縦型ショートの書き出し → YouTubeへ**非公開**アップロード"
-            "まで自動で行います。公開は、許可済みチャンネルの動画だけ下の「公開する」で行えます。\n\n"
-            "**注意:** 文字起こしは選んだAI（Codex / Claude）へ送られます。"
-            "他人の配信は、配信者の許可や切り抜きガイドラインを確認したものだけを許可済みにしてください。"
-        )
-        with gr.Accordion("① アカウント連携", open=True):
+    status_md = gr.Markdown("")
+    with gr.Tabs():
+        with gr.Tab("切り抜き"):
+            auto_sources = gr.Textbox(
+                label="動画のURL（YouTube / Twitch）またはファイルのパス　※1行に1つ",
+                lines=2, placeholder="https://www.youtube.com/watch?v=...",
+            )
+            with gr.Row():
+                auto_agent = gr.Radio(
+                    choices=[("Codex", "codex"), ("Claude Code", "claude")], value="codex",
+                    label="見どころを選ぶAI", scale=2,
+                )
+                auto_model = gr.Dropdown(
+                    choices=model_choices("codex"), value=agent_runner.DEFAULT_CODEX_MODEL,
+                    label="モデル", scale=2,
+                )
+                auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="本数", scale=2)
+            with gr.Accordion("詳細設定", open=False):
+                with gr.Row():
+                    auto_effort = gr.Dropdown(
+                        choices=list(agent_runner.EFFORTS), value=agent_runner.DEFAULT_EFFORT,
+                        label="推論の強さ（Codex）",
+                    )
+                    auto_min_sec = gr.Number(value=20, label="最短（秒）")
+                    auto_max_sec = gr.Number(value=60, label="最長（秒）")
+                with gr.Row():
+                    auto_layout = gr.Radio(
+                        choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",
+                    )
+                    auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
+            auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg")
+            gr.Markdown(
+                "<small>文字起こしは選んだAIへ送られます。アップロードは常に**非公開**で、"
+                "公開は下の「公開する」（許可済みの動画のみ）かYouTube Studioで行います。</small>"
+            )
+            gr.Markdown("### ジョブ")
+            with gr.Row():
+                auto_publish_select = gr.Dropdown(choices=[], label="公開する動画", scale=4)
+                auto_publish_btn = gr.Button("公開する", scale=1)
+            auto_jobs_md = gr.Markdown("まだジョブはありません。")
+            with gr.Accordion("実行中のジョブを停止", open=False):
+                with gr.Row():
+                    auto_cancel_select = gr.Dropdown(choices=[], label="実行中のジョブ", scale=4)
+                    auto_cancel_btn = gr.Button("停止", variant="stop", scale=1)
+            auto_timer = gr.Timer(5)
+
+        with gr.Tab("設定"):
+            gr.Markdown("### YouTubeアカウント")
             auto_account_md = gr.Markdown("")
             auto_agents_md = gr.Markdown("")
-            with gr.Accordion("Google Cloudの準備（初回のみ・gcloudで自動化）", open=False):
-                gcp_status_md = gr.Markdown("")
-                gr.Markdown(
-                    "Googleへのログイン、CUT用プロジェクトの作成、YouTube Data API v3 の有効化を自動で行います。"
-                    "同意画面とOAuthクライアントはGoogleの仕様上自動化できないため、設定ページを開きます。"
-                    "YouTube Data APIは無料枠で使え、課金の設定は不要です。"
-                )
-                with gr.Row():
-                    gcp_login_btn = gr.Button("1. Googleにログイン")
-                    gcp_confirm = gr.Checkbox(
-                        value=False,
-                        label="ログイン中のGoogleアカウントにCUT用のプロジェクトを作成することに同意します",
-                    )
-                    gcp_create_btn = gr.Button("2. プロジェクト作成とAPI有効化")
-                    gcp_pages_btn = gr.Button("3. 設定ページを開く")
-                with gr.Row():
-                    gcp_code = gr.Textbox(label="確認コード（ログイン後にブラウザに表示されたもの）", type="password", scale=3)
-                    gcp_code_btn = gr.Button("コードを送信", scale=1)
-                gcp_result_md = gr.Markdown("")
-            with gr.Accordion("配布用: OAuthクライアントをアプリに同梱（他の人に使ってもらう場合）", open=False):
-                gr.Markdown(
-                    "読み込んだ自分のOAuthクライアントをアプリフォルダに同梱します。"
-                    "同梱したCUTを受け取った人は、Google Cloudの作業なしで「YouTubeアカウントを連携」だけで使えます。"
-                    "投稿先は各自のチャンネルで、ログイン情報（トークン）は各自のPCにだけ保存されます。"
-                )
-                bundle_btn = gr.Button("このクライアントをアプリに同梱する")
-                bundle_md = gr.Markdown("")
             auto_client_file = gr.File(
                 label="OAuthクライアントJSON（Google Cloudからダウンロードしたもの）",
-                file_types=[".json"], type="filepath",
+                file_types=[".json"], type="filepath", height=120,
             )
             with gr.Row():
                 auto_connect_btn = gr.Button("YouTubeアカウントを連携", variant="primary")
                 auto_disconnect_btn = gr.Button("連携を解除")
                 auto_account_refresh_btn = gr.Button("状態を更新")
-        with gr.Accordion("② 公開許可（チャンネル全体／この動画のみ）", open=False):
-            auto_channels_df = gr.Dataframe(
-                headers=["許可範囲", "名前・動画タイトル", "ID", "元チャンネル", "許可の根拠", "登録日"],
-                value=[], interactive=False, wrap=True,
-            )
-            with gr.Row():
-                auto_channel_scope = gr.Radio(choices=[("この動画のみ", "video"), ("チャンネル全体", "channel")], value="video", label="許可範囲", scale=2)
-                auto_channel_url = gr.Textbox(label="動画またはチャンネルのURL", scale=3)
-                auto_channel_note = gr.Textbox(
-                    label="許可の根拠（例: 配信者のガイドラインURL、許可をもらった日時）", scale=3,
+            with gr.Accordion("Google Cloudの準備（初回のみ）", open=False):
+                gcp_status_md = gr.Markdown("")
+                gr.Markdown(
+                    "ログイン、CUT用プロジェクトの作成、YouTube Data API v3 の有効化を自動で行います。"
+                    "同意画面とOAuthクライアントはGoogleの仕様上自動化できないため、設定ページを開きます。"
                 )
-                auto_channel_add_btn = gr.Button("追加", scale=1)
-            with gr.Row():
-                auto_channel_remove = gr.Dropdown(choices=[], label="削除する許可", scale=3)
-                auto_channel_remove_btn = gr.Button("削除", scale=1)
-            with gr.Row():
-                auto_limit = gr.Number(
-                    value=channel_policy.DEFAULT_DAILY_LIMIT, precision=0,
-                    label="1日の公開上限（本）", scale=1,
+                with gr.Row():
+                    gcp_login_btn = gr.Button("1. Googleにログイン")
+                    gcp_create_btn = gr.Button("2. プロジェクト作成とAPI有効化")
+                    gcp_pages_btn = gr.Button("3. 設定ページを開く")
+                gcp_confirm = gr.Checkbox(
+                    value=False,
+                    label="ログイン中のGoogleアカウントにCUT用のプロジェクトを作成することに同意します（2の前に）",
                 )
-                auto_limit_btn = gr.Button("上限を保存", scale=1)
-                auto_limit_md = gr.Markdown("", scale=2)
-        with gr.Accordion("③ 切り抜きたい動画", open=True):
-            auto_sources = gr.Textbox(
-                label="URLかファイルのパス（1行に1つ、最大10件）", lines=3,
-                placeholder="https://www.youtube.com/watch?v=...\nhttps://www.twitch.tv/videos/...",
-            )
-            with gr.Row():
-                auto_agent = gr.Radio(
-                    choices=[("Codex", "codex"), ("Claude Code", "claude")],
-                    value="codex", label="場面を選ぶAI",
+                with gr.Row():
+                    gcp_code = gr.Textbox(label="確認コード（1のログイン後にブラウザに表示されたもの）",
+                                          type="password", scale=4)
+                    gcp_code_btn = gr.Button("コードを送信", scale=1)
+                gcp_result_md = gr.Markdown("")
+            with gr.Accordion("公開の許可（チャンネル全体／この動画のみ）", open=False):
+                auto_channels_df = gr.Dataframe(
+                    headers=["許可範囲", "名前・動画タイトル", "ID", "元チャンネル", "許可の根拠", "登録日"],
+                    value=[], interactive=False, wrap=True,
                 )
-                auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="切り抜き本数")
-                auto_layout = gr.Radio(
-                    choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",
+                with gr.Row():
+                    auto_channel_scope = gr.Radio(
+                        choices=[("この動画のみ", "video"), ("チャンネル全体", "channel")],
+                        value="video", label="許可範囲", scale=2,
+                    )
+                    auto_channel_url = gr.Textbox(label="動画またはチャンネルのURL", scale=3)
+                    auto_channel_note = gr.Textbox(label="許可の根拠（例: 配信者のガイドラインURL）", scale=3)
+                    auto_channel_add_btn = gr.Button("追加", scale=1)
+                with gr.Row():
+                    auto_channel_remove = gr.Dropdown(choices=[], label="削除する許可", scale=3)
+                    auto_channel_remove_btn = gr.Button("削除", scale=1)
+                    auto_limit = gr.Number(
+                        value=channel_policy.DEFAULT_DAILY_LIMIT, precision=0, label="1日の公開上限（本）", scale=1,
+                    )
+                    auto_limit_btn = gr.Button("上限を保存", scale=1)
+                auto_limit_md = gr.Markdown("")
+            with gr.Accordion("配布用: OAuthクライアントをアプリに同梱", open=False):
+                gr.Markdown(
+                    "自分のOAuthクライアントをアプリフォルダに同梱すると、このフォルダを受け取った人は"
+                    "Google Cloudの作業なしで「YouTubeアカウントを連携」だけで使えます。"
                 )
-            with gr.Row():
-                auto_min_sec = gr.Number(value=20, label="最短（秒）")
-                auto_max_sec = gr.Number(value=60, label="最長（秒）")
-                auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
-            auto_start_btn = gr.Button("自動切り抜きを開始", variant="primary")
-        with gr.Accordion("④ ジョブ一覧", open=True):
-            with gr.Row():
-                auto_publish_select = gr.Dropdown(choices=[], label="公開する動画", scale=3)
-                auto_publish_btn = gr.Button("公開する", variant="primary", scale=1)
-            with gr.Row():
-                auto_cancel_select = gr.Dropdown(choices=[], label="実行中のジョブ", scale=3)
-                auto_cancel_btn = gr.Button("停止", variant="stop", scale=1)
-            auto_jobs_md = gr.Markdown("まだジョブはありません。")
-            auto_timer = gr.Timer(5)
+                bundle_btn = gr.Button("このクライアントをアプリに同梱する")
+                bundle_md = gr.Markdown("")
 
-        auto_job_outputs = [auto_jobs_md, auto_publish_select, auto_cancel_select]
-        demo.load(auto_account_status, outputs=[auto_account_md])
-        demo.load(auto_agent_status, outputs=[auto_agents_md])
-        demo.load(auto_channel_rows, outputs=[auto_channels_df])
-        demo.load(lambda: gr.update(choices=auto_channel_choices()), outputs=[auto_channel_remove])
-        demo.load(lambda: channel_policy.settings()["daily_limit"], outputs=[auto_limit])
-        demo.load(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
-        auto_timer.tick(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
-        auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
-        demo.load(gcp_status, outputs=[gcp_status_md])
-        gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
-        gcp_code_btn.click(gcp_submit_code, inputs=[gcp_code], outputs=[gcp_status_md, gcp_code],
-                           concurrency_id="gcp-setup")
-        gcp_create_btn.click(gcp_create_project, inputs=[gcp_confirm], outputs=[gcp_result_md],
-                             concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
-        gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
-        bundle_btn.click(bundle_client, outputs=[bundle_md])
-        auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md], concurrency_id="youtube-account")
-        auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md])
-        auto_account_refresh_btn.click(auto_account_status, outputs=[auto_account_md])
-        auto_channel_add_btn.click(
-            auto_add_allowlist, inputs=[auto_channel_url, auto_channel_note, auto_channel_scope],
-            outputs=[auto_channels_df, auto_channel_remove, auto_channel_url, auto_channel_note],
-        )
-        auto_channel_remove_btn.click(
-            auto_remove_channel, inputs=[auto_channel_remove],
-            outputs=[auto_channels_df, auto_channel_remove],
-        )
-        auto_limit_btn.click(auto_save_limit, inputs=[auto_limit], outputs=[auto_limit_md])
-        auto_start_btn.click(
-            auto_submit,
-            inputs=[auto_sources, auto_agent, auto_clip_count, auto_min_sec, auto_max_sec, auto_layout, auto_upload],
-            outputs=[auto_sources, *auto_job_outputs],
-        )
-        auto_publish_btn.click(auto_publish, inputs=[auto_publish_select], outputs=auto_job_outputs,
-                               concurrency_id="youtube-publish", concurrency_limit=1)
-        auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
+    auto_job_outputs = [auto_jobs_md, auto_publish_select, auto_cancel_select]
+    demo.load(summary_status, outputs=[status_md])
+    demo.load(auto_account_status, outputs=[auto_account_md])
+    demo.load(auto_agent_status, outputs=[auto_agents_md])
+    demo.load(auto_channel_rows, outputs=[auto_channels_df])
+    demo.load(lambda: gr.update(choices=auto_channel_choices()), outputs=[auto_channel_remove])
+    demo.load(lambda: channel_policy.settings()["daily_limit"], outputs=[auto_limit])
+    demo.load(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
+    demo.load(gcp_status, outputs=[gcp_status_md])
+    auto_timer.tick(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
+    auto_agent.change(on_agent_change, inputs=[auto_agent], outputs=[auto_model, auto_effort])
+    auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
+    gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
+    gcp_code_btn.click(gcp_submit_code, inputs=[gcp_code], outputs=[gcp_status_md, gcp_code],
+                       concurrency_id="gcp-setup")
+    gcp_create_btn.click(gcp_create_project, inputs=[gcp_confirm], outputs=[gcp_result_md],
+                         concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
+    gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
+    bundle_btn.click(bundle_client, outputs=[bundle_md])
+    auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md],
+                           concurrency_id="youtube-account").then(summary_status, outputs=[status_md])
+    auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md]).then(
+        summary_status, outputs=[status_md])
+    auto_account_refresh_btn.click(auto_account_status, outputs=[auto_account_md]).then(
+        summary_status, outputs=[status_md])
+    auto_channel_add_btn.click(
+        auto_add_allowlist, inputs=[auto_channel_url, auto_channel_note, auto_channel_scope],
+        outputs=[auto_channels_df, auto_channel_remove, auto_channel_url, auto_channel_note],
+    )
+    auto_channel_remove_btn.click(
+        auto_remove_channel, inputs=[auto_channel_remove], outputs=[auto_channels_df, auto_channel_remove],
+    )
+    auto_limit_btn.click(auto_save_limit, inputs=[auto_limit], outputs=[auto_limit_md])
+    auto_start_btn.click(
+        auto_submit,
+        inputs=[auto_sources, auto_agent, auto_model, auto_clip_count, auto_effort,
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+        outputs=[auto_sources, *auto_job_outputs],
+    )
+    auto_publish_btn.click(auto_publish, inputs=[auto_publish_select], outputs=auto_job_outputs,
+                           concurrency_id="youtube-publish", concurrency_limit=1)
+    auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
 
 
 def _port_in_use(port: int) -> bool:

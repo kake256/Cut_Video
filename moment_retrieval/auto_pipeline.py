@@ -45,6 +45,8 @@ class AutoJob:
     max_duration_sec: float = 60.0
     layout: str = "blur"
     upload: bool = True
+    model: str = ""
+    effort: str = ""
     state: str = "queued"
     step: str = ""
     log: list[str] = field(default_factory=list)
@@ -134,9 +136,14 @@ class AutoPipeline:
             raise Cancelled()
 
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
-               max_duration_sec: float = 60.0, layout: str = "blur", upload: bool = True) -> AutoJob:
+               max_duration_sec: float = 60.0, layout: str = "blur", upload: bool = True,
+               model: str = "", effort: str = "") -> AutoJob:
         if agent not in agent_runner.AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
+        try:
+            model, effort = agent_runner.validate_model(agent, model, effort)
+        except agent_runner.AgentError as exc:
+            raise PipelineError(str(exc)) from exc
         if not 1 <= int(clip_count) <= 10:
             raise PipelineError("切り抜き本数は1〜10本で指定してください。")
         if not 5 <= float(min_duration_sec) <= float(max_duration_sec) <= 180:
@@ -147,6 +154,7 @@ class AutoPipeline:
             job_id="auto_" + secrets.token_hex(6), source=validate_source(source), agent=agent,
             clip_count=int(clip_count), min_duration_sec=float(min_duration_sec),
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
+            model=model, effort=effort,
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -333,7 +341,8 @@ class AutoPipeline:
     def _select(self, job: AutoJob) -> str:
         before = self._latest_run_id(job.video_id)
         label = agent_runner.AGENT_LABELS[job.agent]
-        self._log(job, f"{label} に文字起こしを渡して候補を選んでもらいます。")
+        detail = " / ".join(item for item in (job.model, job.effort) if item)
+        self._log(job, f"{label}{f'（{detail}）' if detail else ''} に文字起こしを渡して候補を選んでもらいます。")
 
         def register(process):
             with self.lock:
@@ -343,6 +352,8 @@ class AutoPipeline:
             job.agent,
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec),
             register_process=register,
+            model=job.model,
+            effort=job.effort,
         )
         self._check_cancel(job)
         after = self._latest_run_id(job.video_id)

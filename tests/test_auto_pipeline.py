@@ -95,6 +95,18 @@ class AgentRunnerTest(unittest.TestCase):
         self.assertEqual(command[-1], "-")
         self.assertIn('mcp_servers.cut_auto.default_tools_approval_mode="approve"', command)
 
+    def test_model_and_effort_apply_to_this_run_only(self):
+        codex = agent_runner.build_command("codex", "codex.exe", Path("."), model="gpt-6-luna", effort="high")
+        self.assertEqual(codex[codex.index("-m") + 1], "gpt-6-luna")
+        self.assertIn('model_reasoning_effort="high"', codex)
+        with tempfile.TemporaryDirectory() as tmp:
+            claude = agent_runner.build_command("claude", "claude", Path(tmp), model="opus")
+        self.assertEqual(claude[-2:], ["--model", "opus"])
+        for agent, model, effort in (("codex", "bad model", ""), ("codex", "", "extreme"), ("claude", "", "high")):
+            with self.subTest(model=model, effort=effort), self.assertRaises(agent_runner.AgentError):
+                agent_runner.validate_model(agent, model, effort)
+        self.assertIn(agent_runner.DEFAULT_CODEX_MODEL, [slug for _name, slug in agent_runner.codex_models()])
+
     def test_prompt_carries_the_request(self):
         prompt = agent_runner.ClipRequest("vid_x", 4, 15, 45).prompt()
         self.assertIn("vid_x", prompt)

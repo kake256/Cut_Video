@@ -17,7 +17,7 @@ os.chdir(Path(__file__).resolve().parent)
 
 import gradio as gr  # noqa: E402
 
-from moment_retrieval import agent_runner, channel_policy, youtube_upload  # noqa: E402
+from moment_retrieval import agent_runner, channel_policy, gcloud_setup, youtube_upload  # noqa: E402
 from moment_retrieval.auto_pipeline import AutoPipeline, PipelineError  # noqa: E402
 
 APP_PORT = int(os.environ.get("CUT_AUTO_PUBLISH_PORT", "7870"))
@@ -49,6 +49,54 @@ def auto_account_status() -> str:
     if channel is None:
         return "**YouTube:** 未連携です。「YouTubeアカウントを連携」を押してください。"
     return f"**YouTube:** 連携中 — {html.escape(str(channel.get('title') or channel.get('id')))}"
+
+
+def gcp_status() -> str:
+    if not gcloud_setup.find_gcloud():
+        return "**Google Cloud:** gcloud（Google Cloud SDK）が見つかりません。手作業の手順は docs/YOUTUBE_UPLOAD.md を参照してください。"
+    try:
+        account = gcloud_setup.active_account()
+    except gcloud_setup.SetupError as exc:
+        return f"**Google Cloud:** {exc}"
+    project = gcloud_setup.saved_project()
+    lines = [f"**Google Cloud:** ログイン中のアカウント: {html.escape(account or '未ログイン')}"]
+    lines.append(f"CUT用プロジェクト: {html.escape(project) if project else '未作成'}")
+    return " / ".join(lines)
+
+
+def gcp_login() -> str:
+    try:
+        gcloud_setup.login()
+    except gcloud_setup.SetupError as exc:
+        return f"**Google Cloud:** {exc}"
+    return gcp_status()
+
+
+def gcp_create_project(confirmed: bool) -> str:
+    if confirmed is not True:
+        return "**Google Cloud:** プロジェクトの作成に同意するチェックを入れてください。"
+    try:
+        result = gcloud_setup.create_project_and_enable_api()
+    except gcloud_setup.SetupError as exc:
+        return f"**Google Cloud:** {exc}"
+    action = "作成し" if result["created"] else "既存のものを使い"
+    return (
+        f"**Google Cloud:** プロジェクト {html.escape(result['project_id'])} を{action}、"
+        "YouTube Data API v3 を有効にしました。次に「設定ページを開く」を押してください。"
+    )
+
+
+def gcp_open_pages() -> str:
+    project = gcloud_setup.saved_project()
+    if not project:
+        return "**Google Cloud:** 先にプロジェクトを作成してください。"
+    pages = gcloud_setup.open_console_pages(project)
+    steps = "\n".join(f"{index}. [{label}]({url})" for index, (label, url) in enumerate(pages, start=1))
+    return (
+        "ブラウザで次のページを開きました。上から順に設定してください。\n\n" + steps + "\n\n"
+        "1ではアプリ名（例: CUT）とメールを入力、2では対象を「外部」にして自分のGoogleアカウントをテストユーザーに追加、"
+        "3では種類「デスクトップアプリ」でクライアントを作成し、JSONをダウンロードして下の欄で読み込みます。"
+    )
 
 
 def auto_install_client_secret(uploaded) -> str:
@@ -220,6 +268,22 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         with gr.Accordion("① アカウント連携", open=True):
             auto_account_md = gr.Markdown("")
             auto_agents_md = gr.Markdown("")
+            with gr.Accordion("Google Cloudの準備（初回のみ・gcloudで自動化）", open=False):
+                gcp_status_md = gr.Markdown("")
+                gr.Markdown(
+                    "Googleへのログイン、CUT用プロジェクトの作成、YouTube Data API v3 の有効化を自動で行います。"
+                    "同意画面とOAuthクライアントはGoogleの仕様上自動化できないため、設定ページを開きます。"
+                    "YouTube Data APIは無料枠で使え、課金の設定は不要です。"
+                )
+                with gr.Row():
+                    gcp_login_btn = gr.Button("1. Googleにログイン")
+                    gcp_confirm = gr.Checkbox(
+                        value=False,
+                        label="ログイン中のGoogleアカウントにCUT用のプロジェクトを作成することに同意します",
+                    )
+                    gcp_create_btn = gr.Button("2. プロジェクト作成とAPI有効化")
+                    gcp_pages_btn = gr.Button("3. 設定ページを開く")
+                gcp_result_md = gr.Markdown("")
             auto_client_file = gr.File(
                 label="OAuthクライアントJSON（Google Cloudからダウンロードしたもの）",
                 file_types=[".json"], type="filepath",
@@ -287,6 +351,11 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         demo.load(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
         auto_timer.tick(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
         auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
+        demo.load(gcp_status, outputs=[gcp_status_md])
+        gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
+        gcp_create_btn.click(gcp_create_project, inputs=[gcp_confirm], outputs=[gcp_result_md],
+                             concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
+        gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
         auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md], concurrency_id="youtube-account")
         auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md])
         auto_account_refresh_btn.click(auto_account_status, outputs=[auto_account_md])

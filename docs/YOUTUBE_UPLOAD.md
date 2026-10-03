@@ -5,6 +5,14 @@ CUTで保存した切り抜き動画を、あなた自身のYouTubeチャンネ�
 
 ## 一度だけ行う準備（あなたの操作が必要です）
 
+**かんたんな方法（Google Cloud SDK が入っている場合）:** 自動投稿アプリ（`start_auto_publish.bat`）の
+「① アカウント連携 → Google Cloudの準備」で、ログイン・プロジェクト作成・YouTube Data API v3 の有効化を
+ボタンで行えます。プロジェクトの作成は同意のチェックを入れたときだけ実行されます。
+その後「3. 設定ページを開く」で開くページで、下の手順3〜5（同意画面、テストユーザー、OAuthクライアント）を行ってください。
+作成したプロジェクトIDは `data/youtube_gcp_project.json` に記録されます。
+
+**手作業で行う場合:**
+
 1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成します。
 2. 「APIとサービス」→「ライブラリ」で **YouTube Data API v3** を有効にします。
 3. 「OAuth同意画面」を設定します。

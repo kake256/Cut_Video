@@ -1,10 +1,10 @@
-"""Which source channels may be published, and how often.
+"""Which source channels or individual videos may be published, and how often.
 
-Every automatic upload is private.  Only clips whose source channel the user
-explicitly registered (with a note on why it is allowed) offer a one-click
-"publish" in the GUI, limited per day.  Everything else, including local
-files, stays private.  State lives as small JSON files under the private
-library directory.
+Every automatic upload is private. Only clips whose source channel, or exact
+source video, the user explicitly registered (with a note on why it is
+allowed) offer a one-click "publish" in the GUI, limited per day. Everything
+else, including local files, stays private. State lives as small JSON files
+under the private library directory.
 """
 from __future__ import annotations
 
@@ -21,10 +21,16 @@ from . import config
 
 DEFAULT_DAILY_LIMIT = 3
 _KEY = re.compile(r"^(youtube|twitch):[A-Za-z0-9_.@-]{2,100}$")
+_VIDEO_KEY = re.compile(r"^(youtube|twitch-video):[A-Za-z0-9_-]{2,100}$")
 
 
 def _channels_path() -> Path:
     return config.LIBRARY_ROOT / "auto_publish_channels.json"
+
+
+def _videos_path() -> Path:
+    """Keep narrowly scoped permissions separate from legacy channel records."""
+    return config.LIBRARY_ROOT / "auto_publish_videos.json"
 
 
 def _settings_path() -> Path:
@@ -56,6 +62,15 @@ class SourceChannel:
     url: str
 
 
+@dataclass(frozen=True)
+class SourceVideo:
+    """A single source video and the channel yt-dlp says uploaded it."""
+    key: str
+    channel_key: str
+    title: str
+    url: str
+
+
 def channel_from_info(info: dict) -> SourceChannel | None:
     """Derive the uploading channel from yt-dlp metadata, if it has one."""
     extractor = str(info.get("extractor_key") or info.get("extractor") or "").lower()
@@ -78,6 +93,35 @@ def channel_from_info(info: dict) -> SourceChannel | None:
             f"https://www.twitch.tv/{login}",
         )
     return None
+
+
+def video_from_info(info: dict) -> SourceVideo | None:
+    """Derive a stable identity for one supported source video from yt-dlp metadata."""
+    # A playlist ID is not a video ID. Be conservative if a caller supplies
+    # playlist metadata even when yt-dlp's noplaylist option was requested.
+    if info.get("_type") in {"playlist", "multi_video"} or info.get("entries"):
+        return None
+    channel = channel_from_info(info)
+    if channel is None:
+        return None
+    extractor = str(info.get("extractor_key") or info.get("extractor") or "").lower()
+    video_id = str(info.get("id") or "")
+    if not video_id:
+        return None
+    if extractor.startswith("youtube"):
+        key = f"youtube:{video_id}"
+    elif extractor.startswith("twitch"):
+        key = f"twitch-video:{video_id}"
+    else:
+        return None
+    if not _VIDEO_KEY.fullmatch(key):
+        return None
+    return SourceVideo(
+        key=key,
+        channel_key=channel.key,
+        title=str(info.get("title") or video_id),
+        url=str(info.get("webpage_url") or info.get("original_url") or ""),
+    )
 
 
 _TWITCH_LOGIN = re.compile(r"^https://(?:www\.|m\.)?twitch\.tv/([A-Za-z0-9_]{3,25})(?:/videos)?/?$")
@@ -112,6 +156,27 @@ def resolve_channel(url: str, *, extract: Callable | None = None) -> SourceChann
     return channel
 
 
+def resolve_video(url: str, *, extract: Callable | None = None) -> SourceVideo:
+    """Resolve a supplied *single-video* URL without broadening it to its channel."""
+    url = str(url or "").strip()
+    if not url.lower().startswith("https://"):
+        raise ValueError("動画のURL（https://）を入力してください。")
+    if extract is None:
+        from yt_dlp import YoutubeDL
+
+        def extract(target):
+            with YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
+                            "js_runtimes": {"deno": {}, "node": {}}}) as ydl:
+                return ydl.extract_info(target, download=False)
+    info = extract(url) or {}
+    video = video_from_info(info)
+    if video is None:
+        raise ValueError("このURLからYouTube/Twitchの動画を特定できませんでした。動画ページのURLを入力してください。")
+    # Preserve a canonical URL when yt-dlp does not provide one, but never use
+    # it as identity: the extractor's video id is the policy key.
+    return SourceVideo(video.key, video.channel_key, video.title, video.url or url)
+
+
 def list_channels() -> list[dict]:
     value = _read(_channels_path(), [])
     return value if isinstance(value, list) else []
@@ -141,8 +206,45 @@ def remove_channel(key: str) -> bool:
     return len(kept) != len(channels)
 
 
-def is_allowed(channel: SourceChannel | None) -> bool:
-    return channel is not None and any(item.get("key") == channel.key for item in list_channels())
+def list_videos() -> list[dict]:
+    value = _read(_videos_path(), [])
+    return value if isinstance(value, list) else []
+
+
+def add_video(video: SourceVideo, permission_note: str) -> dict:
+    note = str(permission_note or "").strip()
+    if not note:
+        raise ValueError("許可の根拠（配信者の許可・ガイドラインなど）を入力してください。")
+    if not _VIDEO_KEY.fullmatch(video.key) or not _KEY.fullmatch(video.channel_key):
+        raise ValueError("動画または元チャンネルを特定できませんでした。")
+    videos = [item for item in list_videos() if item.get("key") != video.key]
+    entry = {
+        "key": video.key, "channel_key": video.channel_key, "title": video.title,
+        "url": video.url, "permission_note": note[:500],
+        "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    videos.append(entry)
+    _write(_videos_path(), videos)
+    return entry
+
+
+def remove_video(key: str) -> bool:
+    videos = list_videos()
+    kept = [item for item in videos if item.get("key") != key]
+    _write(_videos_path(), kept)
+    return len(kept) != len(videos)
+
+
+def is_allowed(channel: SourceChannel | None, video: SourceVideo | None = None) -> bool:
+    """Return true for a legacy channel permission or an exact video+channel pair."""
+    if channel is None:
+        return False
+    if any(item.get("key") == channel.key for item in list_channels()):
+        return True
+    return video is not None and any(
+        item.get("key") == video.key and item.get("channel_key") == channel.key
+        for item in list_videos()
+    )
 
 
 def settings() -> dict:
@@ -173,12 +275,17 @@ def record_publication(video_id: str, channel_key: str, now: float | None = None
     _write(_log_path(), [item for item in log if now - float(item.get("at", 0)) < 30 * 86400])
 
 
-def can_publish(channel_key: str | None) -> tuple[bool, str]:
-    """Whether the GUI may offer one-click publishing for a clip from this channel."""
+def can_publish(channel_key: str | None, video_key: str | None = None) -> tuple[bool, str]:
+    """Whether the GUI may publish this source; video permissions are exact."""
     if not channel_key:
         return False, "元動画のチャンネルが不明なため公開できません（非公開のまま）"
-    if not any(item.get("key") == channel_key for item in list_channels()):
-        return False, "許可済みチャンネルではないため公開できません（非公開のまま）"
+    channel_allowed = any(item.get("key") == channel_key for item in list_channels())
+    video_allowed = bool(video_key) and any(
+        item.get("key") == video_key and item.get("channel_key") == channel_key
+        for item in list_videos()
+    )
+    if not channel_allowed and not video_allowed:
+        return False, "許可済みチャンネルまたはこの動画の許可がないため公開できません（非公開のまま）"
     if published_in_last_day() >= settings()["daily_limit"]:
         return False, "1日の公開上限に達しています"
     return True, "公開できます"

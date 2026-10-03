@@ -55,6 +55,7 @@ class AutoJob:
     outputs: list[str] = field(default_factory=list)
     uploads: list[dict] = field(default_factory=list)
     source_channel_key: str = ""
+    source_video_key: str = ""
 
 
 def _jobs_dir() -> Path:
@@ -197,6 +198,9 @@ class AutoPipeline:
             if channel is not None:
                 job.source_channel = f"{channel.name}（{channel.key}）"
                 job.source_channel_key = channel.key
+            video = channel_policy.video_from_info(info or {}) if info else None
+            if video is not None:
+                job.source_video_key = video.key
             if local_path is None:
                 local_path = self.steps["download"](job)
             self._check_cancel(job)
@@ -239,7 +243,8 @@ class AutoPipeline:
                         "js_runtimes": {"deno": {}, "node": {}}}) as ydl:
             info = ydl.extract_info(job.source, download=False)
         channel = channel_policy.channel_from_info(info or {})
-        allowed = channel_policy.is_allowed(channel)
+        video = channel_policy.video_from_info(info or {})
+        allowed = channel_policy.is_allowed(channel, video)
         self._log(job, f"動画: {info.get('title', '')} / チャンネル: "
                        f"{channel.name if channel else '不明'}（{'許可済み' if allowed else '未許可'}）")
         return info, channel, None
@@ -385,7 +390,7 @@ class AutoPipeline:
                 receipt = result or receipt
             if receipt:
                 job.uploads.append({**receipt, "file": Path(output).name})
-        allowed, reason = channel_policy.can_publish(job.source_channel_key)
+        allowed, reason = channel_policy.can_publish(job.source_channel_key, job.source_video_key)
         self._log(job, "非公開でアップロードしました。" + (
             "ジョブ一覧の「公開する」で公開できます。" if allowed else reason
         ))
@@ -402,7 +407,7 @@ class AutoPipeline:
             raise PipelineError("公開する動画が見つかりません。")
         if upload.get("privacy_status") == "public":
             raise PipelineError("この動画は公開済みです。")
-        allowed, reason = channel_policy.can_publish(job.source_channel_key)
+        allowed, reason = channel_policy.can_publish(job.source_channel_key, job.source_video_key)
         if not allowed:
             raise PipelineError(reason)
         result = youtube_upload.publish(youtube_video_id)

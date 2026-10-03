@@ -9,6 +9,7 @@ user's own OAuth flow.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,8 +34,35 @@ class UploadError(RuntimeError):
     pass
 
 
+BUNDLED_CLIENT_ENV = "CUT_YOUTUBE_CLIENT_FILE"
+
+
 def client_secret_path() -> Path:
+    """The user's own OAuth client (loaded from the GUI); takes precedence."""
     return config.LIBRARY_ROOT / "youtube_client_secret.json"
+
+
+def bundled_client_path() -> Path:
+    """OAuth client shipped with a distributed copy of CUT (never committed to git)."""
+    override = os.environ.get(BUNDLED_CLIENT_ENV, "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[1] / "youtube_oauth_client.json"
+
+
+def active_client_path() -> Path | None:
+    for path in (client_secret_path(), bundled_client_path()):
+        if path.is_file():
+            return path
+    return None
+
+
+def client_source() -> str | None:
+    """"own" when the user loaded a client, "bundled" when the app ships one."""
+    path = active_client_path()
+    if path is None:
+        return None
+    return "own" if path == client_secret_path() else "bundled"
 
 
 def token_path() -> Path:
@@ -53,10 +81,10 @@ def setup_problems() -> list[str]:
         import google_auth_oauthlib  # noqa: F401
     except ImportError:
         problems.append("必要なライブラリが未インストールです（requirements.txt を入れ直してください）。")
-    if not client_secret_path().is_file():
+    if active_client_path() is None:
         problems.append(
-            f"OAuthクライアントのJSONを {client_secret_path()} に置いてください"
-            "（手順は docs/YOUTUBE_UPLOAD.md）。"
+            "OAuthクライアントがありません。配布されたCUTなら同梱ファイル（youtube_oauth_client.json）を"
+            "配布元に確認するか、自分で作成したJSONを読み込んでください（手順は docs/YOUTUBE_UPLOAD.md）。"
         )
     return problems
 
@@ -128,9 +156,10 @@ def load_credentials(*, interactive: bool = True):
     if not creds or not creds.valid:
         if not interactive:
             raise UploadError("YouTubeへのログインが必要です。")
-        if not client_secret_path().is_file():
+        client_path = active_client_path()
+        if client_path is None:
             raise UploadError("OAuthクライアントのJSONが見つかりません。")
-        flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path()), SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(str(client_path), SCOPES)
         creds = flow.run_local_server(port=0, open_browser=True)
     token_path().parent.mkdir(parents=True, exist_ok=True)
     token_path().write_text(creds.to_json(), encoding="utf-8")
@@ -167,8 +196,7 @@ def connect_account() -> dict | None:
     return connected_channel()
 
 
-def install_client_secret(source: Path) -> None:
-    """Validate a downloaded OAuth client JSON (desktop app) and store it privately."""
+def _validated_client(source: Path) -> dict:
     try:
         data = json.loads(Path(source).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -178,8 +206,28 @@ def install_client_secret(source: Path) -> None:
     installed = data.get("installed") if isinstance(data, dict) else None
     if not isinstance(installed, dict) or not installed.get("client_id") or not installed.get("client_secret"):
         raise UploadError("OAuthクライアント（デスクトップアプリ）のJSONではありません。")
+    return data
+
+
+def install_client_secret(source: Path) -> None:
+    """Validate a downloaded OAuth client JSON (desktop app) and store it privately."""
+    data = _validated_client(source)
     client_secret_path().parent.mkdir(parents=True, exist_ok=True)
     client_secret_path().write_text(json.dumps(data), encoding="utf-8")
+
+
+def bundle_own_client() -> Path:
+    """Ship the user's own client with this copy of CUT so others only need to sign in.
+
+    The file is git-ignored; distribute it with the app folder, never via a public repository.
+    """
+    if not client_secret_path().is_file():
+        raise UploadError("先に自分のOAuthクライアントJSONを読み込んでください。")
+    data = _validated_client(client_secret_path())
+    target = bundled_client_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data), encoding="utf-8")
+    return target
 
 
 def disconnect_account() -> bool:

@@ -46,9 +46,28 @@ def auto_account_status() -> str:
         channel = youtube_upload.connected_channel()
     except Exception as exc:  # expired/revoked tokens must not break the tab
         return f"**YouTube:** 連携を確認できませんでした（{type(exc).__name__}）。連携し直してください。"
+    source = "（アプリ同梱のクライアントを使用）" if youtube_upload.client_source() == "bundled" else ""
     if channel is None:
-        return "**YouTube:** 未連携です。「YouTubeアカウントを連携」を押してください。"
-    return f"**YouTube:** 連携中 — {html.escape(str(channel.get('title') or channel.get('id')))}"
+        return f"**YouTube:** 未連携です。「YouTubeアカウントを連携」を押してください。{source}"
+    return f"**YouTube:** 連携中 — {html.escape(str(channel.get('title') or channel.get('id')))}{source}"
+
+
+def bundle_client() -> str:
+    try:
+        target = youtube_upload.bundle_own_client()
+    except youtube_upload.UploadError as exc:
+        return f"**配布用:** {exc}"
+    project = gcloud_setup.saved_project()
+    audience = (
+        f"[テストユーザーの管理ページ](https://console.cloud.google.com/auth/audience?project={project})"
+        if project else "Google Cloud Consoleの「対象」ページ"
+    )
+    return (
+        f"**配布用:** クライアントを `{html.escape(target.name)}` としてアプリフォルダに同梱しました。"
+        "このフォルダごと渡せば、相手は「YouTubeアカウントを連携」だけで使えます。"
+        f"審査前は、使う人のGoogleアカウントを{audience}でテストユーザー（最大100人）に追加してください。"
+        "このファイルは公開リポジトリ（GitHub）には載せないでください（.gitignore済み）。"
+    )
 
 
 def gcp_status() -> str:
@@ -138,33 +157,52 @@ def auto_agent_status() -> str:
 
 
 def auto_channel_rows() -> list[list[str]]:
-    return [
-        [item.get("name", ""), item.get("key", ""), item.get("permission_note", ""),
-         str(item.get("added_at", ""))[:10]]
-        for item in channel_policy.list_channels()
-    ]
+    """Show broad channel permissions and narrow single-video permissions separately."""
+    channels = [["チャンネル全体", item.get("name", ""), item.get("key", ""), "", item.get("permission_note", ""), str(item.get("added_at", ""))[:10]] for item in channel_policy.list_channels()]
+    videos = [["この動画のみ", item.get("title", ""), item.get("key", ""), item.get("channel_key", ""), item.get("permission_note", ""), str(item.get("added_at", ""))[:10]] for item in channel_policy.list_videos()]
+    return channels + videos
 
 
 def auto_channel_choices() -> list[tuple[str, str]]:
-    return [(f"{item.get('name')}（{item.get('key')}）", item.get("key")) for item in channel_policy.list_channels()]
+    channels = [(f"チャンネル全体: {item.get('name')}（{item.get('key')}）", f"channel|{item.get('key')}") for item in channel_policy.list_channels()]
+    videos = [(f"この動画のみ: {item.get('title')}（{item.get('key')}）", f"video|{item.get('key')}") for item in channel_policy.list_videos()]
+    return channels + videos
 
 
 def auto_add_channel(url: str, note: str):
+    return auto_add_allowlist(url, note, "channel")
+
+
+def auto_add_allowlist(url: str, note: str, scope: str):
     try:
-        channel = channel_policy.resolve_channel(url)
-        channel_policy.add_channel(channel, note)
+        if scope == "video":
+            video = channel_policy.resolve_video(url)
+            channel_policy.add_video(video, note)
+            message = f"この動画だけを許可しました: {video.title}"
+        else:
+            channel = channel_policy.resolve_channel(url)
+            channel_policy.add_channel(channel, note)
+            message = f"許可済みチャンネルに追加しました: {channel.name}"
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
     except Exception as exc:
-        raise gr.Error(f"チャンネル情報を取得できませんでした: {exc}") from exc
-    gr.Info(f"許可済みチャンネルに追加しました: {channel.name}")
+        raise gr.Error(f"許可情報を取得できませんでした: {exc}") from exc
+    gr.Info(message)
     return auto_channel_rows(), gr.update(choices=auto_channel_choices(), value=None), "", ""
 
 
 def auto_remove_channel(key: str):
     if not key:
-        raise gr.Error("削除するチャンネルを選択してください。")
-    channel_policy.remove_channel(key)
+        raise gr.Error("削除する許可を選択してください。")
+    scope, separator, policy_key = key.partition("|")
+    if not separator or not policy_key:
+        raise gr.Error("削除する許可を選択してください。")
+    if scope == "channel":
+        channel_policy.remove_channel(policy_key)
+    elif scope == "video":
+        channel_policy.remove_video(policy_key)
+    else:
+        raise gr.Error("削除する許可を選択してください。")
     return auto_channel_rows(), gr.update(choices=auto_channel_choices(), value=None)
 
 
@@ -188,13 +226,15 @@ def auto_jobs_view():
     parts = []
     publishable: list[tuple[str, str]] = []
     for job in jobs:
-        allowed, reason = channel_policy.can_publish(job.source_channel_key)
+        allowed, reason = channel_policy.can_publish(job.source_channel_key, job.source_video_key)
         state = _AUTO_STATE_LABELS.get(job.state, job.state)
         step = f" / {job.step}" if job.state == "running" and job.step else ""
         parts.append(f"### {html.escape(job.job_id)} — {state}{html.escape(step)}")
         parts.append(f"- 元動画: {html.escape(job.source)}")
         if job.source_channel:
             parts.append(f"- チャンネル: {html.escape(job.source_channel)}")
+        if job.source_video_key:
+            parts.append(f"- 動画ID: {html.escape(job.source_video_key)}")
         for upload in job.uploads:
             status = "公開中" if upload.get("privacy_status") == "public" else "非公開"
             link = upload.get("watch_url") or upload.get("studio_url")
@@ -284,6 +324,14 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     gcp_create_btn = gr.Button("2. プロジェクト作成とAPI有効化")
                     gcp_pages_btn = gr.Button("3. 設定ページを開く")
                 gcp_result_md = gr.Markdown("")
+            with gr.Accordion("配布用: OAuthクライアントをアプリに同梱（他の人に使ってもらう場合）", open=False):
+                gr.Markdown(
+                    "読み込んだ自分のOAuthクライアントをアプリフォルダに同梱します。"
+                    "同梱したCUTを受け取った人は、Google Cloudの作業なしで「YouTubeアカウントを連携」だけで使えます。"
+                    "投稿先は各自のチャンネルで、ログイン情報（トークン）は各自のPCにだけ保存されます。"
+                )
+                bundle_btn = gr.Button("このクライアントをアプリに同梱する")
+                bundle_md = gr.Markdown("")
             auto_client_file = gr.File(
                 label="OAuthクライアントJSON（Google Cloudからダウンロードしたもの）",
                 file_types=[".json"], type="filepath",
@@ -292,19 +340,20 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 auto_connect_btn = gr.Button("YouTubeアカウントを連携", variant="primary")
                 auto_disconnect_btn = gr.Button("連携を解除")
                 auto_account_refresh_btn = gr.Button("状態を更新")
-        with gr.Accordion("② 許可済みチャンネル（公開してよい配信者）", open=False):
+        with gr.Accordion("② 公開許可（チャンネル全体／この動画のみ）", open=False):
             auto_channels_df = gr.Dataframe(
-                headers=["チャンネル", "ID", "許可の根拠", "登録日"],
+                headers=["許可範囲", "名前・動画タイトル", "ID", "元チャンネル", "許可の根拠", "登録日"],
                 value=[], interactive=False, wrap=True,
             )
             with gr.Row():
-                auto_channel_url = gr.Textbox(label="チャンネルか動画のURL", scale=3)
+                auto_channel_scope = gr.Radio(choices=[("この動画のみ", "video"), ("チャンネル全体", "channel")], value="video", label="許可範囲", scale=2)
+                auto_channel_url = gr.Textbox(label="動画またはチャンネルのURL", scale=3)
                 auto_channel_note = gr.Textbox(
                     label="許可の根拠（例: 配信者のガイドラインURL、許可をもらった日時）", scale=3,
                 )
                 auto_channel_add_btn = gr.Button("追加", scale=1)
             with gr.Row():
-                auto_channel_remove = gr.Dropdown(choices=[], label="削除するチャンネル", scale=3)
+                auto_channel_remove = gr.Dropdown(choices=[], label="削除する許可", scale=3)
                 auto_channel_remove_btn = gr.Button("削除", scale=1)
             with gr.Row():
                 auto_limit = gr.Number(
@@ -356,11 +405,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         gcp_create_btn.click(gcp_create_project, inputs=[gcp_confirm], outputs=[gcp_result_md],
                              concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
         gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
+        bundle_btn.click(bundle_client, outputs=[bundle_md])
         auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md], concurrency_id="youtube-account")
         auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md])
         auto_account_refresh_btn.click(auto_account_status, outputs=[auto_account_md])
         auto_channel_add_btn.click(
-            auto_add_channel, inputs=[auto_channel_url, auto_channel_note],
+            auto_add_allowlist, inputs=[auto_channel_url, auto_channel_note, auto_channel_scope],
             outputs=[auto_channels_df, auto_channel_remove, auto_channel_url, auto_channel_note],
         )
         auto_channel_remove_btn.click(

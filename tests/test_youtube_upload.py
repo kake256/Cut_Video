@@ -93,10 +93,27 @@ class YouTubeUploadTest(unittest.TestCase):
         with self.assertRaises(youtube_upload.UploadError):
             list(youtube_upload.upload_private(other, service_factory=_Service))
 
-    def test_setup_reports_missing_client_secret_location(self):
-        with patch.object(config, "LIBRARY_ROOT", self.root):
+    def test_setup_reports_missing_client(self):
+        with patch.object(config, "LIBRARY_ROOT", self.root), \
+                patch.dict("os.environ", {youtube_upload.BUNDLED_CLIENT_ENV: str(self.root / "none.json")}):
             problems = youtube_upload.setup_problems()
-        self.assertTrue(any("youtube_client_secret.json" in item for item in problems))
+        self.assertTrue(any("youtube_oauth_client.json" in item for item in problems))
+
+    def test_bundled_client_is_used_until_the_user_loads_their_own(self):
+        bundled = self.root / "bundle" / "youtube_oauth_client.json"
+        own = self.root / "own.json"
+        own.write_text(json.dumps({"installed": {"client_id": "a", "client_secret": "b"}}), encoding="utf-8")
+        with patch.object(config, "LIBRARY_ROOT", self.root / "lib"), \
+                patch.dict("os.environ", {youtube_upload.BUNDLED_CLIENT_ENV: str(bundled)}):
+            self.assertIsNone(youtube_upload.client_source())
+            with self.assertRaises(youtube_upload.UploadError):
+                youtube_upload.bundle_own_client()
+            youtube_upload.install_client_secret(own)
+            self.assertEqual(youtube_upload.bundle_own_client(), bundled)
+            youtube_upload.client_secret_path().unlink()
+            self.assertEqual(youtube_upload.client_source(), "bundled")
+            self.assertEqual(youtube_upload.active_client_path(), bundled)
+            self.assertEqual(youtube_upload.setup_problems(), [])
 
 
 

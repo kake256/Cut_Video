@@ -32,3 +32,6 @@ Thumbs.db
 .DS_Store
 *.lnk
 .claude/settings.local.json
+
+# OAuth client bundled into a distributed copy of CUT (do not publish)
+youtube_oauth_client.json

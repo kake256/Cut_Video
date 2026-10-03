@@ -93,8 +93,12 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
         if msg:
             msg_queue.put(msg)
 
+    # YouTube's EJS challenges need a JS runtime. yt-dlp enables only Deno
+    # by default; also allow a supported Node.js already installed on PATH.
+    # Runtime availability/version checks remain owned by yt-dlp.
+    runtime_options = {"js_runtimes": {"deno": {}, "node": {}}}
     try:
-        with YoutubeDL({"noplaylist": True, "quiet": True}) as ydl:
+        with YoutubeDL({"noplaylist": True, "quiet": True, **runtime_options}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         raise DownloadError(f"動画情報の取得に失敗しました: {e}")
@@ -107,6 +111,7 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
         return
 
     ydl_opts = {
+        **runtime_options,
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "outtmpl": str(save_dir / f"{basename}.%(ext)s"),

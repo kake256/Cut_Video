@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -74,6 +75,7 @@ class AppLlmAnalysisTest(unittest.TestCase):
             "path": "synthetic.mp4",
             "display_name": "synthetic:source.mp4",
             "duration": 120.0,
+            "public_video_id": "vid_0123456789abcdef0123456789abcdef",
         }
         candidates = [
             {
@@ -119,7 +121,13 @@ class AppLlmAnalysisTest(unittest.TestCase):
                     "synthetic_source_本題：詳しい説明.mp4",
                 ],
             )
-            self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
+            self.assertEqual(
+                {Path(path).parent for path in saved},
+                {(
+                    Path(temporary) / "synthetic_source__vid_0123456789ab"
+                ).resolve()},
+            )
+            self.assertFalse(list(Path(temporary).rglob("*.partial.mp4")))
 
     def test_highlight_batch_keeps_successes_after_one_candidate_fails(self):
         video = {
@@ -165,8 +173,8 @@ class AppLlmAnalysisTest(unittest.TestCase):
             job_state = app.EXPORT_JOBS.get(job.job_id)
             self.assertEqual(job_state.stage, app.ExportStage.FAILED)
             self.assertEqual(job_state.error_code, "BATCH_PARTIAL_FAILURE")
-            self.assertFalse(list(Path(temporary).glob("*.partial.mp4")))
-            self.assertFalse(list(Path(temporary).glob("*.cut-video-claim")))
+            self.assertFalse(list(Path(temporary).rglob("*.partial.mp4")))
+            self.assertFalse(list(Path(temporary).rglob("*.cut-video-claim")))
 
     def test_highlight_export_can_write_reviewable_metadata_sidecar(self):
         video = {
@@ -209,6 +217,8 @@ class AppLlmAnalysisTest(unittest.TestCase):
             self.assertTrue(payload["requires_review"])
             self.assertNotIn("private transcript", raw)
             self.assertNotIn(video["path"], raw)
+            self.assertEqual(sidecar.parent, video_path.parent)
+            self.assertNotEqual(video_path.parent, Path(temporary).resolve())
 
     def test_highlight_export_can_render_captioned_short_video(self):
         video = {
@@ -360,6 +370,44 @@ class AppLlmAnalysisTest(unittest.TestCase):
             ),
             "_CON",
         )
+
+    def test_highlight_video_output_directories_use_distinct_public_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = {
+                "path": r"C:\private\first.mp4",
+                "display_name": "My Video.mp4",
+                "public_video_id": "vid_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }
+            second = {
+                **first,
+                "public_video_id": "vid_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            }
+
+            first_dir = app._highlight_video_output_directory(root, first)
+            second_dir = app._highlight_video_output_directory(root, second)
+
+        self.assertEqual(first_dir.name, "My Video__vid_aaaaaaaaaaaa")
+        self.assertEqual(second_dir.name, "My Video__vid_bbbbbbbbbbbb")
+        self.assertNotEqual(first_dir, second_dir)
+
+    def test_highlight_video_output_directory_fallback_is_deterministic_and_private(self):
+        private_path = r"C:\private\sensitive\source.mp4"
+        video = {
+            "path": private_path,
+            "display_name": "Readable source.mp4",
+        }
+        expected_id = "vid_" + hashlib.sha256(
+            private_path.encode("utf-8")
+        ).hexdigest()[:12]
+
+        first = app._highlight_video_output_directory(Path("root"), video)
+        second = app._highlight_video_output_directory(Path("root"), video)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.name, f"Readable source__{expected_id}")
+        self.assertNotIn(private_path, str(first))
+        self.assertNotIn("sensitive", first.name)
 
     def test_highlight_export_uses_source_chapter_title(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -3457,8 +3457,8 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(
             [child["id"] for child in workspace["children"]],
             [
-                components_by_elem_id["intuitive-preview-panel"]["id"],
-                components_by_elem_id["intuitive-search-panel"]["id"],
+                components_by_elem_id["intuitive-search-panel" if app_module.UI_STUDIO else "intuitive-preview-panel"]["id"],
+                components_by_elem_id["intuitive-preview-panel" if app_module.UI_STUDIO else "intuitive-search-panel"]["id"],
                 components_by_elem_id["intuitive-transcript-panel"]["id"],
             ],
         )

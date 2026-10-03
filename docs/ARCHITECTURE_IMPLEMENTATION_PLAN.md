@@ -725,6 +725,19 @@ LLMへ自由な時刻を生成させない。候補はTranscript revisionとanal
 別run/tableへ保存し、Edit planや成果物へ自動反映しない。採用判断はsegment根拠・尺・重複の
 機械検証と、ローカルでの候補preview評価を分けて行う。
 
+### 14.1 公開YouTube字幕のCodex連携（独立した任意adapter）
+
+2026-09-26の利用者依頼による追加。既存のUI/backend ownerを置換しない。
+`cut_mcp.py`はstdio上のinitialize/ping/toolsだけを持つ読み取り中心のMCP adapterとし、
+`moment_retrieval/youtube_captions.py`のUI非依存DTO・取得処理を利用する。
+既存依存関係を更新しないため、MCPのこの限定された契約は標準ライブラリで実装する。
+HTTP公開、SDK追加、認証機構変更、OpenAI API呼び出しは行わない。
+
+Library store・Search generation・application document repositoryへ接続せず、
+public字幕の有効期限付きメモリだけを所有する。これはASRの代替公開経路ではなく、
+ダウンロード前の内容確認用adapterである。将来のローカル編集MCPは別の承認・設計とし、
+既存documentのprocess-local状態やsingle-writer規則をこの実装で迂回しない。
+
 ## 15. 各フェーズ共通の完了条件
 
 - `data/`、`video/`、`clips/`、`exports/`、private transcriptを読まない・commitしない。

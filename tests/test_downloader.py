@@ -24,9 +24,11 @@ class _FakeYoutubeDL:
     download_error = None
     metadata_calls = 0
     download_calls = 0
+    options_seen = []
 
     def __init__(self, options):
         self.options = options
+        type(self).options_seen.append(options)
 
     def __enter__(self):
         return self
@@ -67,6 +69,7 @@ class DownloaderCharacterizationTests(unittest.TestCase):
         _FakeYoutubeDL.download_error = None
         _FakeYoutubeDL.metadata_calls = 0
         _FakeYoutubeDL.download_calls = 0
+        _FakeYoutubeDL.options_seen = []
         self._yt_dlp = types.ModuleType("yt_dlp")
         self._yt_dlp.YoutubeDL = _FakeYoutubeDL
 
@@ -116,6 +119,10 @@ class DownloaderCharacterizationTests(unittest.TestCase):
             self.assertEqual(completed[0].read_bytes(), b"synthetic download")
             self.assertEqual(_FakeYoutubeDL.metadata_calls, 1)
             self.assertEqual(_FakeYoutubeDL.download_calls, 1)
+            self.assertEqual(
+                [options["js_runtimes"] for options in _FakeYoutubeDL.options_seen],
+                [{"deno": {}, "node": {}}, {"deno": {}, "node": {}}],
+            )
 
     def test_existing_output_is_reused_without_starting_download_worker(self):
         with tempfile.TemporaryDirectory(prefix="cut_downloader_test_") as root:

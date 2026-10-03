@@ -83,7 +83,7 @@ from moment_retrieval.short_video import (
     render_captioned_source_clip,
     render_short_clip,
 )
-from moment_retrieval.ui_assets import _APP_CSS, _INTUITIVE_EDITOR_JS
+from moment_retrieval.ui_assets import _APP_CSS, _INTUITIVE_EDITOR_JS, UI_STUDIO
 from moment_retrieval.transcript_types import parse_segment
 
 PREVIEW_DIR = config.CACHE_ROOT / "previews"
@@ -5005,6 +5005,36 @@ def _safe_highlight_filename_part(
     return sanitized
 
 
+def _highlight_video_output_directory(output_root: Path, video: dict) -> Path:
+    """Return the stable per-video directory below the highlight output root."""
+    video_name = str(
+        video.get("display_name") or Path(str(video.get("path") or "")).name
+    )
+    safe_video_name = _safe_highlight_filename_part(
+        Path(video_name).stem,
+        fallback="動画",
+        max_length=64,
+    )
+
+    public_video_id = str(video.get("public_video_id") or "").strip()
+    stable_id = public_video_id or str(video.get("video_id") or "").strip()
+    if not stable_id:
+        private_path = str(video.get("path") or "")
+        stable_id = "vid_" + hashlib.sha256(
+            private_path.encode("utf-8")
+        ).hexdigest()[:12]
+    elif public_video_id and re.fullmatch(
+        r"vid_[0-9a-f]{32}", public_video_id, flags=re.IGNORECASE
+    ):
+        stable_id = "vid_" + public_video_id[4:16].lower()
+    safe_id = _safe_highlight_filename_part(
+        stable_id,
+        fallback="vid_unknown",
+        max_length=64,
+    )
+    return output_root / f"{safe_video_name}__{safe_id}"
+
+
 def _available_highlight_output_path(
     output_dir: Path, video_name: str, chapter_title: str, *, variant: str = ""
 ) -> Path:
@@ -5470,6 +5500,8 @@ def export_highlight_candidates(
             or str(config.ARTIFACT_ROOT / "highlights")
         )
         output_dir.mkdir(parents=True, exist_ok=True)
+        video_output_dir = _highlight_video_output_directory(output_dir, video)
+        video_output_dir.mkdir(parents=True, exist_ok=True)
         if export_format not in {"standard", "short"}:
             raise gr.Error("出力形式を選択してください。")
         short_options = None
@@ -5538,7 +5570,7 @@ def export_highlight_candidates(
                     "字幕付き" if captions else ""
                 )
                 output = _available_highlight_output_path(
-                    output_dir,
+                    video_output_dir,
                     video_name,
                     str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
                     variant=variant,
@@ -6554,6 +6586,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         "検索・編集・切り抜き",
         id="intuitive-main",
         elem_id="intuitive-editor-tab",
+        elem_classes=["studio-layout"] if UI_STUDIO else None,
     ):
         intuitive_state = gr.State(None)
         # An initially open Accordion does not emit an expand event.
@@ -6640,19 +6673,34 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     elem_id="intuitive-return-source",
                 )
 
+        if UI_STUDIO:
+            gr.HTML(
+                '<div class="studio-workspace-heading"><p>検索結果を確認し、プレビューと文字起こしで境界を決めます。</p>'
+                '<a href="#intuitive-save-bar">保存へ移動</a></div>'
+                '<details id="studio-layout-controls"><summary>レイアウトを調整</summary>'
+                '<div class="studio-layout-fields">'
+                '<label>左右の順序<select name="order"><option value="normal">検索・プレビュー・文字起こし</option><option value="reverse-sides">文字起こし・プレビュー・検索</option></select></label>'
+                '<label>検索幅<input name="search" type="range" min="20" max="32" step="1"><output data-for="search">24</output>%</label>'
+                '<label>文字起こし幅<input name="transcript" type="range" min="20" max="32" step="1"><output data-for="transcript">28</output>%</label>'
+                '<label>パネル高<input name="height" type="range" min="300" max="440" step="10"><output data-for="height">360</output>px</label>'
+                '<button type="button" data-studio-reset>初期値に戻す</button></div></details>',
+            )
         with gr.Row(equal_height=True, elem_id="intuitive-workspace-row"):
-            with gr.Column(
-                scale=5, min_width=480, elem_id="intuitive-preview-panel",
-            ):
-                intuitive_preview = gr.Video(
-                    label="1. 動画プレビュー（Source timeline）",
-                    autoplay=False,
-                    interactive=False,
-                    height=320,
-                    elem_id="intuitive-preview-video",
-                )
+            if not UI_STUDIO:
+                with gr.Column(
+                    scale=5, min_width=480, elem_id="intuitive-preview-panel",
+                    elem_classes=["studio-panel"] if UI_STUDIO else None,
+                ):
+                    intuitive_preview = gr.Video(
+                        label="1. 動画プレビュー（Source timeline）",
+                        autoplay=False,
+                        interactive=False,
+                        height=320,
+                        elem_id="intuitive-preview-video",
+                    )
             with gr.Column(
                 scale=4, min_width=400, elem_id="intuitive-search-panel",
+                elem_classes=["studio-panel"] if UI_STUDIO else None,
             ):
                 gr.Markdown(
                     "**2. 文字クエリー検索**",
@@ -6687,9 +6735,22 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "検索すると、文字一致を先に表示し、意味検索結果を後から追加します。",
                     elem_id="intuitive-search-status",
                 )
+            if UI_STUDIO:
+                with gr.Column(
+                    scale=5, min_width=480, elem_id="intuitive-preview-panel",
+                    elem_classes=["studio-panel"] if UI_STUDIO else None,
+                ):
+                    intuitive_preview = gr.Video(
+                        label="1. 動画プレビュー（Source timeline）",
+                        autoplay=False,
+                        interactive=False,
+                        height=320,
+                        elem_id="intuitive-preview-video",
+                    )
             with gr.Column(
                 scale=3, min_width=280,
                 elem_id="intuitive-transcript-panel",
+                elem_classes=["studio-panel"] if UI_STUDIO else None,
             ):
                 intuitive_toolbar = gr.HTML(
                     '<div class="intuitive-toolbox"><strong>3. 文字起こし編集</strong>'
@@ -7624,7 +7685,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     with gr.Row():
                         highlight_export_dir = gr.Textbox(
                             value=str(config.ARTIFACT_ROOT / "highlights"),
-                            label="保存先フォルダ",
+                            label="保存先ルート（動画ごとにサブフォルダを作成）",
                             scale=3,
                         )
                         highlight_export_precise = gr.Checkbox(

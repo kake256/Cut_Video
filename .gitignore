@@ -24,6 +24,9 @@ credentials*.json
 *.vindex.zip
 benchmark-results/
 
+# Local source-only UI snapshots (never include user media or indexes)
+.ui-backups/
+
 # OS
 Thumbs.db
 .DS_Store

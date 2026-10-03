@@ -2,7 +2,9 @@
 
 自然言語クエリ(例: 「奨学金について話しているところ」)で動画内の該当シーンを検索し、
 プレビューで確認しながら区間を調整してmp4に切り抜けるローカルツールです。
-文字起こし・埋め込み・検索・切り抜きのすべてがローカルで完結します(外部APIは使いません)。
+通常の文字起こし・埋め込み・検索・切り抜きはローカルで完結します(外部AI APIは使いません)。
+任意の[Codex連携](docs/CODEX_YOUTUBE_MCP.md)では、利用者が指定・許可した公開YouTube字幕だけを
+Codexへ渡せます。既存の動画・文字起こし・DBを送信する機能ではありません。
 
 > **Windows + NVIDIA GPU環境を主対象としています。**
 > Linux/macOSでも動作しますが、動作確認はWindows (RTX 4070) で行っています。
@@ -76,6 +78,18 @@ powershell -ExecutionPolicy Bypass -File setup.ps1 -Cpu   # CPUのみ
 初回の文字起こし/検索時にWhisper large-v3 (約3GB) とBGE-M3 (約2GB) がHugging Faceから
 自動ダウンロードされます。
 
+### URLダウンロードが失敗するとき
+
+YouTubeなどのサイト側の変更により、URLダウンロードに使う `yt-dlp` は定期的な更新が必要です。
+通常起動時に自動更新は行いません。URL登録で取得できなくなった場合だけ、アプリを終了してから
+`update_ytdlp.bat` を実行してください。仮想環境内の `yt-dlp[default]` と必要な依存パッケージを
+最新版へ更新し、成功後にバージョンを表示します。
+
+現在のYouTube取得には、別途 **Node.js 22以上** または **Deno 2.3以上** が必要になる場合があります。
+どちらかをインストールしてPATHを反映した後、CUTを再起動してください。
+今回の変更は取得依存関係の互換性修正です。保存・重複判定・インデックス登録の規則は変更しません。
+詳細は[yt-dlp公式のEJS説明](https://github.com/yt-dlp/yt-dlp/wiki/EJS)を参照してください。
+
 ## 使い方 (WebUI)
 
 ```powershell
@@ -98,6 +112,17 @@ powershell -ExecutionPolicy Bypass -File setup.ps1 -Cpu   # CPUのみ
 「保存場所を開く」「動画保存フォルダを開く」「ファイルの場所を開く」からExplorerで確認できます。
 
 ## 使い方 (CLI)
+
+### 任意: CodexからYouTubeの内容を確認する
+
+`cut_mcp.py`をCodexのローカルMCPとして登録すると、自然言語で公開YouTube動画の
+字幕確認・要約・話題整理・切り抜き候補の相談ができます。要約はCodexの会話で行い、
+この機能からOpenAI/Gemini APIは呼びません（Codex自体の利用枠は消費します）。
+動画を視聴する機能や、字幕のない動画の自動文字起こし・自動切り抜き保存は含みません。
+設定・利用例・プライバシー・切り戻しは[連携手順](docs/CODEX_YOUTUBE_MCP.md)を参照してください。
+既存UI・ダウンロード・Whisper別プロセスは変更せず、追加パッケージのインストールも不要です。
+
+### 既存のローカルCLI
 
 ```bash
 python index_video.py --video input.mp4              # インデックス構築 (--force で作り直し)

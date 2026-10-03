@@ -3457,8 +3457,8 @@ class ClipPlanTest(unittest.TestCase):
         self.assertEqual(
             [child["id"] for child in workspace["children"]],
             [
-                components_by_elem_id["intuitive-preview-panel"]["id"],
-                components_by_elem_id["intuitive-search-panel"]["id"],
+                components_by_elem_id["intuitive-search-panel" if app_module.UI_STUDIO else "intuitive-preview-panel"]["id"],
+                components_by_elem_id["intuitive-preview-panel" if app_module.UI_STUDIO else "intuitive-search-panel"]["id"],
                 components_by_elem_id["intuitive-transcript-panel"]["id"],
             ],
         )
@@ -3515,13 +3515,21 @@ class ClipPlanTest(unittest.TestCase):
             dependency for dependency in config["dependencies"]
             if dependency.get("api_name") == "save_intuitive_editor"
         )
-        self.assertEqual(len(save_dependency["outputs"]), 3)
+        self.assertEqual(len(save_dependency["outputs"]), 5)
         self.assertEqual(
-            save_dependency["outputs"][-1],
+            save_dependency["outputs"][2],
             next(
                 component["id"] for component in components
                 if component.get("props", {}).get("elem_id") == "intuitive-toolbox"
             ),
+        )
+        self.assertEqual(
+            save_dependency["outputs"][3],
+            components_by_elem_id["intuitive-export-status"]["id"],
+        )
+        self.assertEqual(
+            save_dependency["outputs"][4],
+            components_by_elem_id["intuitive-export-stop"]["id"],
         )
 
         html_values = "\n".join(
@@ -4156,7 +4164,9 @@ class ClipPlanTest(unittest.TestCase):
         ):
             result = app_module.do_export("synthetic choice", True)
 
-        export.assert_called_once_with("synthetic-video", confirm_sensitive=True)
+        export.assert_called_once_with(
+            "synthetic-video", confirm_sensitive=True, include_source_url=False,
+        )
         self.assertEqual(result, (str(out_path), f"保存先: {out_path}"))
 
     def test_library_index_events_share_one_serial_writer_lane(self):

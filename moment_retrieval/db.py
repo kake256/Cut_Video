@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -205,6 +205,21 @@ CREATE TABLE IF NOT EXISTS highlight_candidates (
 );
 CREATE INDEX IF NOT EXISTS idx_highlight_candidates_run
 ON highlight_candidates(highlight_run_id, ordinal);
+
+-- Canonical public YouTube URL of a file CUT downloaded (sender side).
+CREATE TABLE IF NOT EXISTS downloaded_sources (
+    path TEXT PRIMARY KEY,
+    origin_url TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Origin URL carried in an imported share package (recipient side).
+CREATE TABLE IF NOT EXISTS shared_source_origins (
+    public_video_id TEXT PRIMARY KEY,
+    origin_url TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_shared_source_origins_url ON shared_source_origins(origin_url);
 """
 
 
@@ -919,6 +934,9 @@ def get_segments(
 
 
 ANALYSIS_STATUSES = frozenset({"pending", "running", "ready", "failed"})
+# Codex MCP proposals store an internal analysis run per proposal; it is never
+# a user-facing transcript summary, so summary listings skip it.
+MCP_PROVIDER = "codex-mcp"
 HIGHLIGHT_STATUSES = ANALYSIS_STATUSES
 
 
@@ -1049,8 +1067,8 @@ def list_analysis_runs(
     storage_id = _storage_id(conn, video_id) or video_id
     rows = conn.execute(
         "SELECT * FROM analysis_runs WHERE video_id = ? AND transcript_revision = ? "
-        "ORDER BY created_at DESC, rowid DESC",
-        (storage_id, transcript_revision),
+        "AND provider != ? ORDER BY created_at DESC, rowid DESC",
+        (storage_id, transcript_revision, MCP_PROVIDER),
     ).fetchall()
     return [get_analysis_run(conn, str(row["analysis_run_id"])) for row in rows]
 
@@ -1061,9 +1079,9 @@ def get_latest_ready_analysis_run(
     storage_id = _storage_id(conn, video_id) or video_id
     row = conn.execute(
         "SELECT analysis_run_id FROM analysis_runs WHERE video_id = ? "
-        "AND transcript_revision = ? AND status = 'ready' "
+        "AND transcript_revision = ? AND status = 'ready' AND provider != ? "
         "ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        (storage_id, transcript_revision),
+        (storage_id, transcript_revision, MCP_PROVIDER),
     ).fetchone()
     return get_analysis_run(conn, str(row["analysis_run_id"])) if row else None
 

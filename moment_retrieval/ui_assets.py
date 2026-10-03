@@ -4,6 +4,7 @@ Keeping these resources outside :mod:`app` makes the Python composition layer
 readable while retaining the historical module-level compatibility aliases.
 """
 
+import os
 from pathlib import Path
 
 
@@ -22,3 +23,15 @@ def _load_required_asset(filename: str) -> str:
 
 _APP_CSS = _load_required_asset("app.css")
 _INTUITIVE_EDITOR_JS = _load_required_asset("intuitive_editor.js")
+
+# The classic assets remain the exact compatibility path.  Studio adds a
+# scoped layer rather than changing selectors used by the migration UI.
+UI_STUDIO = os.environ.get("CUT_VIDEO_UI_LAYOUT", "studio").strip().lower() != "classic"
+if UI_STUDIO:
+    _APP_CSS += "\n" + _load_required_asset("studio_layout.css")
+    _INTUITIVE_EDITOR_JS = (
+        "() => {\n"
+        f"  ({_INTUITIVE_EDITOR_JS})();\n"
+        f"  ({_load_required_asset('studio_layout.js')})();\n"
+        "}"
+    )

@@ -2,18 +2,77 @@
 from __future__ import annotations
 
 import math
+import json
 import re
 import subprocess
 import tempfile
+import threading
+import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .output_profile import (
+    AudioProfile,
+    CaptionProfile,
+    OutputProfile,
+    caption_style_for_canvas,
+)
+from .publication import private_source_fingerprint
 from .subtitles import SubtitleCue
 
 
 class ShortVideoError(RuntimeError):
     pass
+
+
+class ShortVideoCancelled(ShortVideoError):
+    pass
+
+
+def _run_render_command(
+    command: list[str], *, cwd: Path, timeout_sec: float | None,
+    cancel_event: threading.Event | None,
+) -> None:
+    """Run ffmpeg with cooperative cancellation when a job owns an event."""
+    if cancel_event is None:
+        subprocess.run(
+            command, cwd=cwd, check=True, capture_output=True,
+            timeout=timeout_sec,
+        )
+        return
+    if cancel_event.is_set():
+        raise ShortVideoCancelled("動画生成を停止しました")
+    process = subprocess.Popen(
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + timeout_sec if timeout_sec is not None else None
+    while True:
+        if cancel_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise ShortVideoCancelled("動画生成を停止しました")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            process.kill()
+            process.wait()
+            raise subprocess.TimeoutExpired(command, timeout_sec)
+        try:
+            stdout, stderr = process.communicate(
+                timeout=min(0.1, remaining) if remaining is not None else 0.1,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if process.returncode:
+            raise subprocess.CalledProcessError(
+                process.returncode, command, output=stdout, stderr=stderr,
+            )
+        return
 
 
 @dataclass(frozen=True)
@@ -31,6 +90,35 @@ class ShortVideoOptions:
         if self.width % 2 or self.height % 2:
             raise ValueError("short-video resolution must use even dimensions")
         return self
+
+    def to_output_profile(self) -> OutputProfile:
+        """Adapt the legacy short-only API to the shared profile contract."""
+        self.validate()
+        return OutputProfile.portrait(
+            self.width, self.height, layout=self.layout,
+            caption=CaptionProfile(enabled=self.burn_captions),
+        )
+
+    @classmethod
+    def from_output_profile(cls, profile: OutputProfile) -> "ShortVideoOptions":
+        """Keep portrait rendering compatible while rejecting source profiles."""
+        profile.validate()
+        if profile.canvas_mode not in {"portrait_blur", "portrait_crop"}:
+            raise ValueError("a short-video option requires a portrait output profile")
+        return cls(
+            width=int(profile.width or 0), height=int(profile.height or 0),
+            layout="blur" if profile.canvas_mode == "portrait_blur" else "crop",
+            burn_captions=profile.caption.enabled,
+        ).validate()
+
+
+def resolve_output_profile(value: ShortVideoOptions | OutputProfile) -> OutputProfile:
+    """Single resolver for callers which still use ``ShortVideoOptions``."""
+    if isinstance(value, ShortVideoOptions):
+        return value.to_output_profile()
+    if isinstance(value, OutputProfile):
+        return value.validate()
+    raise TypeError("output profile must be ShortVideoOptions or OutputProfile")
 
 
 def parse_short_resolution(value: str) -> tuple[int, int]:
@@ -72,13 +160,19 @@ def _split_caption_text(value: str, max_chars: int) -> list[str]:
 
 
 def prepare_short_captions(
-    cues: Iterable[SubtitleCue], *, max_chars: int = 18, minimum_part_ms: int = 500,
+    cues: Iterable[SubtitleCue], *, max_chars: int | None = None,
+    minimum_part_ms: int | None = None, caption_profile: CaptionProfile | None = None,
 ) -> tuple[SubtitleCue, ...]:
-    """Split long ASR cues into phone-readable caption blocks.
+    """Split long ASR cues into concise, readable caption blocks.
 
     Timing remains inside the already-mapped output cue. No transcript text is
     logged or persisted by this function.
     """
+    profile = (caption_profile or CaptionProfile()).validate()
+    max_chars = profile.max_chars if max_chars is None else int(max_chars)
+    minimum_part_ms = (
+        profile.minimum_part_ms if minimum_part_ms is None else int(minimum_part_ms)
+    )
     prepared: list[SubtitleCue] = []
     for cue in cues:
         duration = int(cue.end_ms) - int(cue.start_ms)
@@ -144,12 +238,68 @@ def _ass_text(value: str) -> str:
     )
 
 
+def _caption_display_units(value: str) -> int:
+    """Approximate rendered width without depending on a platform font API."""
+    return sum(
+        2 if unicodedata.east_asian_width(char) in {"W", "F", "A"} else 1
+        for char in value
+    )
+
+
+def _wrap_caption_line(value: str, max_units: int) -> list[str]:
+    """Wrap one caption line at readable punctuation before its safe width."""
+    remaining = str(value or "").strip()
+    if not remaining:
+        return []
+    break_chars = "。！？!?、，, 　"
+    lines: list[str] = []
+    while _caption_display_units(remaining) > max_units:
+        used = 0
+        hard_end = 0
+        for index, char in enumerate(remaining):
+            char_units = _caption_display_units(char)
+            if used + char_units > max_units:
+                break
+            used += char_units
+            hard_end = index + 1
+        if hard_end <= 0:
+            hard_end = 1
+        preferred = max(
+            (
+                index + 1
+                for index, char in enumerate(remaining[:hard_end])
+                if char in break_chars
+            ),
+            default=0,
+        )
+        split_at = preferred if preferred >= hard_end // 2 else hard_end
+        lines.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        lines.append(remaining)
+    return lines
+
+
+def wrap_caption_for_canvas(
+    value: str, width: int, font_size: int, margin_left: int, margin_right: int,
+) -> str:
+    """Insert explicit line breaks so libass text stays inside the canvas."""
+    safe_width = max(1, int(width) - int(margin_left) - int(margin_right))
+    # One unit is approximately half an em. East Asian full-width glyphs use
+    # two units, while Latin letters use one, so both scripts use the canvas
+    # efficiently without relying on the installed font's private metrics.
+    max_units = max(12, math.floor(safe_width / max(1.0, font_size * 0.52)))
+    wrapped: list[str] = []
+    for source_line in re.split(r"\r\n|\r|\n", str(value or "")):
+        wrapped.extend(_wrap_caption_line(source_line, max_units))
+    return "\n".join(wrapped)
+
+
 def captions_to_ass(
     cues: Iterable[SubtitleCue], width: int, height: int,
+    *, caption_profile: CaptionProfile | None = None,
 ) -> str:
-    font_size = max(32, round(height * 0.041))
-    outline = max(2, round(height * 0.003))
-    margin_v = max(64, round(height * 0.105))
+    style = caption_style_for_canvas(caption_profile or CaptionProfile(), width, height)
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -163,9 +313,12 @@ def captions_to_ass(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        "Style: Default,Yu Gothic UI,"
-        f"{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H78000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline},2,2,70,70,{margin_v},1",
+        f"Style: Default,{style.font_name},"
+        f"{style.font_size},{style.primary_colour},{style.secondary_colour},"
+        f"{style.outline_colour},{style.back_colour},"
+        f"{style.bold},0,0,0,100,100,0,0,{style.border_style},{style.outline},"
+        f"{style.shadow},{style.alignment},{style.margin_left},{style.margin_right},"
+        f"{style.margin_vertical},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -174,18 +327,28 @@ def captions_to_ass(
     for cue in cues:
         if cue.end_ms <= cue.start_ms or not str(cue.text or "").strip():
             continue
+        wrapped_text = wrap_caption_for_canvas(
+            cue.text, width, style.font_size, style.margin_left, style.margin_right,
+        )
         lines.append(
             f"Dialogue: 0,{_ass_time(cue.start_ms)},{_ass_time(cue.end_ms)},"
-            f"Default,,0,0,0,,{_ass_text(cue.text)}"
+            "Default,,0,0,0,,"
+            f"{_ass_text(wrapped_text)}"
         )
     return "\n".join(lines) + "\n"
 
 
-def build_short_filter(options: ShortVideoOptions, *, include_captions: bool) -> str:
-    options.validate()
-    width, height = options.width, options.height
+def build_short_filter(
+    options: ShortVideoOptions | OutputProfile, *, include_captions: bool,
+) -> str:
+    profile = resolve_output_profile(options)
+    if profile.canvas_mode not in {
+        "portrait_blur", "portrait_crop", "square_fit",
+    }:
+        raise ValueError("canvas filter requires a portrait or square output profile")
+    width, height = int(profile.width or 0), int(profile.height or 0)
     captions = ",subtitles=filename=captions.ass" if include_captions else ""
-    if options.layout == "crop":
+    if profile.canvas_mode == "portrait_crop":
         return (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},setsar=1{captions}[vout]"
@@ -201,6 +364,238 @@ def build_short_filter(options: ShortVideoOptions, *, include_captions: bool) ->
     )
 
 
+def probe_video_dimensions(video_path: Path) -> tuple[int, int]:
+    """Read the source canvas without decoding private video content."""
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json",
+        str(Path(video_path).resolve()),
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+        )
+        payload = json.loads(completed.stdout)
+        stream = (payload.get("streams") or [])[0]
+        width, height = int(stream["width"]), int(stream["height"])
+        if width <= 0 or height <= 0:
+            raise ValueError("invalid source dimensions")
+        return width, height
+    except (
+        OSError, ValueError, KeyError, IndexError, TypeError,
+        json.JSONDecodeError, subprocess.SubprocessError,
+    ) as exc:
+        raise ShortVideoError("元動画の画面サイズを確認できませんでした") from exc
+
+
+def probe_audio_stream(media_path: Path) -> bool:
+    """Return whether a local media file has at least one decodable audio stream."""
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=index", "-of", "json",
+        str(Path(media_path).resolve()),
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+        )
+        payload = json.loads(completed.stdout)
+        return bool(payload.get("streams"))
+    except (
+        OSError, ValueError, TypeError, json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        raise ShortVideoError("音声ストリームを確認できませんでした") from exc
+
+
+def build_source_caption_filter(*, include_captions: bool = True) -> str:
+    captions = ",subtitles=filename=captions.ass" if include_captions else ""
+    return f"[0:v]setpts=PTS-STARTPTS{captions}[vout]"
+
+
+def build_audio_filter(
+    profile: AudioProfile, *, duration: float,
+    source_has_audio: bool, bgm_has_audio: bool,
+) -> str | None:
+    """Build a path-free ffmpeg audio graph from validated effective settings."""
+    profile.validate()
+    duration = max(0.001, float(duration))
+    normalize = bool(profile.normalize_source and source_has_audio)
+    if (
+        profile.normalization_applied is not None
+        and bool(profile.normalization_applied) != normalize
+    ):
+        raise ShortVideoError("音量正規化の事前確認結果が変わりました")
+    if profile.bgm_enabled and not bgm_has_audio:
+        raise ShortVideoError("指定したBGMを音声として読み込めません")
+    if profile.bgm_applied is False and profile.bgm_enabled:
+        raise ShortVideoError("BGMを適用できない出力設定です")
+
+    filters: list[str] = []
+    source_label: str | None = None
+    if source_has_audio:
+        source_chain = "asetpts=PTS-STARTPTS"
+        if normalize:
+            source_chain += (
+                f",loudnorm=I={float(profile.target_lufs):g}"
+                f":LRA={float(profile.loudness_range):g}"
+                f":TP={float(profile.true_peak_db):g}"
+            )
+        filters.append(f"[0:a]{source_chain}[source_audio]")
+        source_label = "[source_audio]"
+
+    bgm_label: str | None = None
+    if profile.bgm_enabled and bgm_has_audio:
+        fade_in = min(duration, float(profile.bgm_fade_in_sec))
+        fade_out = min(duration, float(profile.bgm_fade_out_sec))
+        bgm_chain = (
+            f"atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,"
+            f"volume={float(profile.bgm_gain_db):g}dB"
+        )
+        if fade_in > 0:
+            bgm_chain += f",afade=t=in:st=0:d={fade_in:.3f}"
+        if fade_out > 0:
+            bgm_chain += (
+                f",afade=t=out:st={max(0.0, duration - fade_out):.3f}"
+                f":d={fade_out:.3f}"
+            )
+        filters.append(f"[1:a]{bgm_chain}[bgm_audio]")
+        bgm_label = "[bgm_audio]"
+
+    if source_label and bgm_label:
+        filters.append(
+            f"{source_label}{bgm_label}"
+            "amix=inputs=2:duration=longest:dropout_transition=0,"
+            "alimiter=limit=0.95[aout]"
+        )
+    elif source_label:
+        filters.append(f"{source_label}anull[aout]")
+    elif bgm_label:
+        filters.append(f"{bgm_label}anull[aout]")
+    else:
+        return None
+    return ";".join(filters)
+
+
+def _audio_render_parts(
+    video_path: Path, profile: AudioProfile, duration: float,
+    bgm_path: Path | None,
+) -> tuple[list[str], str | None]:
+    profile.validate()
+    if not profile.normalize_source and not profile.bgm_enabled:
+        return [], None
+    source_has_audio = probe_audio_stream(video_path)
+    bgm_has_audio = False
+    input_args: list[str] = []
+    if profile.bgm_enabled:
+        if bgm_path is None:
+            raise ShortVideoError("BGMファイルが指定されていません")
+        resolved_bgm = Path(bgm_path).expanduser().resolve()
+        if not resolved_bgm.is_file():
+            raise ShortVideoError("BGMファイルを読み込めません")
+        try:
+            fingerprint = private_source_fingerprint(resolved_bgm)
+        except OSError as exc:
+            raise ShortVideoError("BGMファイルを読み込めません") from exc
+        if fingerprint != profile.bgm_fingerprint:
+            raise ShortVideoError("BGMファイルが設定時から変更されています")
+        bgm_has_audio = probe_audio_stream(resolved_bgm)
+        input_args = ["-stream_loop", "-1", "-i", str(resolved_bgm)]
+    audio_filter = build_audio_filter(
+        profile, duration=duration, source_has_audio=source_has_audio,
+        bgm_has_audio=bgm_has_audio,
+    )
+    return input_args, audio_filter
+
+
+def render_captioned_source_clip(
+    video_path: Path,
+    start: float,
+    end: float,
+    output_path: Path,
+    *,
+    captions: Iterable[SubtitleCue],
+    caption_profile: CaptionProfile | None = None,
+    output_profile: OutputProfile | None = None,
+    duration: float | None = None,
+    timeout_sec: float | None = None,
+    cancel_event: threading.Event | None = None,
+    bgm_path: Path | None = None,
+) -> Path:
+    """Render a source-canvas clip with optional captions and audio finishing."""
+    start_value, end_value = float(start), float(end)
+    if not math.isfinite(start_value) or not math.isfinite(end_value):
+        raise ValueError("字幕付き動画の開始・終了時刻は有限値で指定してください")
+    if start_value < 0 or end_value <= start_value:
+        raise ValueError("字幕付き動画の終了時刻は開始時刻より後にしてください")
+    if duration is not None and end_value > float(duration) + 0.001:
+        raise ValueError("字幕付き動画の終了時刻が元動画の長さを超えています")
+
+    if output_profile is not None:
+        render_profile = output_profile.validate()
+        if render_profile.canvas_mode != "source":
+            raise ValueError("source caption renderer requires a source output profile")
+        if caption_profile is not None and caption_profile != render_profile.caption:
+            raise ValueError("caption profile conflicts with the output profile")
+        profile = render_profile.caption
+    else:
+        profile = (caption_profile or CaptionProfile()).validate()
+        render_profile = OutputProfile.source(caption=profile)
+    prepared = (
+        prepare_short_captions(captions, caption_profile=profile)
+        if profile.enabled else ()
+    )
+    if profile.enabled and not prepared:
+        raise ValueError("焼き込める字幕がありません")
+    video_path = Path(video_path).resolve()
+    output_path = Path(output_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = probe_video_dimensions(video_path) if prepared else (0, 0)
+    with tempfile.TemporaryDirectory(
+        prefix="cut_video_captioned_", dir=str(output_path.parent),
+    ) as temporary_name:
+        temporary = Path(temporary_name)
+        if prepared:
+            (temporary / "captions.ass").write_text(
+                captions_to_ass(prepared, width, height, caption_profile=profile),
+                encoding="utf-8",
+            )
+        audio_inputs, audio_filter = _audio_render_parts(
+            video_path, render_profile.audio, end_value - start_value, bgm_path,
+        )
+        filter_complex = build_source_caption_filter(
+            include_captions=bool(prepared),
+        )
+        if audio_filter:
+            filter_complex += ";" + audio_filter
+        command = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", f"{start_value:.3f}", "-i", str(video_path),
+            *audio_inputs,
+            "-t", f"{end_value - start_value:.3f}",
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]" if audio_filter else "0:a?",
+            "-c:v", render_profile.video_codec,
+            "-preset", render_profile.encoding_preset,
+            "-crf", str(render_profile.crf),
+            "-pix_fmt", render_profile.pixel_format,
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", str(output_path),
+        ]
+        try:
+            _run_render_command(
+                command, cwd=temporary, timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
+            )
+        except ShortVideoCancelled:
+            output_path.unlink(missing_ok=True)
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            output_path.unlink(missing_ok=True)
+            raise ShortVideoError("字幕付き動画の生成に失敗しました") from exc
+    return output_path
+
+
 def render_short_clip(
     video_path: Path,
     start: float,
@@ -208,17 +603,24 @@ def render_short_clip(
     output_path: Path,
     *,
     captions: Iterable[SubtitleCue] = (),
-    options: ShortVideoOptions = ShortVideoOptions(),
+    options: ShortVideoOptions | OutputProfile = ShortVideoOptions(),
     duration: float | None = None,
     timeout_sec: float | None = None,
+    cancel_event: threading.Event | None = None,
+    bgm_path: Path | None = None,
 ) -> Path:
-    """Render one source interval as a portrait MP4.
+    """Render one source interval as a portrait or square MP4.
 
     Captions are written only to a temporary ASS file next to the staging
     output. Keeping the filter filename relative avoids Windows drive-letter
     escaping in libass.
     """
-    options.validate()
+    profile = resolve_output_profile(options)
+    if profile.canvas_mode not in {
+        "portrait_blur", "portrait_crop", "square_fit",
+    }:
+        raise ValueError("canvas renderer requires a portrait or square output profile")
+    output_width, output_height = int(profile.width or 0), int(profile.height or 0)
     start_value, end_value = float(start), float(end)
     if not math.isfinite(start_value) or not math.isfinite(end_value):
         raise ValueError("ショート動画の開始・終了時刻は有限値で指定してください")
@@ -230,34 +632,56 @@ def render_short_clip(
     video_path = Path(video_path).resolve()
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    prepared = tuple(captions) if options.burn_captions else ()
+    # Keep the behavior that the former LLM-highlight path already provided:
+    # long ASR cues become sequential, concise blocks before the final
+    # canvas-width safety wrapping is applied by ``captions_to_ass``.
+    prepared = (
+        prepare_short_captions(captions, caption_profile=profile.caption)
+        if profile.caption.enabled else ()
+    )
     with tempfile.TemporaryDirectory(
         prefix="cut_video_short_", dir=str(output_path.parent),
     ) as temporary_name:
         temporary = Path(temporary_name)
         if prepared:
             (temporary / "captions.ass").write_text(
-                captions_to_ass(prepared, options.width, options.height),
+                captions_to_ass(
+                    prepared, output_width, output_height,
+                    caption_profile=profile.caption,
+                ),
                 encoding="utf-8",
             )
+        audio_inputs, audio_filter = _audio_render_parts(
+            video_path, profile.audio, end_value - start_value, bgm_path,
+        )
+        filter_complex = build_short_filter(
+            profile, include_captions=bool(prepared),
+        )
+        if audio_filter:
+            filter_complex += ";" + audio_filter
         command = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-ss", f"{start_value:.3f}",
             "-i", str(video_path),
+            *audio_inputs,
             "-t", f"{end_value - start_value:.3f}",
-            "-filter_complex", build_short_filter(
-                options, include_captions=bool(prepared),
-            ),
-            "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]" if audio_filter else "0:a?",
+            "-c:v", profile.video_codec,
+            "-preset", profile.encoding_preset,
+            "-crf", str(profile.crf),
+            "-pix_fmt", profile.pixel_format,
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(output_path),
         ]
         try:
-            subprocess.run(
-                command, cwd=temporary, check=True, capture_output=True,
-                timeout=timeout_sec,
+            _run_render_command(
+                command, cwd=temporary, timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
             )
+        except ShortVideoCancelled:
+            output_path.unlink(missing_ok=True)
+            raise
         except (OSError, subprocess.SubprocessError) as exc:
             output_path.unlink(missing_ok=True)
             raise ShortVideoError("ショート動画の生成に失敗しました") from exc

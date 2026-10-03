@@ -6,9 +6,17 @@ from pathlib import Path
 
 from moment_retrieval.application import DocumentRepository
 from moment_retrieval.edit_domain import EditPlan, TimeRange
+from moment_retrieval.export_jobs import ExportJobRegistry, ExportStage
+from moment_retrieval.output_profile import AudioProfile, CaptionProfile, OutputProfile
 from moment_retrieval.publication import private_source_fingerprint
 from moment_retrieval.save_service import (
-    ProbedArtifact, SaveError, recover_artifact_transactions, save_document,
+    ExportVariantRequest,
+    ProbedAudioArtifact,
+    ProbedArtifact,
+    SaveError,
+    recover_artifact_transactions,
+    save_document,
+    save_document_variants,
 )
 
 
@@ -64,6 +72,236 @@ class ApplicationSaveTest(unittest.TestCase):
             self.assertTrue(result.subtitle_path.exists())
             self.assertTrue(result.manifest_path.exists())
             self.assertFalse(self.documents.get(doc.document_id).history.dirty)
+
+    def test_manifest_records_output_profile_without_private_source_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "private-source.mp4"
+            source.write_bytes(b"source")
+            output = root / "clip.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+
+            result = save_document(
+                doc.document_id, source, output, True,
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                output_profile=OutputProfile.portrait(
+                    720, 1280, layout="blur",
+                    caption=CaptionProfile(preset="large", position="top"),
+                ),
+            )
+            raw = result.manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(raw)
+            self.assertEqual(manifest["output_profile"]["canvas_mode"], "portrait_blur")
+            self.assertEqual(manifest["output_profile"]["caption"]["preset"], "large")
+            self.assertNotIn(str(source), raw)
+
+    def test_audio_finishing_is_verified_and_clipping_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "normalized.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            profile = OutputProfile.source(
+                caption=CaptionProfile(enabled=False),
+                audio=AudioProfile(
+                    normalize_source=True, normalization_applied=True,
+                ),
+            )
+            result = save_document(
+                doc.document_id, source, output, True,
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                audio_probe=lambda _path: ProbedAudioArtifact(True, -0.05),
+                output_profile=profile,
+            )
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["audio_verification"]["present"])
+            self.assertTrue(manifest["audio_verification"]["clipping_detected"])
+            self.assertIn("AUDIO_CLIPPING_DETECTED", manifest["warnings"])
+
+    def test_missing_processed_audio_rolls_back_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "normalized.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            with self.assertRaisesRegex(SaveError, "AUDIO_STREAM_MISSING"):
+                save_document(
+                    doc.document_id, source, output, True,
+                    documents=self.documents,
+                    cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                    probe=lambda _path: ProbedArtifact(7_000, 34),
+                    audio_probe=lambda _path: ProbedAudioArtifact(False, None),
+                    output_profile=OutputProfile.source(
+                        caption=CaptionProfile(enabled=False),
+                        audio=AudioProfile(
+                            normalize_source=True, normalization_applied=True,
+                        ),
+                    ),
+                )
+            self.assertFalse(output.exists())
+
+    def test_export_job_tracks_save_stages_and_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "clip.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            class RecordingJobs(ExportJobRegistry):
+                def __init__(self):
+                    super().__init__()
+                    self.stages = []
+
+                def transition(self, job_id, stage, **kwargs):
+                    self.stages.append(ExportStage(stage))
+                    return super().transition(job_id, stage, **kwargs)
+
+            jobs = RecordingJobs()
+            job = jobs.create(job_id="export_save_success")
+
+            result = save_document(
+                doc.document_id, source, output, True,
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"video"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                export_job_id=job.job_id,
+                export_jobs=jobs,
+            )
+
+            self.assertTrue(result.video_path.exists())
+            state = jobs.get(job.job_id)
+            self.assertIsNotNone(state)
+            self.assertEqual(state.stage, ExportStage.COMPLETED)
+            self.assertEqual(state.progress, 100)
+            self.assertEqual(jobs.stages, [
+                ExportStage.VALIDATING,
+                ExportStage.JOINING,
+                ExportStage.PROBING,
+                ExportStage.PUBLISHING,
+            ])
+
+    def test_cancelled_export_job_is_acknowledged_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            output = root / "clip.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            jobs = ExportJobRegistry()
+            job = jobs.create(job_id="export_save_cancel")
+            jobs.request_cancel(job.job_id)
+
+            with self.assertRaisesRegex(SaveError, "cancelled"):
+                save_document(
+                    doc.document_id, source, output, True,
+                    documents=self.documents,
+                    cutter=lambda *_args, **_kwargs: self.fail("cutter must not run"),
+                    probe=lambda _path: ProbedArtifact(7_000, 34),
+                    export_job_id=job.job_id,
+                    export_jobs=jobs,
+                )
+
+            state = jobs.get(job.job_id)
+            self.assertEqual(state.stage, ExportStage.CANCELLED)
+            self.assertFalse(output.exists())
+
+    def test_variant_export_joins_snapshot_once_and_publishes_each_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            join_calls = []
+
+            def join_once(_source, ranges, target, **_kwargs):
+                join_calls.append(tuple(tuple(item) for item in ranges))
+                Path(target).write_bytes(b"joined")
+
+            variants = [
+                ExportVariantRequest(
+                    root / "source-profile.mp4",
+                    OutputProfile.source(caption=CaptionProfile(enabled=False)),
+                ),
+                ExportVariantRequest(
+                    root / "portrait-profile.mp4",
+                    OutputProfile.portrait(
+                        720, 1280,
+                        caption=CaptionProfile(enabled=False),
+                    ),
+                    postprocessor=lambda joined, output, _duration: Path(output).write_bytes(
+                        Path(joined).read_bytes() + b"-portrait"
+                    ),
+                ),
+            ]
+
+            result = save_document_variants(
+                doc.document_id,
+                source,
+                variants,
+                documents=self.documents,
+                cutter=join_once,
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+            )
+
+            self.assertEqual(len(join_calls), 1)
+            self.assertEqual(len(result.results), 2)
+            self.assertEqual(result.failures, ())
+            self.assertTrue((root / "source-profile.mp4").is_file())
+            self.assertTrue((root / "portrait-profile.mp4").is_file())
+            self.assertFalse(list(root.glob(".variant-export-job-*")))
+
+    def test_variant_export_keeps_success_when_another_output_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            conflict = root / "existing.mp4"
+            conflict.write_bytes(b"existing")
+            successful = root / "successful.mp4"
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            result = save_document_variants(
+                doc.document_id,
+                source,
+                [
+                    ExportVariantRequest(conflict, OutputProfile.source()),
+                    ExportVariantRequest(successful, OutputProfile.source()),
+                ],
+                documents=self.documents,
+                cutter=lambda _source, _ranges, target, **_kwargs: Path(target).write_bytes(b"joined"),
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+            )
+            self.assertEqual(len(result.results), 1)
+            self.assertEqual(len(result.failures), 1)
+            self.assertEqual(result.failures[0].output_name, "existing.mp4")
+            self.assertEqual(conflict.read_bytes(), b"existing")
+            self.assertTrue(successful.exists())
 
     def test_cancel_before_cut_leaves_no_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -160,6 +398,40 @@ class ApplicationSaveTest(unittest.TestCase):
             )
             self.assertTrue(received_precise)
             self.assertTrue(result.subtitle_path.exists())
+
+    def test_postprocessor_receives_precisely_joined_result_timeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            doc = self.documents.open(
+                "vid_test", "src_test", self.plan,
+                expected_source_fingerprint=private_source_fingerprint(source),
+            )
+            received = {}
+
+            def cutter(_source, ranges, target, **kwargs):
+                received["ranges"] = ranges
+                received["precise"] = kwargs["precise"]
+                Path(target).write_bytes(b"joined")
+
+            def postprocessor(joined, output, duration):
+                received["joined"] = Path(joined).read_bytes()
+                received["duration"] = duration
+                Path(output).write_bytes(b"rendered")
+
+            result = save_document(
+                doc.document_id, source, root / "clip.mp4", False,
+                documents=self.documents, cutter=cutter,
+                probe=lambda _path: ProbedArtifact(7_000, 34),
+                postprocessor=postprocessor,
+            )
+
+            self.assertTrue(received["precise"])
+            self.assertEqual(received["ranges"], [[1.0, 4.0], [5.0, 9.0]])
+            self.assertEqual(received["joined"], b"joined")
+            self.assertEqual(received["duration"], 7.0)
+            self.assertEqual(result.video_path.read_bytes(), b"rendered")
 
     def test_duration_mismatch_stops_before_subtitle_or_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

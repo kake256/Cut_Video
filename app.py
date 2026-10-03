@@ -19,6 +19,7 @@ import re
 import secrets
 import statistics
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -60,18 +61,30 @@ from moment_retrieval.edit_domain import (
     make_effective_export_plan,
 )
 from moment_retrieval.share import ShareError, export_index, import_index, relink_video
+from moment_retrieval import source_origin, youtube_upload
 from moment_retrieval.vector_index import VectorIndex
 from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
+from moment_retrieval.export_jobs import EXPORT_JOBS, ExportStage
+from moment_retrieval.output_profile import (
+    AudioProfile,
+    CaptionProfile,
+    OutputProfile,
+    validate_font_glyphs,
+)
+from moment_retrieval.publication import private_source_fingerprint
+from moment_retrieval.posting_metadata import posting_metadata_from_candidate
 from moment_retrieval.ui_experiment import UIExperimentRecorder, compare_ui_runs
-from moment_retrieval.subtitles import map_subtitles
+from moment_retrieval.subtitles import SubtitleCue, format_srt_time, map_subtitles
 from moment_retrieval.short_video import (
     ShortVideoOptions,
     parse_short_resolution,
     prepare_short_captions,
+    probe_audio_stream,
+    render_captioned_source_clip,
     render_short_clip,
 )
-from moment_retrieval.ui_assets import _APP_CSS, _INTUITIVE_EDITOR_JS
+from moment_retrieval.ui_assets import _APP_CSS, _INTUITIVE_EDITOR_JS, UI_STUDIO
 from moment_retrieval.transcript_types import parse_segment
 
 PREVIEW_DIR = config.CACHE_ROOT / "previews"
@@ -94,6 +107,9 @@ APP_PIDFILE = config.CACHE_ROOT / "app.pid"
 ALL_VIDEOS_VALUE = "__all_videos__"
 
 ADJUST_STEPS = [0.1, 1.0, 10.0, 30.0, 60.0, 600.0]
+HIGHLIGHT_CAPTION_EDITOR_MAX_CUES = 300
+HIGHLIGHT_CAPTION_EDITOR_MAX_TEXT_CHARS = 1_000
+CAPTION_PREVIEW_RENDER_VERSION = "shorter-cues-v3"
 
 _embedder = None
 _index_lock = threading.Lock()
@@ -177,6 +193,14 @@ def _tk_dialog(kind: str) -> str:
     try:
         if kind == "folder":
             path = filedialog.askdirectory(title="保存先フォルダを選択")
+        elif kind == "audio":
+            path = filedialog.askopenfilename(
+                title="ローカルBGMを選択",
+                filetypes=[
+                    ("音声", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.opus"),
+                    ("すべて", "*.*"),
+                ],
+            )
         else:
             path = filedialog.askopenfilename(
                 title="動画ファイルを選択",
@@ -194,6 +218,11 @@ def browse_folder(current: str) -> str:
 
 def browse_video(current: str) -> str:
     path = _tk_dialog("file")
+    return path if path else current
+
+
+def browse_audio(current: str) -> str:
+    path = _tk_dialog("audio")
     return path if path else current
 
 
@@ -240,6 +269,110 @@ def open_exported_index_location(export_path_text: str) -> str:
         return "書き出したインデックスを表示しました。"
     _launch_explorer(DEFAULT_INDEX_EXPORT_DIR)
     return "インデックス保存フォルダを開きました。"
+
+
+def _saved_highlight_paths(saved_files, output_dir_text: str) -> list[Path]:
+    """Map the File component's (possibly cached) entries back to saved clips."""
+    root = Path(
+        str(output_dir_text or "").strip() or str(config.ARTIFACT_ROOT / "highlights")
+    ).expanduser()
+    entries = saved_files if isinstance(saved_files, (list, tuple)) else [saved_files]
+    resolved: list[Path] = []
+    for entry in entries:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            raw = entry.get("path") or entry.get("name")
+        else:
+            raw = getattr(entry, "path", None) or getattr(entry, "name", None) or entry
+        try:
+            shown = Path(str(raw)).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        if not shown.is_file():
+            continue
+        try:
+            shown.relative_to(root.resolve())
+            resolved.append(shown)
+            continue
+        except (OSError, ValueError):
+            pass
+        # Gradio serves a cached copy; find the original by name and size.
+        size = shown.stat().st_size
+        matches = [
+            item for item in root.rglob(shown.name)
+            if item.is_file() and item.stat().st_size == size
+        ] if root.is_dir() else []
+        if matches:
+            resolved.append(max(matches, key=lambda item: item.stat().st_mtime))
+    return list(dict.fromkeys(resolved))
+
+
+def upload_saved_highlights_to_youtube(saved_files, output_dir_text: str, confirmed: bool):
+    """Upload just-saved clips as private videos; publishing stays manual."""
+    if confirmed is not True:
+        raise gr.Error("内容と権利（配信者の許可など）を確認してからアップロードしてください。")
+    paths = [
+        path for path in _saved_highlight_paths(saved_files, output_dir_text)
+        if path.suffix.lower() == ".mp4"
+    ]
+    if not paths:
+        raise gr.Error("先に「候補を切り抜いて保存」で動画を保存してください。")
+    problems = youtube_upload.setup_problems()
+    if problems:
+        raise gr.Error(" ".join(problems))
+    log_lines = [f"{len(paths)}件をYouTubeへ非公開でアップロードします。"]
+    yield "\n".join(log_lines)
+    for path in paths:
+        try:
+            for message, _receipt in youtube_upload.upload_private(path):
+                if (
+                    message.startswith("  アップロード中")
+                    and log_lines[-1].startswith("  アップロード中")
+                ):
+                    log_lines[-1] = message
+                else:
+                    log_lines.append(message)
+                yield "\n".join(log_lines)
+        except youtube_upload.UploadError as exc:
+            log_lines.append(f"失敗: {path.name}: {exc}")
+            yield "\n".join(log_lines)
+        except Exception as exc:  # network/API errors must not hide other clips
+            log_lines.append(f"失敗: {path.name}: {type(exc).__name__}: {exc}")
+            yield "\n".join(log_lines)
+    log_lines.append("公開する場合は、YouTube Studioで内容を確認してから公開設定を変更してください。")
+    yield "\n".join(log_lines)
+
+
+def open_saved_highlight_location(saved_files, output_dir_text: str) -> str:
+    """Select one saved highlight, or open its folder when there are many."""
+    entries = saved_files if isinstance(saved_files, (list, tuple)) else [saved_files]
+    paths: list[Path] = []
+    for entry in entries:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            raw = entry.get("path") or entry.get("name")
+        else:
+            raw = getattr(entry, "path", None) or getattr(entry, "name", None) or entry
+        try:
+            candidate = Path(str(raw)).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            continue
+        if candidate.is_file():
+            paths.append(candidate)
+    if len(paths) == 1:
+        _launch_explorer(paths[0], select_file=True)
+        return "保存した動画をエクスプローラーで選択しました。"
+    if paths:
+        _launch_explorer(paths[0].parent)
+        return f"保存した動画{len(paths)}件のフォルダを開きました。"
+    folder = Path(
+        str(output_dir_text or "").strip()
+        or str(config.ARTIFACT_ROOT / "highlights")
+    )
+    _launch_explorer(folder)
+    return "保存フォルダを開きました。"
 
 
 # ---------- 検索・切り抜き ----------
@@ -2884,8 +3017,448 @@ def return_intuitive_source(state: dict, result_time_sec: float | None = None):
     return _intuitive_render_outputs(source_state, (preview, transcript, info))
 
 
+def _intuitive_output_plan_signature(state: dict) -> str:
+    """Stable identity for subtitles authored against an edit result timeline."""
+    return edit_plan_from_intuitive(state).semantic_signature
+
+
+def _intuitive_active_transcript_revision(video_id: str) -> str:
+    conn = db.get_conn()
+    try:
+        return str(db.get_active_transcript_revision(conn, video_id) or "")
+    finally:
+        conn.close()
+
+
+def _intuitive_auto_captions(state: dict) -> tuple[tuple[SubtitleCue, ...], list[str], str]:
+    """Map active ASR rows to the current result timeline without persisting them."""
+    plan = edit_plan_from_intuitive(state)
+    revision = _intuitive_active_transcript_revision(state["video_id"])
+    if not revision:
+        return (), [], ""
+    warnings: list[str] = []
+    segments = []
+    conn = db.get_conn()
+    try:
+        rows = db.get_segments_in_range(
+            conn, state["video_id"],
+            ms_to_seconds(plan.overall.start_ms), ms_to_seconds(plan.overall.end_ms),
+            transcript_revision=revision,
+        )
+        for row in rows:
+            try:
+                segments.append(parse_segment(row, plan.source_duration_ms))
+            except ValueError as exc:
+                warnings.append(str(exc))
+    finally:
+        conn.close()
+    mapped = map_subtitles(segments, make_effective_export_plan(plan))
+    warnings.extend(mapped.warnings)
+    # The editor must show the same short blocks that the renderer will burn,
+    # rather than one long ASR row that is silently split only during export.
+    return prepare_short_captions(mapped.cues), warnings, revision
+
+
+def _intuitive_caption_editor_state(state: dict, revision: str) -> dict[str, str]:
+    return {
+        "video_id": str(state.get("video_id") or ""),
+        "transcript_revision": str(revision or ""),
+        "plan_signature": _intuitive_output_plan_signature(state),
+    }
+
+
+def _intuitive_caption_state_matches(state: dict, editor_state) -> bool:
+    if not isinstance(editor_state, dict):
+        return False
+    try:
+        signature = _intuitive_output_plan_signature(state)
+    except (EditPlanError, ValueError):
+        return False
+    revision = _intuitive_active_transcript_revision(state["video_id"])
+    return (
+        str(editor_state.get("video_id") or "") == str(state.get("video_id") or "")
+        and str(editor_state.get("transcript_revision") or "") == revision
+        and str(editor_state.get("plan_signature") or "") == signature
+    )
+
+
+def _cues_to_srt(cues: tuple[SubtitleCue, ...]) -> str:
+    return "\n".join(
+        f"{index}\n{format_srt_time(cue.start_ms)} --> {format_srt_time(cue.end_ms)}\n"
+        f"{str(cue.text).strip()}\n"
+        for index, cue in enumerate(cues, 1)
+    )
+
+
+def load_intuitive_output_captions(state: dict):
+    """Load editable result-timeline captions for the current edit plan only."""
+    if not state:
+        raise gr.Error("先に動画を読み込んでください。")
+    try:
+        captions, warnings, revision = _intuitive_auto_captions(state)
+    except (EditPlanError, ValueError) as exc:
+        raise gr.Error("字幕を読み込めませんでした。編集範囲を確認してください。") from exc
+    editor_state = _intuitive_caption_editor_state(state, revision)
+    status = f"ASRから {len(captions)} 行の字幕を読み込みました。時刻は編集結果の先頭を0秒とする相対時刻です。"
+    if not captions:
+        status = "この編集結果には字幕にできるASR時刻がありません。"
+    if warnings:
+        status += f" 時刻情報に関する警告: {len(warnings)} 件。"
+    return _highlight_caption_rows(captions), editor_state, status
+
+
+def _intuitive_caption_form_values(rows, index: int = 0):
+    normalized = _caption_editor_rows_as_list(rows)
+    if not normalized:
+        return -1, "", None, None, "字幕行がありません。ASR字幕を読み込んでください。"
+    selected = max(0, min(int(index), len(normalized) - 1))
+    row = list(normalized[selected])
+    row.extend([None] * (3 - len(row)))
+    start, end, text = row[:3]
+    return (
+        selected,
+        str(text or ""),
+        start,
+        end,
+        f"**編集中:** 字幕 {selected + 1} / {len(normalized)}　"
+        "変更後は「この字幕を反映」を押してください。",
+    )
+
+
+def first_intuitive_caption_for_form(rows):
+    return _intuitive_caption_form_values(rows, 0)
+
+
+def select_intuitive_caption_for_form(rows, evt: gr.SelectData):
+    raw_index = evt.index if evt and evt.index is not None else 0
+    index = raw_index[0] if isinstance(raw_index, (tuple, list)) else raw_index
+    return _intuitive_caption_form_values(rows, int(index))
+
+
+def move_intuitive_caption_form(rows, selected_index: int, direction: int):
+    normalized = _caption_editor_rows_as_list(rows)
+    if not normalized:
+        return _intuitive_caption_form_values([], 0)
+    current = int(selected_index) if selected_index is not None else 0
+    return _intuitive_caption_form_values(
+        normalized, max(0, min(len(normalized) - 1, current + int(direction))),
+    )
+
+
+def apply_intuitive_caption_form(
+    rows, selected_index: int, text: str, start_sec: float, end_sec: float,
+    state: dict,
+):
+    normalized = _caption_editor_rows_as_list(rows)
+    index = int(selected_index) if selected_index is not None else -1
+    if not 0 <= index < len(normalized):
+        raise gr.Error("編集する字幕を一覧から選択してください。")
+    updated = [list(row) for row in normalized]
+    updated[index] = [start_sec, end_sec, str(text or "").strip()]
+    if not state:
+        raise gr.Error("先に動画を読み込んでください。")
+    try:
+        duration = ms_to_seconds(edit_plan_from_intuitive(state).result_duration_ms)
+        _validate_highlight_caption_rows(updated, duration)
+    except (EditPlanError, TypeError, ValueError) as exc:
+        raise gr.Error(str(exc)) from exc
+    return updated, (
+        f"字幕 {index + 1} の変更を反映しました。"
+        "確認するには「出力プレビューを更新」を押してください。"
+    )
+
+
+def delete_intuitive_caption_form(rows, selected_index: int):
+    normalized = _caption_editor_rows_as_list(rows)
+    index = int(selected_index) if selected_index is not None else -1
+    if not 0 <= index < len(normalized):
+        raise gr.Error("削除する字幕を一覧から選択してください。")
+    del normalized[index]
+    next_values = _intuitive_caption_form_values(
+        normalized, min(index, max(0, len(normalized) - 1)),
+    )
+    return normalized, *next_values
+
+
+def _resolve_intuitive_output_captions(
+    state: dict, editor_rows, editor_state, *, burn_captions: bool,
+) -> tuple[tuple[SubtitleCue, ...], str, list[str]]:
+    """Use matching manual captions, otherwise safely fall back to active ASR."""
+    if not burn_captions:
+        return (), "字幕なし", []
+    if _intuitive_caption_state_matches(state, editor_state):
+        try:
+            duration = ms_to_seconds(edit_plan_from_intuitive(state).result_duration_ms)
+            captions = _validate_highlight_caption_rows(editor_rows, duration)
+        except (EditPlanError, ValueError) as exc:
+            raise gr.Error(str(exc)) from exc
+        if not captions:
+            raise gr.Error("字幕を焼き込むには、ASR字幕を読み込むか字幕行を入力してください。")
+        return captions, "編集字幕", []
+    captions, warnings, _revision = _intuitive_auto_captions(state)
+    if not captions:
+        raise gr.Error("字幕を焼き込めるASR時刻がありません。字幕をOFFにするか範囲を見直してください。")
+    return captions, "自動字幕（編集範囲または動画の変更により編集内容は適用していません）", warnings
+
+
+def _resolve_intuitive_audio_profile(
+    source_path: str | Path | None,
+    normalize_audio: bool = False,
+    bgm_path: str | Path | None = None,
+    bgm_gain_db: float = -24.0,
+    bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
+) -> tuple[AudioProfile, list[str], Path | None]:
+    """Resolve local audio inputs without persisting their absolute paths."""
+    warnings: list[str] = []
+    source_has_audio: bool | None = None
+    if normalize_audio and source_path:
+        source = Path(source_path).expanduser()
+        if source.is_file():
+            try:
+                source_has_audio = probe_audio_stream(source)
+            except (OSError, RuntimeError) as exc:
+                raise gr.Error("元動画の音声を確認できませんでした。") from exc
+            if not source_has_audio:
+                warnings.append("AUDIO_NORMALIZE_SKIPPED_NO_SOURCE_AUDIO")
+
+    raw_bgm = str(bgm_path or "").strip()
+    resolved_bgm: Path | None = None
+    bgm_name = None
+    bgm_fingerprint = None
+    bgm_enabled = bool(raw_bgm)
+    if bgm_enabled:
+        resolved_bgm = Path(raw_bgm).expanduser().resolve()
+        if not resolved_bgm.is_file():
+            raise gr.Error("指定したBGMファイルを読み込めません。")
+        try:
+            if not probe_audio_stream(resolved_bgm):
+                raise gr.Error("指定したファイルには利用できる音声がありません。")
+            bgm_fingerprint = private_source_fingerprint(resolved_bgm)
+        except gr.Error:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise gr.Error("指定したBGMファイルを確認できませんでした。") from exc
+        bgm_name = resolved_bgm.name
+
+    try:
+        audio = AudioProfile(
+            normalize_source=bool(normalize_audio),
+            normalization_applied=(
+                bool(source_has_audio) if normalize_audio else False
+            ),
+            bgm_enabled=bgm_enabled,
+            bgm_applied=True if bgm_enabled else False,
+            bgm_name=bgm_name,
+            bgm_fingerprint=bgm_fingerprint,
+            bgm_gain_db=float(bgm_gain_db),
+            bgm_fade_in_sec=float(bgm_fade_in_sec),
+            bgm_fade_out_sec=float(bgm_fade_out_sec),
+        ).validate()
+    except (TypeError, ValueError) as exc:
+        raise gr.Error(str(exc)) from exc
+    return audio, warnings, resolved_bgm
+
+
+def _intuitive_output_profile(
+    output_format: str, short_layout: str, short_resolution: str,
+    burn_captions: bool, caption_preset: str = "standard",
+    caption_position: str = "bottom",
+    audio_profile: AudioProfile | None = None,
+) -> OutputProfile:
+    try:
+        caption = CaptionProfile(
+            preset=caption_preset,
+            position=caption_position,
+            enabled=bool(burn_captions),
+        ).validate()
+        if output_format == "standard":
+            return OutputProfile.source(caption=caption, audio=audio_profile)
+        if output_format == "square":
+            return OutputProfile.square(
+                1080, caption=caption, audio=audio_profile,
+            )
+        if output_format != "short":
+            raise ValueError("出力形式を選択してください。")
+        width, height = parse_short_resolution(short_resolution)
+        return OutputProfile.portrait(
+            width, height, layout=short_layout, caption=caption,
+            audio=audio_profile,
+        )
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def _validate_intuitive_output_font(
+    profile: OutputProfile, captions: tuple[SubtitleCue, ...],
+) -> list[str]:
+    """Preflight the effective font without retaining caption text or paths."""
+    if not profile.caption.enabled or not captions:
+        return []
+    result = validate_font_glyphs(
+        profile.caption.font_name,
+        "".join(cue.text for cue in captions),
+    )
+    if result.warning == "FONT_FALLBACK_REQUIRED":
+        raise gr.Error(
+            "選択した字幕フォントでは一部の文字を表示できません。"
+            "字幕スタイルまたはフォント環境を確認してください。"
+        )
+    if result.warning in {"FONT_NAME_INVALID"}:
+        raise gr.Error("字幕フォントの設定が不正です。")
+    return [result.warning] if result.warning else []
+
+
+def _intuitive_output_preview_path(
+    state: dict, captions: tuple[SubtitleCue, ...], *, output_format: str,
+    short_layout: str, short_resolution: str, burn_captions: bool,
+    caption_preset: str = "standard", caption_position: str = "bottom",
+    audio_profile: AudioProfile | None = None,
+) -> Path:
+    plan = edit_plan_from_intuitive(state)
+    ranges = [
+        (ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms))
+        for item in plan.kept_ranges
+    ]
+    base = _preview_cache_path(
+        "intuitive_output", state.get("video_id"), state["video_path"], ranges,
+    )
+    payload = {
+        "renderer": CAPTION_PREVIEW_RENDER_VERSION,
+        "plan": plan.semantic_signature,
+        "format": output_format,
+        "layout": short_layout,
+        "resolution": short_resolution,
+        "burn": bool(burn_captions),
+        "caption_preset": caption_preset,
+        "caption_position": caption_position,
+        "audio": (audio_profile or AudioProfile()).to_manifest(),
+        "cues": [[cue.start_ms, cue.end_ms, cue.text] for cue in captions],
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return base.with_name(f"{base.stem}_{digest}{base.suffix}")
+
+
+def _render_intuitive_output_profile(
+    source: Path, plan, output: Path, *, captions: tuple[SubtitleCue, ...],
+    output_profile: OutputProfile, timeout_sec: float | None = None,
+    bgm_path: Path | None = None,
+) -> None:
+    """Join kept ranges, then render the exact result timeline into ``output``."""
+    output = Path(output)
+    duration = ms_to_seconds(plan.result_duration_ms)
+    ranges = [
+        [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
+        for item in plan.kept_ranges
+    ]
+    with tempfile.TemporaryDirectory(prefix="cut_video_edit_output_", dir=str(output.parent)) as name:
+        joined = Path(name) / "joined.mp4"
+        cut_clips(
+            source, ranges, joined, precise=True,
+            duration=ms_to_seconds(plan.source_duration_ms), pad=0.0,
+            timeout_sec=timeout_sec,
+        )
+        if output_profile.canvas_mode != "source":
+            render_short_clip(
+                joined, 0.0, duration, output, captions=captions,
+                options=output_profile, duration=duration, timeout_sec=timeout_sec,
+                bgm_path=bgm_path,
+            )
+        else:
+            render_captioned_source_clip(
+                joined, 0.0, duration, output, captions=captions,
+                output_profile=output_profile,
+                duration=duration, timeout_sec=timeout_sec, bgm_path=bgm_path,
+            )
+
+
+def preview_intuitive_output(
+    state: dict, editor_rows, editor_state, output_format: str = "standard",
+    short_layout: str = "blur", short_resolution: str = "1080x1920",
+    burn_captions: bool = False, caption_preset: str = "standard",
+    caption_position: str = "bottom",
+    normalize_audio: bool = False, bgm_path: str = "",
+    bgm_gain_db: float = -24.0, bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
+):
+    if not state:
+        raise gr.Error("先に動画を読み込んでください。")
+    try:
+        plan = edit_plan_from_intuitive(state)
+        captions, caption_kind, warnings = _resolve_intuitive_output_captions(
+            state, editor_rows, editor_state, burn_captions=bool(burn_captions),
+        )
+        audio_profile, audio_warnings, resolved_bgm = _resolve_intuitive_audio_profile(
+            state.get("video_path"), normalize_audio, bgm_path,
+            bgm_gain_db, bgm_fade_in_sec, bgm_fade_out_sec,
+        )
+        warnings.extend(audio_warnings)
+        output_profile = _intuitive_output_profile(
+            output_format, short_layout, short_resolution, bool(burn_captions),
+            caption_preset, caption_position, audio_profile,
+        )
+        warnings.extend(_validate_intuitive_output_font(output_profile, captions))
+        output = _intuitive_output_preview_path(
+            state, captions, output_format=output_format, short_layout=short_layout,
+            short_resolution=short_resolution, burn_captions=bool(burn_captions),
+            caption_preset=caption_preset, caption_position=caption_position,
+            audio_profile=audio_profile,
+        )
+        audio_processing = bool(normalize_audio or audio_profile.bgm_enabled)
+        if output_format == "standard" and not burn_captions and not audio_processing:
+            ranges = [
+                [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
+                for item in plan.kept_ranges
+            ]
+            preview = _create_cached_preview(
+                output,
+                lambda temporary: cut_clips(
+                    Path(state["video_path"]), ranges, temporary, precise=False,
+                    duration=ms_to_seconds(plan.source_duration_ms), pad=0.0,
+                    timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+                ),
+            )
+        else:
+            preview = _create_cached_preview(
+                output,
+                lambda temporary: _render_intuitive_output_profile(
+                    Path(state["video_path"]), plan, temporary, captions=captions,
+                    output_profile=output_profile,
+                    timeout_sec=PREVIEW_RENDER_TIMEOUT_SEC,
+                    bgm_path=resolved_bgm,
+                ),
+            )
+    except (OSError, RuntimeError, ValueError, EditPlanError) as exc:
+        raise gr.Error("出力プレビューの作成に失敗しました。") from exc
+    mode = {
+        "short": "縦型9:16",
+        "square": "正方形1:1",
+    }.get(output_format, "元の縦横比")
+    if output_format == "short":
+        mode += f"（{short_layout} / {short_resolution}）"
+    status = f"**出力プレビュー:** {mode}　｜　**{caption_kind}**"
+    if burn_captions:
+        status += f"　｜　字幕: {caption_preset} / {caption_position}"
+    if normalize_audio:
+        status += "　｜　音量正規化"
+    if str(bgm_path or "").strip():
+        status += f"　｜　BGM: {Path(str(bgm_path)).name}"
+    if warnings:
+        status += f"（警告 {len(warnings)} 件）"
+    return gr.update(value=preview, label="③ 出力プレビュー"), status
+
+
 def save_intuitive_editor(
-    state: dict, precise: bool, out_dir: str, filename: str, include_srt: bool = False
+    state: dict, precise: bool, out_dir: str, filename: str, include_srt: bool = False,
+    output_format: str = "standard", short_layout: str = "blur",
+    short_resolution: str = "1080x1920", burn_captions: bool = False,
+    editor_rows=None, editor_state=None, caption_preset: str = "standard",
+    caption_position: str = "bottom", export_job_id: str | None = None,
+    normalize_audio: bool = False, bgm_path: str = "",
+    bgm_gain_db: float = -24.0, bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
 ):
     if not state:
         raise gr.Error("先に動画を読み込んでください。")
@@ -2903,6 +3476,7 @@ def save_intuitive_editor(
         "duration": state["duration"],
     }
     source = Path(state["video_path"])
+    cancel_event = EXPORT_JOBS.cancel_event(export_job_id) if export_job_id else None
     if source.is_file() and state.get("document_id"):
         domain_plan = edit_plan_from_intuitive(state)
         DOCUMENTS.sync_adapter_plan(state["document_id"], domain_plan)
@@ -2913,39 +3487,175 @@ def save_intuitive_editor(
         if not output_name.lower().endswith(".mp4"):
             output_name += ".mp4"
         subtitle_text = None
-        subtitle_warnings = []
-        if include_srt:
-            conn = db.get_conn()
-            try:
-                transcript_segments = []
-                for row in db.get_segments(conn, state["video_id"]):
-                    try:
-                        transcript_segments.append(
-                            parse_segment(row, domain_plan.source_duration_ms)
-                        )
-                    except ValueError as exc:
-                        subtitle_warnings.append(str(exc))
-            finally:
-                conn.close()
-            subtitle_result = map_subtitles(
-                transcript_segments, make_effective_export_plan(domain_plan)
-            )
-            subtitle_text = subtitle_result.to_srt()
-            subtitle_warnings.extend(subtitle_result.warnings)
+        subtitle_warnings: list[str] = []
+        captions: tuple[SubtitleCue, ...] = ()
+        needs_captions = bool(include_srt or burn_captions)
+        if needs_captions:
+            if burn_captions:
+                captions, _caption_kind, subtitle_warnings = _resolve_intuitive_output_captions(
+                    state, editor_rows, editor_state, burn_captions=True,
+                )
+            elif _intuitive_caption_state_matches(state, editor_state):
+                captions = _validate_highlight_caption_rows(
+                    editor_rows, ms_to_seconds(domain_plan.result_duration_ms),
+                )
+            else:
+                captions, subtitle_warnings, _revision = _intuitive_auto_captions(state)
+            if include_srt:
+                subtitle_text = _cues_to_srt(captions)
+        audio_profile, audio_warnings, resolved_bgm = _resolve_intuitive_audio_profile(
+            source, normalize_audio, bgm_path, bgm_gain_db,
+            bgm_fade_in_sec, bgm_fade_out_sec,
+        )
+        subtitle_warnings.extend(audio_warnings)
+        output_profile = _intuitive_output_profile(
+            output_format, short_layout, short_resolution, bool(burn_captions),
+            caption_preset, caption_position, audio_profile,
+        )
+        subtitle_warnings.extend(
+            _validate_intuitive_output_font(output_profile, captions)
+        )
+        postprocessor = None
+        if (
+            output_profile.canvas_mode != "source"
+            or burn_captions
+            or normalize_audio
+            or audio_profile.bgm_enabled
+        ):
+            def postprocessor(joined: Path, output: Path, result_duration: float) -> None:
+                if output_profile.canvas_mode != "source":
+                    render_short_clip(
+                        joined, 0.0, result_duration, output, captions=captions,
+                        options=output_profile, duration=result_duration,
+                        cancel_event=cancel_event, bgm_path=resolved_bgm,
+                    )
+                else:
+                    render_captioned_source_clip(
+                        joined, 0.0, result_duration, output, captions=captions,
+                        output_profile=output_profile,
+                        duration=result_duration,
+                        cancel_event=cancel_event, bgm_path=resolved_bgm,
+                    )
         result = save_document(
             state["document_id"], source, output_dir / output_name, bool(precise),
             subtitle_text=subtitle_text, warnings=subtitle_warnings, cutter=cut_clips,
+            postprocessor=postprocessor, output_profile=output_profile,
+            cancel_event=cancel_event, export_job_id=export_job_id,
         )
         saved_path = str(result.video_path.resolve())
     else:
+        if (
+            output_format != "standard" or burn_captions or include_srt
+            or normalize_audio or str(bgm_path or "").strip()
+        ):
+            raise gr.Error(
+                "この動画では出力形式・字幕を利用できません。動画を再読み込みしてからお試しください。"
+            )
         saved_path = on_save(
             state["overall_start"], state["overall_end"], ctx,
             intuitive_state_to_clip_plan(state), precise, out_dir, filename,
         )
+        if export_job_id:
+            EXPORT_JOBS.complete(export_job_id)
     saved_state = copy.deepcopy(state)
     saved_state["baseline_plan"] = _intuitive_plan_snapshot(saved_state)
     saved_state["edit_dirty"] = False
     return saved_path, saved_state, render_intuitive_toolbar(saved_state)
+
+
+_EXPORT_STAGE_LABELS = {
+    ExportStage.QUEUED: "保存待ち",
+    ExportStage.VALIDATING: "入力を確認中",
+    ExportStage.JOINING: "編集区間を結合中",
+    ExportStage.RENDERING: "画面・字幕を生成中",
+    ExportStage.PROBING: "成果物を検証中",
+    ExportStage.PUBLISHING: "保存を確定中",
+    ExportStage.COMPLETED: "保存完了",
+    ExportStage.FAILED: "保存失敗",
+    ExportStage.CANCELLED: "停止済み",
+}
+
+
+def _intuitive_export_job_status(job_id: str) -> str:
+    state = EXPORT_JOBS.get(job_id)
+    if state is None:
+        return "保存jobが見つかりません。"
+    label = _EXPORT_STAGE_LABELS[state.stage]
+    detail = f"　エラーコード: `{state.error_code}`" if state.error_code else ""
+    return f"**保存処理:** {label}（{state.progress}%）{detail}"
+
+
+def start_intuitive_export_job():
+    job = EXPORT_JOBS.create()
+    return (
+        job.job_id,
+        _intuitive_export_job_status(job.job_id),
+        gr.update(visible=True, interactive=True),
+    )
+
+
+def cancel_intuitive_export_job(job_id: str):
+    if not job_id or EXPORT_JOBS.get(job_id) is None:
+        return "停止できる保存処理はありません。", gr.update(interactive=False)
+    state = EXPORT_JOBS.request_cancel(job_id)
+    if state.terminal:
+        return _intuitive_export_job_status(job_id), gr.update(interactive=False)
+    return (
+        "停止を要求しました。現在の処理を安全に終了しています。",
+        gr.update(interactive=False),
+    )
+
+
+def run_intuitive_export_job(
+    state: dict, precise: bool, out_dir: str, filename: str,
+    include_srt: bool, output_format: str, short_layout: str,
+    short_resolution: str, burn_captions: bool, editor_rows,
+    editor_state, caption_preset: str, caption_position: str,
+    export_job_id: str,
+    normalize_audio: bool = False, bgm_path: str = "",
+    bgm_gain_db: float = -24.0, bgm_fade_in_sec: float = 0.5,
+    bgm_fade_out_sec: float = 1.0,
+):
+    """Keep the UI responsive while a local export reports stage changes."""
+    result_box: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            result_box["result"] = save_intuitive_editor(
+                state, precise, out_dir, filename, include_srt,
+                output_format, short_layout, short_resolution, burn_captions,
+                editor_rows, editor_state, caption_preset, caption_position,
+                export_job_id, normalize_audio, bgm_path, bgm_gain_db,
+                bgm_fade_in_sec, bgm_fade_out_sec,
+            )
+        except Exception as exc:  # re-raised after the terminal state is visible
+            current = EXPORT_JOBS.get(export_job_id)
+            if current is not None and not current.terminal:
+                if current.cancel_requested:
+                    EXPORT_JOBS.acknowledge_cancel(export_job_id)
+                else:
+                    EXPORT_JOBS.fail(export_job_id, "EXPORT_PREPARE_FAILED")
+            result_box["error"] = exc
+
+    thread = threading.Thread(
+        target=worker, name=f"cut-video-{export_job_id}", daemon=True,
+    )
+    thread.start()
+    while thread.is_alive():
+        yield (
+            gr.update(), gr.update(), gr.update(),
+            _intuitive_export_job_status(export_job_id),
+            gr.update(visible=True, interactive=True),
+        )
+        thread.join(0.2)
+    if "error" in result_box:
+        raise gr.Error(_intuitive_export_job_status(export_job_id)) from result_box["error"]
+    saved_path, saved_state, toolbar = result_box["result"]
+    yield (
+        saved_path, saved_state, toolbar,
+        _intuitive_export_job_status(export_job_id),
+        gr.update(visible=False, interactive=False),
+    )
 
 
 def get_region_sentences(conn, video_id: str, lo: float, hi: float) -> list:
@@ -3490,6 +4200,33 @@ def on_save(
 
 # ---------- 動画の追加 (インデックス作成) ----------
 
+def _record_download_and_relink(url: str, path: Path) -> tuple[list[str], bool]:
+    """Remember a download's YouTube origin and attach a waiting shared index to it."""
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        canonical = source_origin.record_download(conn, path, url)
+        targets = (
+            source_origin.unlinked_videos_for_origin(conn, canonical)
+            if canonical else []
+        )
+    finally:
+        conn.close()
+    messages: list[str] = []
+    for public_id in targets:
+        try:
+            video = relink_video(public_id, Path(path))
+        except ShareError as exc:
+            messages.append(f"共有インデックスとの自動関連付けを見送りました: {exc}")
+            continue
+        messages.append(
+            "共有インデックスに自動で関連付けました: "
+            f"{video.get('display_name') or public_id}（共有された文字起こしをそのまま使います）"
+        )
+        return messages, True
+    return messages, False
+
+
 def do_index(
     video_path: str,
     asr_model: str,
@@ -3533,6 +4270,14 @@ def do_index(
                 if local_path is None:
                     log_lines.append("エラー: ダウンロードに失敗しました(ファイルパスを取得できませんでした)。")
                     yield "\n".join(log_lines), gr.update()
+                    return
+                relink_messages, relinked = _record_download_and_relink(
+                    video_path, Path(local_path)
+                )
+                log_lines.extend(relink_messages)
+                if relinked:
+                    log_lines.append("文字起こしは不要なため、インデックス作成を省略しました。")
+                    yield "\n".join(log_lines), gr.update(choices=list_video_choices())
                     return
                 video_path = str(local_path)
             except DownloadError as e:
@@ -3793,12 +4538,20 @@ def load_summary_highlight_workspace(video_choice: str):
             "再要約せず見どころ候補を生成できます。"
         )
     else:
-        highlight_markdown, choices = (
-            "この動画には利用できる保存済み要約がありません。"
-            "先に上の「この動画をローカルLLMで解析」を実行してください。",
-            [],
-        )
-        status = "保存済み要約がないため、見どころ候補はまだ生成できません。"
+        # Candidates proposed without a summary (e.g. Codex via MCP) must stay
+        # previewable and savable; only new generation needs a summary.
+        highlight_markdown, choices = _latest_highlight_view(video_choice)
+        if choices:
+            status = (
+                "保存済み要約はありませんが、保存済みの見どころ候補（Codexの提案など）は"
+                "プレビュー・保存できます。新しい候補の生成には要約が必要です。"
+            )
+        else:
+            highlight_markdown = (
+                "この動画には利用できる保存済み要約がありません。"
+                "先に上の「この動画をローカルLLMで解析」を実行してください。"
+            )
+            status = "保存済み要約がないため、見どころ候補はまだ生成できません。"
     return (
         summary,
         status,
@@ -3919,10 +4672,10 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
         candidates = db.get_highlight_candidates(conn, ready["highlight_run_id"])
         result = ready.get("result") or {}
         generation_mode = str(result.get("generation_mode") or "summary")
-        generation_description = (
-            "自然言語クエリ検索"
-            if generation_mode == "query" else "要約から自動選定"
-        )
+        generation_description = {
+            "query": "自然言語クエリ検索",
+            "mcp": "Codexの提案（MCP経由・未書き出し）",
+        }.get(generation_mode, "要約から自動選定")
         requested = int(
             result.get("requested_count") or ready.get("requested_count") or 0
         )
@@ -3931,6 +4684,11 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             query_html = (
                 "<li>クエリ: "
                 f"{html.escape(str(result['query']))}</li>"
+            )
+        elif generation_mode == "mcp" and result.get("note"):
+            query_html = (
+                "<li>Codexのメモ: "
+                f"{html.escape(str(result['note']))}</li>"
             )
         parts = [
             '<div class="highlight-candidate-view">',
@@ -4369,6 +5127,36 @@ def _safe_highlight_filename_part(
     return sanitized
 
 
+def _highlight_video_output_directory(output_root: Path, video: dict) -> Path:
+    """Return the stable per-video directory below the highlight output root."""
+    video_name = str(
+        video.get("display_name") or Path(str(video.get("path") or "")).name
+    )
+    safe_video_name = _safe_highlight_filename_part(
+        Path(video_name).stem,
+        fallback="動画",
+        max_length=64,
+    )
+
+    public_video_id = str(video.get("public_video_id") or "").strip()
+    stable_id = public_video_id or str(video.get("video_id") or "").strip()
+    if not stable_id:
+        private_path = str(video.get("path") or "")
+        stable_id = "vid_" + hashlib.sha256(
+            private_path.encode("utf-8")
+        ).hexdigest()[:12]
+    elif public_video_id and re.fullmatch(
+        r"vid_[0-9a-f]{32}", public_video_id, flags=re.IGNORECASE
+    ):
+        stable_id = "vid_" + public_video_id[4:16].lower()
+    safe_id = _safe_highlight_filename_part(
+        stable_id,
+        fallback="vid_unknown",
+        max_length=64,
+    )
+    return output_root / f"{safe_video_name}__{safe_id}"
+
+
 def _available_highlight_output_path(
     output_dir: Path, video_name: str, chapter_title: str, *, variant: str = ""
 ) -> Path:
@@ -4390,9 +5178,11 @@ def _available_highlight_output_path(
         stem = f"{stem}_{safe_variant}"
     candidate = output_dir / f"{stem}.mp4"
     suffix = 2
-    while candidate.exists() or candidate.with_name(
-        f".{candidate.name}.cut-video-claim"
-    ).exists():
+    while (
+        candidate.exists()
+        or candidate.with_suffix(".metadata.json").exists()
+        or candidate.with_name(f".{candidate.name}.cut-video-claim").exists()
+    ):
         candidate = output_dir / f"{stem}_{suffix}.mp4"
         suffix += 1
     return candidate
@@ -4429,6 +5219,329 @@ def _highlight_short_captions(
     return prepare_short_captions(mapped.cues), warnings
 
 
+def _highlight_caption_rows(captions: tuple[SubtitleCue, ...]) -> list[list[object]]:
+    """Return editable, result-timeline caption rows without changing ASR."""
+    return [
+        [
+            round(int(cue.start_ms) / 1000.0, 3),
+            round(int(cue.end_ms) / 1000.0, 3),
+            str(cue.text),
+        ]
+        for cue in captions
+    ]
+
+
+def _caption_editor_rows_as_list(value) -> list[list[object]]:
+    """Accept Gradio's array value and the dataframe form used by unit tests."""
+    if value is None:
+        return []
+    if hasattr(value, "values"):
+        value = value.values.tolist()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("字幕編集表の形式が不正です。字幕を読み込み直してください。")
+    return [list(row) if isinstance(row, (list, tuple)) else [row] for row in value]
+
+
+def _validate_highlight_caption_rows(
+    rows, candidate_duration: float,
+) -> tuple[SubtitleCue, ...]:
+    """Validate user-edited result-timeline captions before rendering/export.
+
+    The validation deliberately never snaps or reorders user input.  A caption
+    is either a valid exact instruction for this candidate, or rejected before
+    FFmpeg is invoked.
+    """
+    duration = float(candidate_duration)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("見どころ候補の長さが不正です。")
+    normalized = _caption_editor_rows_as_list(rows)
+    if len(normalized) > HIGHLIGHT_CAPTION_EDITOR_MAX_CUES:
+        raise ValueError(
+            f"字幕は {HIGHLIGHT_CAPTION_EDITOR_MAX_CUES} 行までにしてください。"
+        )
+    cues: list[SubtitleCue] = []
+    previous_end = -1
+    limit_ms = round(duration * 1000)
+    for ordinal, row in enumerate(normalized, start=1):
+        if len(row) != 3:
+            raise ValueError(f"字幕 {ordinal} 行目は開始・終了・本文を入力してください。")
+        try:
+            start = float(row[0])
+            end = float(row[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"字幕 {ordinal} 行目の時刻が不正です。") from exc
+        text = str(row[2] or "").strip()
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise ValueError(f"字幕 {ordinal} 行目の時刻は有限の数値にしてください。")
+        if not text:
+            raise ValueError(f"字幕 {ordinal} 行目の本文を入力してください。")
+        if len(text) > HIGHLIGHT_CAPTION_EDITOR_MAX_TEXT_CHARS:
+            raise ValueError(
+                f"字幕 {ordinal} 行目の本文は "
+                f"{HIGHLIGHT_CAPTION_EDITOR_MAX_TEXT_CHARS} 文字までです。"
+            )
+        start_ms = round(start * 1000)
+        end_ms = round(end * 1000)
+        if not 0 <= start_ms < end_ms <= limit_ms:
+            raise ValueError(
+                f"字幕 {ordinal} 行目は候補内で 0 <= 開始 < 終了 <= "
+                "候補長 を満たしてください。"
+            )
+        if start_ms < previous_end:
+            raise ValueError("字幕は時刻順に並べ、重複・重なりをなくしてください。")
+        cues.append(SubtitleCue(start_ms, end_ms, text, ordinal))
+        previous_end = end_ms
+    return tuple(cues)
+
+
+def _highlight_caption_editor_state(
+    video_id: str, candidate: dict,
+) -> dict[str, object]:
+    start = float(candidate["start_sec"])
+    end = float(candidate["end_sec"])
+    return {
+        "video_id": str(video_id),
+        "candidate_id": str(candidate["highlight_candidate_id"]),
+        "candidate_start_sec": start,
+        "candidate_end_sec": end,
+    }
+
+
+def _caption_editor_state_matches(
+    video: dict, candidate: dict, editor_state,
+) -> bool:
+    if not isinstance(editor_state, dict):
+        return False
+    video_id = str(video.get("public_video_id") or video.get("video_id") or "")
+    return (
+        str(editor_state.get("video_id") or "") == video_id
+        and str(editor_state.get("candidate_id") or "")
+        == str(candidate.get("highlight_candidate_id") or "")
+    )
+
+
+def _highlight_candidate_from_context(
+    candidates: list[dict], candidate_id: str,
+) -> dict:
+    candidate = next(
+        (
+            item for item in candidates
+            if str(item.get("highlight_candidate_id") or "") == str(candidate_id or "")
+        ),
+        None,
+    )
+    if candidate is None:
+        raise gr.Error("見どころ候補を選択してください。")
+    return candidate
+
+
+def load_highlight_caption_editor(video_choice: str, candidate_id: str):
+    """Load generated captions into a session-only editor for one candidate."""
+    video, candidates = _highlight_export_context(video_choice)
+    candidate = _highlight_candidate_from_context(candidates, candidate_id)
+    captions, warnings = _highlight_short_captions(video, candidate)
+    video_id = str(video.get("public_video_id") or video.get("video_id") or "")
+    state = _highlight_caption_editor_state(video_id, candidate)
+    status = (
+        f"ASR から {len(captions)} 行の字幕を読み込みました。"
+        " 時刻は見どころ候補の先頭を 0 秒とする相対時刻です。"
+    )
+    if warnings:
+        status += f" 時刻情報に関する警告: {len(warnings)} 件。"
+    return _highlight_caption_rows(captions), state, status
+
+
+def _highlight_caption_preview_path(
+    video: dict,
+    candidate: dict,
+    captions: tuple[SubtitleCue, ...],
+    *,
+    export_format: str,
+    short_layout: str,
+    short_resolution: str,
+    burn_captions: bool,
+) -> Path:
+    """Give each output preview an isolated deterministic cache key.
+
+    The output format alone is not enough: a no-caption preview must never be
+    reused for a captioned one (and vice versa).
+    """
+    start = float(candidate["start_sec"])
+    end = float(candidate["end_sec"])
+    video_id = str(video.get("public_video_id") or video.get("video_id") or "")
+    base = _preview_cache_path(
+        "highlight_caption", video_id, str(video["path"]), [(start, end)],
+    )
+    payload = {
+        "renderer": CAPTION_PREVIEW_RENDER_VERSION,
+        "candidate_id": str(candidate.get("highlight_candidate_id") or ""),
+        "format": str(export_format),
+        "layout": str(short_layout),
+        "resolution": str(short_resolution),
+        "burn_captions": bool(burn_captions),
+        "captions": [
+            [cue.start_ms, cue.end_ms, cue.text, cue.source_segment_id]
+            for cue in captions
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return base.with_name(f"{base.stem}_{digest}{base.suffix}")
+
+
+def _highlight_preview_captions(
+    video: dict,
+    candidate: dict,
+    editor_rows,
+    editor_state,
+    burn_captions: bool,
+) -> tuple[tuple[SubtitleCue, ...], str, list[str]]:
+    """Resolve captions for one preview without leaking edits across candidates."""
+    if not burn_captions:
+        return (), "字幕なし", []
+    if _caption_editor_state_matches(video, candidate, editor_state):
+        duration = float(candidate["end_sec"]) - float(candidate["start_sec"])
+        try:
+            captions = _validate_highlight_caption_rows(editor_rows, duration)
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+        if not captions:
+            raise gr.Error(
+                "編集字幕が空です。ASR 字幕を読み込み直すか、字幕焼き込みをOFFにしてください。"
+            )
+        return captions, "編集字幕", []
+    captions, warnings = _highlight_short_captions(video, candidate)
+    return captions, "自動字幕", warnings
+
+
+def preview_highlight_output(
+    video_choice: str,
+    candidate_id: str,
+    editor_rows,
+    editor_state,
+    export_format: str = "standard",
+    short_layout: str = "blur",
+    short_resolution: str = "1080x1920",
+    burn_captions: bool = False,
+):
+    """Render the exact selected output mode, using edits only when they match."""
+    video, candidates = _highlight_export_context(video_choice)
+    candidate = _highlight_candidate_from_context(candidates, candidate_id)
+    if export_format not in {"standard", "short"}:
+        raise gr.Error("出力形式を選択してください。")
+    captions, caption_kind, warnings = _highlight_preview_captions(
+        video, candidate, editor_rows, editor_state, bool(burn_captions),
+    )
+    options = None
+    if export_format == "short":
+        try:
+            width, height = parse_short_resolution(short_resolution)
+            options = ShortVideoOptions(
+                width=width,
+                height=height,
+                layout=short_layout,
+                burn_captions=bool(burn_captions),
+            ).validate()
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+    output = _highlight_caption_preview_path(
+        video, candidate, captions,
+        export_format=export_format,
+        short_layout=short_layout,
+        short_resolution=short_resolution,
+        burn_captions=bool(burn_captions),
+    )
+    start = float(candidate["start_sec"])
+    end = float(candidate["end_sec"])
+    try:
+        preview = _create_cached_preview(
+            output,
+            lambda temporary: (
+                render_short_clip(
+                    Path(video["path"]), start, end, temporary,
+                    captions=captions, options=options or ShortVideoOptions(),
+                    duration=float(video.get("duration") or end),
+                )
+                if export_format == "short"
+                else render_captioned_source_clip(
+                    Path(video["path"]), start, end, temporary,
+                    captions=captions, duration=float(video.get("duration") or end),
+                )
+                if burn_captions
+                else cut_clip(
+                    Path(video["path"]), start, end, temporary,
+                    pad=0.0, precise=False,
+                    duration=float(video.get("duration") or end),
+                )
+            ),
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise gr.Error("出力プレビューの作成に失敗しました。") from exc
+    filename = Path(video["path"]).name
+    mode = "縦型9:16" if export_format == "short" else "元の縦横比"
+    if export_format == "short":
+        mode += f"（{short_layout} / {short_resolution}）"
+    caption_status = (
+        "字幕なし"
+        if not burn_captions
+        else (
+            f"{caption_kind} {len(captions)} 行"
+            if captions
+            else "字幕にできるASR時刻なし（字幕なし）"
+        )
+    )
+    if warnings:
+        caption_status += f"（時刻警告 {len(warnings)} 件）"
+    detail = (
+        f"**{html.escape(str(candidate.get('title') or '無題'))}**　｜　"
+        f"{utils.format_timestamp(start)}–{utils.format_timestamp(end)}　｜　"
+        f"{end - start:.1f}秒"
+    )
+    return gr.update(
+        value=preview,
+        label=f"出力プレビュー: {filename}",
+    ), detail, f"**出力プレビュー:** {mode}　｜　**{caption_status}**"
+
+
+def preview_highlight_caption_editor(
+    video_choice: str,
+    candidate_id: str,
+    editor_rows,
+    editor_state,
+    export_format: str = "standard",
+    short_layout: str = "blur",
+    short_resolution: str = "1080x1920",
+):
+    """Compatibility wrapper for the original edited-caption-only callback."""
+    update, _detail, status = preview_highlight_output(
+        video_choice,
+        candidate_id,
+        editor_rows,
+        editor_state,
+        export_format,
+        short_layout,
+        short_resolution,
+        True,
+    )
+    return update, status
+
+
+def _edited_highlight_captions_or_none(
+    video: dict, candidate: dict, editor_rows, editor_state,
+) -> tuple[SubtitleCue, ...] | None:
+    """Use edits only for their original candidate; never leak across cards."""
+    if not _caption_editor_state_matches(video, candidate, editor_state):
+        return None
+    duration = float(candidate["end_sec"]) - float(candidate["start_sec"])
+    captions = _validate_highlight_caption_rows(editor_rows, duration)
+    if not captions:
+        raise ValueError(
+            "編集字幕が空です。ASR 字幕を読み込み直すか、字幕焼き込みをOFFにしてください。"
+        )
+    return captions
+
+
 def _publish_highlight_without_overwrite(source: Path, destination: Path) -> None:
     """Publish within one filesystem without replacing an unexpected target."""
     import os
@@ -4448,6 +5561,17 @@ def _publish_highlight_without_overwrite(source: Path, destination: Path) -> Non
         ) from exc
 
 
+def highlight_export_options_update(export_format: str, burn_captions: bool):
+    """Keep format-specific controls visibly mapped to the selected output."""
+    is_short = export_format == "short"
+    precise_is_relevant = export_format == "standard" and not burn_captions
+    return (
+        gr.update(interactive=is_short),
+        gr.update(interactive=is_short),
+        gr.update(interactive=precise_is_relevant),
+    )
+
+
 def export_highlight_candidates(
     video_choice: str,
     selected_candidate_id: str,
@@ -4457,16 +5581,31 @@ def export_highlight_candidates(
     export_format: str = "standard",
     short_layout: str = "blur",
     short_resolution: str = "1080x1920",
-    short_captions: bool = True,
+    short_captions: bool = False,
+    editor_rows=None,
+    editor_state=None,
+    write_metadata: bool = False,
+    metadata_title: str = "",
+    metadata_description: str = "",
+    metadata_tags: str = "",
+    export_job_id: str | None = None,
 ):
     """Cut selected/generated candidates locally with atomic final publish."""
     if not _highlight_export_lock.acquire(blocking=False):
         raise gr.Error("別の見どころ候補を保存中です。完了までお待ちください。")
     outputs: list[str] = []
     log_lines: list[str] = []
+    failed_count = 0
+    cancel_event = EXPORT_JOBS.cancel_event(export_job_id) if export_job_id else None
     try:
+        if export_job_id:
+            EXPORT_JOBS.transition(export_job_id, ExportStage.VALIDATING)
         video, candidates = _highlight_export_context(video_choice)
         if export_scope == "selected":
+            if not selected_candidate_id:
+                raise gr.Error(
+                    "候補が選択されていません。「保存済み候補を表示」で一覧を出してから候補を選んでください。"
+                )
             candidates = [
                 candidate for candidate in candidates
                 if candidate["highlight_candidate_id"] == selected_candidate_id
@@ -4475,11 +5614,20 @@ def export_highlight_candidates(
                 raise gr.Error("保存する候補を選択してください。")
         elif export_scope != "all":
             raise gr.Error("保存対象を選択してください。")
+        if export_scope != "selected" and any(
+            str(value or "").strip()
+            for value in (metadata_title, metadata_description, metadata_tags)
+        ):
+            raise gr.Error(
+                "メタデータの手動上書きは「選択候補のみ」で利用してください。"
+            )
         output_dir = Path(
             str(output_dir_text or "").strip()
             or str(config.ARTIFACT_ROOT / "highlights")
         )
         output_dir.mkdir(parents=True, exist_ok=True)
+        video_output_dir = _highlight_video_output_directory(output_dir, video)
+        video_output_dir.mkdir(parents=True, exist_ok=True)
         if export_format not in {"standard", "short"}:
             raise gr.Error("出力形式を選択してください。")
         short_options = None
@@ -4497,76 +5645,192 @@ def export_highlight_candidates(
             log_lines.append(
                 f"{len(candidates)}件を9:16ショート動画としてローカル保存します。"
             )
+        elif short_captions:
+            log_lines.append(
+                f"{len(candidates)}件を元の縦横比の字幕付き動画としてローカル保存します。"
+            )
         else:
             log_lines.append(f"{len(candidates)}件の候補をローカル保存します。")
+        log_lines.append(
+            f"出力予定: {len(candidates)}件 / "
+            f"再エンコード: {'あり' if export_format == 'short' or short_captions or precise else 'なし'}"
+        )
         yield "\n".join(log_lines), outputs
         video_name = str(
             video.get("display_name") or Path(video["path"]).name
         )
         for ordinal, candidate in enumerate(candidates, start=1):
-            start = float(candidate["start_sec"])
-            end = float(candidate["end_sec"])
-            output = _available_highlight_output_path(
-                output_dir,
-                video_name,
-                str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
-                variant="short" if export_format == "short" else "",
-            )
-            temporary = output.with_name(
-                f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
-            )
-            claim = output.with_name(f".{output.name}.cut-video-claim")
+            if cancel_event is not None and cancel_event.is_set():
+                log_lines.append("保存処理を停止しました。未処理の候補は保存していません。")
+                break
             try:
-                try:
-                    claim.touch(exist_ok=False)
-                except FileExistsError as exc:
-                    raise gr.Error(
-                        "同じ候補の保存処理が競合しました。もう一度実行してください。"
-                    ) from exc
-                if export_format == "short":
-                    captions = ()
-                    subtitle_warnings: list[str] = []
-                    if short_options and short_options.burn_captions:
+                if export_job_id:
+                    EXPORT_JOBS.transition(
+                        export_job_id,
+                        ExportStage.RENDERING,
+                        progress=10 + round(75 * (ordinal - 1) / max(1, len(candidates))),
+                    )
+                start = float(candidate["start_sec"])
+                end = float(candidate["end_sec"])
+                captions = ()
+                subtitle_warnings: list[str] = []
+                if short_captions:
+                    edited_captions = _edited_highlight_captions_or_none(
+                        video, candidate, editor_rows, editor_state,
+                    )
+                    if edited_captions is not None:
+                        captions = edited_captions
+                        log_lines.append(
+                            f"{ordinal}/{len(candidates)} 編集済み字幕 {len(captions)} 行を使用します。"
+                        )
+                    else:
                         captions, subtitle_warnings = _highlight_short_captions(
                             video, candidate,
                         )
-                        if not captions:
-                            log_lines.append(
-                                f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
-                                "字幕なしで生成します。"
-                            )
-                    render_short_clip(
-                        Path(video["path"]), start, end, temporary,
-                        captions=captions,
-                        options=short_options or ShortVideoOptions(),
-                        duration=float(video.get("duration") or end),
-                    )
+                    if not captions:
+                        log_lines.append(
+                            f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
+                            "字幕なしで生成します。"
+                        )
+                variant = "short" if export_format == "short" else (
+                    "字幕付き" if captions else ""
+                )
+                output = _available_highlight_output_path(
+                    video_output_dir,
+                    video_name,
+                    str(candidate.get("export_title") or candidate.get("title") or "見どころ"),
+                    variant=variant,
+                )
+                temporary = output.with_name(
+                    f".{output.stem}.{secrets.token_hex(4)}.partial.mp4"
+                )
+                metadata_output = output.with_suffix(".metadata.json")
+                metadata_temporary = output.with_name(
+                    f".{output.stem}.{secrets.token_hex(4)}.partial.metadata.json"
+                )
+                metadata_published = False
+                claim = output.with_name(f".{output.name}.cut-video-claim")
+                try:
+                    try:
+                        claim.touch(exist_ok=False)
+                    except FileExistsError as exc:
+                        raise gr.Error(
+                            "同じ候補の保存処理が競合しました。もう一度実行してください。"
+                        ) from exc
+                    metadata = None
+                    if write_metadata:
+                        metadata = posting_metadata_from_candidate(
+                            candidate,
+                            title_override=metadata_title,
+                            description_override=metadata_description,
+                            tags_override=metadata_tags,
+                        )
+                        if metadata_output.exists():
+                            raise gr.Error("同名の投稿用メタデータが既にあります。")
+                    if export_format == "short":
+                        render_short_clip(
+                            Path(video["path"]), start, end, temporary,
+                            captions=captions,
+                            options=short_options or ShortVideoOptions(),
+                            duration=float(video.get("duration") or end),
+                            cancel_event=cancel_event,
+                        )
+                    elif captions:
+                        render_captioned_source_clip(
+                            Path(video["path"]), start, end, temporary,
+                            captions=captions,
+                            duration=float(video.get("duration") or end),
+                            cancel_event=cancel_event,
+                        )
+                    else:
+                        cut_clip(
+                            Path(video["path"]),
+                            start,
+                            end,
+                            temporary,
+                            pad=0.0,
+                            precise=bool(precise),
+                            duration=float(video.get("duration") or end),
+                            cancel_event=cancel_event,
+                        )
                     if subtitle_warnings:
                         log_lines.append(
                             f"{ordinal}/{len(candidates)} 字幕時刻の警告: "
                             f"{len(subtitle_warnings)}件（本文はログに表示しません）"
                         )
-                else:
-                    cut_clip(
-                        Path(video["path"]),
-                        start,
-                        end,
-                        temporary,
-                        pad=0.0,
-                        precise=bool(precise),
-                        duration=float(video.get("duration") or end),
-                    )
-                _publish_highlight_without_overwrite(temporary, output)
-            finally:
-                temporary.unlink(missing_ok=True)
-                claim.unlink(missing_ok=True)
-            outputs.append(str(output.resolve()))
-            log_lines.append(
-                f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
-            )
+                    if export_job_id:
+                        EXPORT_JOBS.transition(
+                            export_job_id, ExportStage.PUBLISHING,
+                            progress=10 + round(75 * ordinal / max(1, len(candidates))),
+                        )
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("highlight export cancelled")
+                    if metadata is not None:
+                        metadata_temporary.write_text(
+                            json.dumps(
+                                metadata.to_dict(), ensure_ascii=False, indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                        _publish_highlight_without_overwrite(
+                            metadata_temporary, metadata_output,
+                        )
+                        metadata_published = True
+                    _publish_highlight_without_overwrite(temporary, output)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                    metadata_temporary.unlink(missing_ok=True)
+                    if metadata_published and not output.exists():
+                        metadata_output.unlink(missing_ok=True)
+                    claim.unlink(missing_ok=True)
+                outputs.append(str(output.resolve()))
+                log_lines.append(
+                    f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
+                    + ("（投稿用JSON付き）" if write_metadata else "")
+                )
+            except Exception:
+                if cancel_event is not None and cancel_event.is_set():
+                    log_lines.append("保存処理を停止しました。未処理の候補は保存していません。")
+                    break
+                failed_count += 1
+                log_lines.append(
+                    f"{ordinal}/{len(candidates)} 保存失敗 "
+                    "（HIGHLIGHT_ITEM_FAILED。ほかの候補は続行します）"
+                )
             yield "\n".join(log_lines), list(outputs)
+        log_lines.append(
+            f"一括保存結果: 成功 {len(outputs)}件 / 失敗 {failed_count}件 / "
+            f"未処理 {max(0, len(candidates) - len(outputs) - failed_count)}件"
+        )
+        if export_job_id:
+            if cancel_event is not None and cancel_event.is_set():
+                EXPORT_JOBS.acknowledge_cancel(export_job_id)
+            elif failed_count:
+                EXPORT_JOBS.fail(export_job_id, "BATCH_PARTIAL_FAILURE")
+            else:
+                EXPORT_JOBS.complete(export_job_id)
+        yield "\n".join(log_lines), list(outputs)
+    except Exception:
+        if export_job_id:
+            current = EXPORT_JOBS.get(export_job_id)
+            if current is not None and not current.terminal:
+                EXPORT_JOBS.fail(export_job_id, "BATCH_PREPARE_FAILED")
+        raise
     finally:
         _highlight_export_lock.release()
+
+
+def run_highlight_export_job(*args):
+    export_job_id = str(args[-1])
+    for log_text, files in export_highlight_candidates(*args):
+        state = EXPORT_JOBS.get(export_job_id)
+        stop_visible = bool(state is not None and not state.terminal)
+        yield (
+            log_text,
+            files,
+            _intuitive_export_job_status(export_job_id),
+            gr.update(visible=stop_visible, interactive=stop_visible),
+        )
 
 
 def do_existing_highlight_analysis(
@@ -4716,7 +5980,9 @@ def stop_indexing():
 
 # ---------- インデックスの共有 (エクスポート/インポート) ----------
 
-def do_export(video_choice: str, privacy_confirmed: bool = False):
+def do_export(
+    video_choice: str, privacy_confirmed: bool = False, include_source_url: bool = False,
+):
     video_id = parse_video_choice(video_choice)
     if not video_id:
         raise gr.Error("エクスポートする動画を選択してください。")
@@ -4725,11 +5991,26 @@ def do_export(video_choice: str, privacy_confirmed: bool = False):
             "全文文字起こし等を含むことと、個人情報を確認したことに同意してください。"
         )
     try:
-        out_path = export_index(video_id, confirm_sensitive=True)
+        out_path = export_index(
+            video_id, confirm_sensitive=True,
+            include_source_url=bool(include_source_url),
+        )
     except ShareError as e:
         raise gr.Error(str(e))
     gr.Info(f"エクスポートしました: {out_path}")
-    return str(out_path), f"保存先: {out_path}"
+    status = f"保存先: {out_path}"
+    if include_source_url:
+        conn = db.get_conn()
+        try:
+            video = db.get_video(conn, video_id)
+            url = source_origin.origin_url_for_video(conn, video) if video else None
+        finally:
+            conn.close()
+        status += (
+            f"（元動画URLを同梱: {url}）" if url
+            else "（YouTube/Twitch由来と確認できないため、URLは同梱していません）"
+        )
+    return str(out_path), status
 
 
 def do_import(zip_file):
@@ -4807,6 +6088,20 @@ _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS = r"""() => {
   );
   requestAnimationFrame(syncSearchMarkers);
   setTimeout(syncSearchMarkers, 120);
+}"""
+
+
+_OPEN_INTUITIVE_MAIN_TAB_JS = r"""() => {
+  const openEditor = () => {
+    const target = Array.from(document.querySelectorAll('[role="tab"]')).find(
+      (tab) => (tab.textContent || '').trim() === '検索・編集・切り抜き'
+    );
+    if (!target) return false;
+    target.click();
+    target.scrollIntoView({block: 'nearest', inline: 'nearest'});
+    return true;
+  };
+  if (!openEditor()) requestAnimationFrame(openEditor);
 }"""
 
 
@@ -5434,6 +6729,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         "検索・編集・切り抜き",
         id="intuitive-main",
         elem_id="intuitive-editor-tab",
+        elem_classes=["studio-layout"] if UI_STUDIO else None,
     ):
         intuitive_state = gr.State(None)
         # An initially open Accordion does not emit an expand event.
@@ -5520,19 +6816,34 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     elem_id="intuitive-return-source",
                 )
 
+        if UI_STUDIO:
+            gr.HTML(
+                '<div class="studio-workspace-heading"><p>検索結果を確認し、プレビューと文字起こしで境界を決めます。</p>'
+                '<a href="#intuitive-save-bar">保存へ移動</a></div>'
+                '<details id="studio-layout-controls"><summary>レイアウトを調整</summary>'
+                '<div class="studio-layout-fields">'
+                '<label>左右の順序<select name="order"><option value="normal">検索・プレビュー・文字起こし</option><option value="reverse-sides">文字起こし・プレビュー・検索</option></select></label>'
+                '<label>検索幅<input name="search" type="range" min="20" max="32" step="1"><output data-for="search">24</output>%</label>'
+                '<label>文字起こし幅<input name="transcript" type="range" min="20" max="32" step="1"><output data-for="transcript">28</output>%</label>'
+                '<label>パネル高<input name="height" type="range" min="300" max="440" step="10"><output data-for="height">360</output>px</label>'
+                '<button type="button" data-studio-reset>初期値に戻す</button></div></details>',
+            )
         with gr.Row(equal_height=True, elem_id="intuitive-workspace-row"):
-            with gr.Column(
-                scale=5, min_width=480, elem_id="intuitive-preview-panel",
-            ):
-                intuitive_preview = gr.Video(
-                    label="1. 動画プレビュー（Source timeline）",
-                    autoplay=False,
-                    interactive=False,
-                    height=320,
-                    elem_id="intuitive-preview-video",
-                )
+            if not UI_STUDIO:
+                with gr.Column(
+                    scale=5, min_width=480, elem_id="intuitive-preview-panel",
+                    elem_classes=["studio-panel"] if UI_STUDIO else None,
+                ):
+                    intuitive_preview = gr.Video(
+                        label="1. 動画プレビュー（Source timeline）",
+                        autoplay=False,
+                        interactive=False,
+                        height=320,
+                        elem_id="intuitive-preview-video",
+                    )
             with gr.Column(
                 scale=4, min_width=400, elem_id="intuitive-search-panel",
+                elem_classes=["studio-panel"] if UI_STUDIO else None,
             ):
                 gr.Markdown(
                     "**2. 文字クエリー検索**",
@@ -5567,9 +6878,22 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "検索すると、文字一致を先に表示し、意味検索結果を後から追加します。",
                     elem_id="intuitive-search-status",
                 )
+            if UI_STUDIO:
+                with gr.Column(
+                    scale=5, min_width=480, elem_id="intuitive-preview-panel",
+                    elem_classes=["studio-panel"] if UI_STUDIO else None,
+                ):
+                    intuitive_preview = gr.Video(
+                        label="1. 動画プレビュー（Source timeline）",
+                        autoplay=False,
+                        interactive=False,
+                        height=320,
+                        elem_id="intuitive-preview-video",
+                    )
             with gr.Column(
                 scale=3, min_width=280,
                 elem_id="intuitive-transcript-panel",
+                elem_classes=["studio-panel"] if UI_STUDIO else None,
             ):
                 intuitive_toolbar = gr.HTML(
                     '<div class="intuitive-toolbox"><strong>3. 文字起こし編集</strong>'
@@ -5714,6 +7038,130 @@ with gr.Blocks(title="動画シーン検索") as demo:
                             '途中カットはありません。</div></div></details>',
                             elem_id="intuitive-exclusion-list",
                         )
+            with gr.Tab("③ 出力・字幕", elem_id="intuitive-output-tab"):
+                gr.Markdown(
+                    "範囲編集の結果に対して、画面形式と字幕を確認して保存します。"
+                    " 字幕の編集はこの画面だけに保持され、元の文字起こしは変更しません。"
+                )
+                intuitive_caption_editor_state = gr.State({})
+                with gr.Row(equal_height=False, elem_id="intuitive-output-workspace"):
+                    with gr.Column(scale=3, min_width=460):
+                        intuitive_output_preview_btn = gr.Button(
+                            "出力プレビューを更新", variant="primary",
+                            elem_id="intuitive-output-preview-button",
+                        )
+                        intuitive_output_preview = gr.Video(
+                            label="③ 出力プレビュー", autoplay=False, interactive=False,
+                            height=400, elem_id="intuitive-output-preview-video",
+                        )
+                        intuitive_output_status = gr.Markdown(
+                            "出力設定を選び、必要ならASR字幕を読み込んでください。"
+                        )
+                    with gr.Column(scale=2, min_width=380):
+                        intuitive_output_format = gr.Radio(
+                            choices=[
+                                ("元の縦横比（通常）", "standard"),
+                                ("縦型9:16（ショート）", "short"),
+                                ("正方形1:1", "square"),
+                            ], value="standard", label="画面サイズ",
+                        )
+                        with gr.Row():
+                            intuitive_short_layout = gr.Radio(
+                                choices=[
+                                    ("背景ぼかし（映像全体を残す）", "blur"),
+                                    ("中央を縦に切り抜く", "crop"),
+                                ], value="blur", label="ショート動画の画面配置",
+                                interactive=False, scale=2,
+                            )
+                            intuitive_short_resolution = gr.Dropdown(
+                                choices=["1080x1920", "720x1280"], value="1080x1920",
+                                label="ショート動画の解像度", interactive=False, scale=1,
+                            )
+                        intuitive_burn_captions = gr.Checkbox(
+                            value=False, label="字幕を動画へ焼き込む",
+                        )
+                        with gr.Row():
+                            intuitive_caption_preset = gr.Radio(
+                                choices=[
+                                    ("標準", "standard"),
+                                    ("大きめ", "large"),
+                                    ("背景付き", "boxed"),
+                                ],
+                                value="standard", label="字幕スタイル", scale=2,
+                            )
+                            intuitive_caption_position = gr.Radio(
+                                choices=[
+                                    ("下", "bottom"),
+                                    ("中央", "center"),
+                                    ("上", "top"),
+                                ],
+                                value="bottom", label="字幕位置", scale=2,
+                            )
+                        with gr.Accordion("音声仕上げ（任意）", open=False):
+                            intuitive_normalize_audio = gr.Checkbox(
+                                value=False,
+                                label="元動画の音量をそろえる（-16 LUFS）",
+                            )
+                            with gr.Row():
+                                intuitive_bgm_path = gr.Textbox(
+                                    value="", label="ローカルBGM",
+                                    placeholder="BGMを使う場合だけローカル音声を選択",
+                                    scale=4,
+                                )
+                                intuitive_bgm_browse_btn = gr.Button(
+                                    "BGMを選択", scale=0, min_width=110,
+                                )
+                            intuitive_bgm_gain = gr.Slider(
+                                minimum=-40, maximum=-6, value=-24, step=1,
+                                label="BGM音量（dB・元音声より小さく）",
+                            )
+                            with gr.Row():
+                                intuitive_bgm_fade_in = gr.Number(
+                                    value=0.5, minimum=0, maximum=30,
+                                    label="フェードイン（秒）",
+                                )
+                                intuitive_bgm_fade_out = gr.Number(
+                                    value=1.0, minimum=0, maximum=30,
+                                    label="フェードアウト（秒）",
+                                )
+                        with gr.Accordion("字幕を調整（この出力のみ）", open=True):
+                            intuitive_caption_load_btn = gr.Button(
+                                "ASR字幕を読み込む", variant="secondary",
+                            )
+                            intuitive_caption_selected_index = gr.State(-1)
+                            intuitive_caption_form_status = gr.Markdown(
+                                "ASR字幕を読み込むと、1行ずつ大きな入力欄で調整できます。"
+                            )
+                            intuitive_caption_text = gr.Textbox(
+                                label="選択字幕の本文",
+                                placeholder="字幕一覧から編集する行を選択してください",
+                                lines=3,
+                            )
+                            with gr.Row():
+                                intuitive_caption_start = gr.Number(
+                                    label="開始（編集結果・秒）", precision=3,
+                                )
+                                intuitive_caption_end = gr.Number(
+                                    label="終了（編集結果・秒）", precision=3,
+                                )
+                            with gr.Row():
+                                intuitive_caption_prev_btn = gr.Button("← 前の字幕")
+                                intuitive_caption_apply_btn = gr.Button(
+                                    "この字幕を反映", variant="primary",
+                                )
+                                intuitive_caption_next_btn = gr.Button("次の字幕 →")
+                                intuitive_caption_delete_btn = gr.Button(
+                                    "この字幕を削除", variant="stop",
+                                )
+                            intuitive_caption_table = gr.Dataframe(
+                                headers=["開始（編集結果・秒）", "終了（編集結果・秒）", "本文"],
+                                datatype=["number", "number", "str"], type="array",
+                                row_count=1, column_count=3, value=[], interactive=False,
+                                label="字幕一覧（行をクリックして選択）", max_height=220,
+                            )
+        # Save remains a fixed global action bar.  Output format/captions live
+        # in stage ③; keeping only the final commit action visible avoids a
+        # needless tab switch after a user has confirmed the preview.
         with gr.Group(elem_id="intuitive-save-bar"):
             with gr.Row(elem_classes=["intuitive-compact-row"]):
                 intuitive_out_dir = gr.Textbox(
@@ -5749,6 +7197,16 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 show_label=False, container=False,
                 elem_id="intuitive-saved-path",
             )
+            intuitive_export_job_id = gr.State("")
+            with gr.Row(elem_classes=["intuitive-compact-row"]):
+                intuitive_export_status = gr.Markdown(
+                    "**保存処理:** 待機中",
+                    elem_id="intuitive-export-status",
+                )
+                intuitive_export_stop_btn = gr.Button(
+                    "保存処理を停止", variant="stop", visible=False,
+                    scale=0, min_width=140, elem_id="intuitive-export-stop",
+                )
             intuitive_open_folder_status = gr.Markdown("")
 
         with gr.Accordion("UI比較計測（匿名・ローカル保存）", open=False):
@@ -5999,20 +7457,156 @@ with gr.Blocks(title="動画シーン検索") as demo:
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
         )
-        intuitive_save_btn.click(
-            save_intuitive_editor,
+        intuitive_save_event = intuitive_save_btn.click(
+            start_intuitive_export_job,
+            inputs=None,
+            outputs=[
+                intuitive_export_job_id, intuitive_export_status,
+                intuitive_export_stop_btn,
+            ],
+            show_progress="hidden",
+        ).then(
+            run_intuitive_export_job,
             inputs=[
                 intuitive_state, intuitive_precise,
                 intuitive_out_dir, intuitive_filename, intuitive_srt,
+                intuitive_output_format, intuitive_short_layout,
+                intuitive_short_resolution, intuitive_burn_captions,
+                intuitive_caption_table, intuitive_caption_editor_state,
+                intuitive_caption_preset, intuitive_caption_position,
+                intuitive_export_job_id,
+                intuitive_normalize_audio, intuitive_bgm_path,
+                intuitive_bgm_gain, intuitive_bgm_fade_in,
+                intuitive_bgm_fade_out,
             ],
-            outputs=[intuitive_saved_path, intuitive_state, intuitive_toolbar],
+            outputs=[
+                intuitive_saved_path, intuitive_state, intuitive_toolbar,
+                intuitive_export_status, intuitive_export_stop_btn,
+            ],
             concurrency_id="intuitive-editor-state",
             concurrency_limit=1,
+            api_name="save_intuitive_editor",
+        )
+        intuitive_export_stop_btn.click(
+            cancel_intuitive_export_job,
+            inputs=[intuitive_export_job_id],
+            outputs=[intuitive_export_status, intuitive_export_stop_btn],
+            concurrency_id="intuitive-export-control",
+            concurrency_limit=2,
+            show_progress="hidden",
+        )
+        intuitive_output_preview_btn.click(
+            preview_intuitive_output,
+            inputs=[
+                intuitive_state, intuitive_caption_table, intuitive_caption_editor_state,
+                intuitive_output_format, intuitive_short_layout,
+                intuitive_short_resolution, intuitive_burn_captions,
+                intuitive_caption_preset, intuitive_caption_position,
+                intuitive_normalize_audio, intuitive_bgm_path,
+                intuitive_bgm_gain, intuitive_bgm_fade_in,
+                intuitive_bgm_fade_out,
+            ],
+            outputs=[intuitive_output_preview, intuitive_output_status],
+            concurrency_id="intuitive-output-preview-io",
+            concurrency_limit=1,
+        )
+        intuitive_caption_load_btn.click(
+            load_intuitive_output_captions,
+            inputs=[intuitive_state],
+            outputs=[
+                intuitive_caption_table, intuitive_caption_editor_state,
+                intuitive_output_status,
+            ],
+            concurrency_id="intuitive-output-preview-io",
+            concurrency_limit=1,
+        ).then(
+            first_intuitive_caption_for_form,
+            inputs=[intuitive_caption_table],
+            outputs=[
+                intuitive_caption_selected_index, intuitive_caption_text,
+                intuitive_caption_start, intuitive_caption_end,
+                intuitive_caption_form_status,
+            ],
+            show_progress="hidden",
+        )
+        intuitive_caption_table.select(
+            select_intuitive_caption_for_form,
+            inputs=[intuitive_caption_table],
+            outputs=[
+                intuitive_caption_selected_index, intuitive_caption_text,
+                intuitive_caption_start, intuitive_caption_end,
+                intuitive_caption_form_status,
+            ],
+            show_progress="hidden",
+        )
+        intuitive_caption_prev_btn.click(
+            move_intuitive_caption_form,
+            inputs=[
+                intuitive_caption_table, intuitive_caption_selected_index,
+                gr.State(-1),
+            ],
+            outputs=[
+                intuitive_caption_selected_index, intuitive_caption_text,
+                intuitive_caption_start, intuitive_caption_end,
+                intuitive_caption_form_status,
+            ],
+            show_progress="hidden",
+        )
+        intuitive_caption_next_btn.click(
+            move_intuitive_caption_form,
+            inputs=[
+                intuitive_caption_table, intuitive_caption_selected_index,
+                gr.State(1),
+            ],
+            outputs=[
+                intuitive_caption_selected_index, intuitive_caption_text,
+                intuitive_caption_start, intuitive_caption_end,
+                intuitive_caption_form_status,
+            ],
+            show_progress="hidden",
+        )
+        intuitive_caption_apply_btn.click(
+            apply_intuitive_caption_form,
+            inputs=[
+                intuitive_caption_table, intuitive_caption_selected_index,
+                intuitive_caption_text, intuitive_caption_start,
+                intuitive_caption_end, intuitive_state,
+            ],
+            outputs=[intuitive_caption_table, intuitive_caption_form_status],
+            concurrency_id="intuitive-output-preview-io",
+            concurrency_limit=1,
+        )
+        intuitive_caption_delete_btn.click(
+            delete_intuitive_caption_form,
+            inputs=[intuitive_caption_table, intuitive_caption_selected_index],
+            outputs=[
+                intuitive_caption_table, intuitive_caption_selected_index,
+                intuitive_caption_text, intuitive_caption_start,
+                intuitive_caption_end, intuitive_caption_form_status,
+            ],
+            show_progress="hidden",
+        )
+        intuitive_output_format.change(
+            highlight_export_options_update,
+            inputs=[intuitive_output_format, intuitive_burn_captions],
+            outputs=[intuitive_short_layout, intuitive_short_resolution, intuitive_precise],
+            show_progress="hidden",
+        )
+        intuitive_burn_captions.change(
+            highlight_export_options_update,
+            inputs=[intuitive_output_format, intuitive_burn_captions],
+            outputs=[intuitive_short_layout, intuitive_short_resolution, intuitive_precise],
+            show_progress="hidden",
         )
         intuitive_folder_btn.click(
             browse_folder,
             inputs=[intuitive_out_dir],
             outputs=[intuitive_out_dir],
+        )
+        intuitive_bgm_browse_btn.click(
+            browse_audio,
+            inputs=[intuitive_bgm_path],
+            outputs=[intuitive_bgm_path],
         )
         intuitive_open_output_btn.click(
             open_output_folder,
@@ -6205,22 +7799,24 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     container=False,
                     elem_id="highlight-candidate-selection",
                 )
-                with gr.Row():
-                    highlight_preview_btn = gr.Button("選択候補をプレビュー")
-                    highlight_edit_btn = gr.Button(
-                        "選択候補を編集画面で開く",
-                        variant="secondary",
-                    )
-                highlight_preview = gr.Video(
-                    label="見どころ候補プレビュー",
-                    autoplay=False,
-                    interactive=False,
-                    height=360,
-                )
-                highlight_preview_detail = gr.Markdown(
-                    "候補を選び、プレビューボタンを押してください。"
-                )
-                with gr.Accordion("3. 作成した候補を切り抜いて保存", open=True):
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=3):
+                        with gr.Row():
+                            highlight_preview_btn = gr.Button(
+                                "候補をプレビュー", variant="primary",
+                            )
+                            highlight_edit_btn = gr.Button(
+                                "選択候補を編集画面で開く",
+                                variant="secondary",
+                            )
+                        highlight_preview = gr.Video(
+                            label="見どころ候補プレビュー", autoplay=False,
+                            interactive=False, height=420,
+                        )
+                        highlight_preview_detail = gr.Markdown(
+                            "候補を選び、プレビューまたは編集画面へ進んでください。"
+                        )
+                with gr.Accordion("4. 作成した候補を切り抜いて保存", open=True):
                     highlight_export_scope = gr.Radio(
                         choices=[
                             ("選択候補のみ", "selected"),
@@ -6229,50 +7825,35 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         value="selected",
                         label="保存対象",
                     )
-                    highlight_export_format = gr.Radio(
-                        choices=[
-                            ("通常動画", "standard"),
-                            ("ショート動画（9:16＋自動字幕）", "short"),
-                        ],
-                        value="standard",
-                        label="出力形式",
-                    )
-                    with gr.Row():
-                        highlight_short_layout = gr.Radio(
-                            choices=[
-                                ("背景ぼかし（映像全体を残す）", "blur"),
-                                ("中央を縦に切り抜く", "crop"),
-                            ],
-                            value="blur",
-                            label="ショート動画の画面配置",
-                            scale=2,
-                        )
-                        highlight_short_resolution = gr.Dropdown(
-                            choices=["1080x1920", "720x1280"],
-                            value="1080x1920",
-                            label="ショート動画の解像度",
-                            scale=1,
-                        )
-                        highlight_short_captions = gr.Checkbox(
-                            value=True,
-                            label="ASR字幕を動画へ焼き込む",
-                            scale=1,
-                        )
                     with gr.Row():
                         highlight_export_dir = gr.Textbox(
                             value=str(config.ARTIFACT_ROOT / "highlights"),
-                            label="保存先フォルダ",
+                            label="保存先ルート（動画ごとにサブフォルダを作成）",
                             scale=3,
                         )
                         highlight_export_precise = gr.Checkbox(
                             value=True,
-                            label="通常動画をフレーム精度で保存",
+                            label="フレーム精度で保存",
                             scale=1,
                         )
-                    gr.Markdown(
-                        "ショート動画は再エンコード固定です。背景ぼかしは元映像全体を残し、"
-                        "中央切り抜きは画面を大きく表示します。字幕・動画はローカルだけで処理します。"
-                    )
+                    with gr.Accordion("投稿用メタデータ（任意・ローカル保存のみ）", open=False):
+                        highlight_write_metadata = gr.Checkbox(
+                            value=False,
+                            label="動画と同名の投稿用JSONを保存する",
+                        )
+                        gr.Markdown(
+                            "LLM由来の候補です。外部送信は行いません。"
+                            " 下の上書き欄は「選択候補のみ」の場合に利用できます。"
+                        )
+                        highlight_metadata_title = gr.Textbox(
+                            value="", label="タイトル（空なら候補タイトル）",
+                        )
+                        highlight_metadata_description = gr.Textbox(
+                            value="", label="説明（空なら候補の要約）", lines=3,
+                        )
+                        highlight_metadata_tags = gr.Textbox(
+                            value="", label="タグ（空なら候補タグ・カンマ区切り）",
+                        )
                     highlight_export_btn = gr.Button(
                         "候補を切り抜いて保存",
                         variant="primary",
@@ -6287,6 +7868,43 @@ with gr.Blocks(title="動画シーン検索") as demo:
                         file_count="multiple",
                         interactive=False,
                     )
+                    highlight_export_job_id = gr.State("")
+                    with gr.Row():
+                        highlight_export_status = gr.Markdown(
+                            "**保存処理:** 待機中",
+                            elem_id="highlight-export-status",
+                        )
+                        highlight_export_stop_btn = gr.Button(
+                            "一括保存を停止", variant="stop", visible=False,
+                            scale=0, min_width=140,
+                            elem_id="highlight-export-stop",
+                        )
+                    with gr.Row():
+                        highlight_open_saved_btn = gr.Button(
+                            "保存したファイルの場所を開く",
+                            variant="secondary",
+                            scale=1,
+                        )
+                        highlight_open_saved_status = gr.Markdown("", scale=3)
+                    with gr.Accordion("YouTubeへ非公開アップロード（任意）", open=False):
+                        gr.Markdown(
+                            "上で保存した動画を、あなたのYouTubeチャンネルへ**非公開**で"
+                            "アップロードします。公開はYouTube Studioで確認してから行ってください。"
+                            "タイトル等は投稿用JSONがあればそれを、なければファイル名を使います。"
+                            "初回はブラウザでGoogleアカウントの許可を求められます。"
+                            "準備手順: docs/YOUTUBE_UPLOAD.md"
+                        )
+                        youtube_upload_confirm = gr.Checkbox(
+                            value=False,
+                            label="動画の内容と権利（配信者の許可・ガイドライン）を確認しました",
+                        )
+                        youtube_upload_btn = gr.Button(
+                            "保存した動画をYouTubeへ非公開でアップロード",
+                            variant="secondary",
+                        )
+                        youtube_upload_log = gr.Textbox(
+                            label="アップロードログ", interactive=False, lines=4,
+                        )
             llm_result_reload.click(
                 refresh_llm_video_picker,
                 inputs=[llm_summary_video_filter, llm_result_video],
@@ -6540,22 +8158,57 @@ with gr.Blocks(title="動画シーン検索") as demo:
                 ],
                 concurrency_id="intuitive-editor-state",
                 concurrency_limit=1,
-            )
+            ).success(fn=None, js=_OPEN_INTUITIVE_MAIN_TAB_JS)
             highlight_export_btn.click(
-                export_highlight_candidates,
+                start_intuitive_export_job,
+                inputs=None,
+                outputs=[
+                    highlight_export_job_id, highlight_export_status,
+                    highlight_export_stop_btn,
+                ],
+                show_progress="hidden",
+            ).then(
+                run_highlight_export_job,
                 inputs=[
                     llm_highlight_video,
                     highlight_candidate_select,
                     highlight_export_scope,
                     highlight_export_dir,
                     highlight_export_precise,
-                    highlight_export_format,
-                    highlight_short_layout,
-                    highlight_short_resolution,
-                    highlight_short_captions,
+                    gr.State("standard"), gr.State("blur"),
+                    gr.State("1080x1920"), gr.State(False),
+                    gr.State([]), gr.State({}),
+                    highlight_write_metadata, highlight_metadata_title,
+                    highlight_metadata_description, highlight_metadata_tags,
+                    highlight_export_job_id,
                 ],
-                outputs=[highlight_export_log, highlight_export_files],
+                outputs=[
+                    highlight_export_log, highlight_export_files,
+                    highlight_export_status, highlight_export_stop_btn,
+                ],
                 concurrency_id="highlight-export-io",
+                concurrency_limit=1,
+                api_name="export_highlight_candidates",
+            )
+            highlight_export_stop_btn.click(
+                cancel_intuitive_export_job,
+                inputs=[highlight_export_job_id],
+                outputs=[highlight_export_status, highlight_export_stop_btn],
+                concurrency_id="highlight-export-control",
+                concurrency_limit=2,
+                show_progress="hidden",
+            )
+            highlight_open_saved_btn.click(
+                open_saved_highlight_location,
+                inputs=[highlight_export_files, highlight_export_dir],
+                outputs=[highlight_open_saved_status],
+                show_progress="hidden",
+            )
+            youtube_upload_btn.click(
+                upload_saved_highlights_to_youtube,
+                inputs=[highlight_export_files, highlight_export_dir, youtube_upload_confirm],
+                outputs=[youtube_upload_log],
+                concurrency_id="youtube-upload",
                 concurrency_limit=1,
             )
 
@@ -6627,7 +8280,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "他のPCと再文字起こしなしで共有できます。\n\n"
             "**注意:** 共有zipには、全文文字起こし、単語時刻、検索チャンク、"
             "埋め込みベクトルが含まれます。動画本体、元ファイル名、送信元PCの"
-            "パス、旧内部IDは含めません。インポート後は元動画の再関連付けが必要です。"
+            "パス、旧内部IDは含めません。インポート後は元動画の再関連付けが必要です。\n\n"
+            "YouTube/Twitch由来の動画はURLも同梱できます。受け取った人が「動画の追加」で"
+            "そのURLを指定すると、ダウンロード後に自動で関連付き、文字起こしは不要です。"
         )
         with gr.Row():
             gr.Markdown("### エクスポート")
@@ -6639,6 +8294,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
         export_privacy_confirm = gr.Checkbox(
             label="共有内容を確認し、文字起こしに個人情報・機密情報がないことを確認しました",
             value=False,
+        )
+        export_include_url = gr.Checkbox(
+            label="YouTube/Twitch由来の動画なら元動画URLを同梱する（受け取った人がURLからダウンロードすると自動で関連付きます）",
+            value=True,
         )
         export_btn = gr.Button("エクスポート", variant="primary")
         export_file = gr.File(label="ダウンロード", interactive=False)
@@ -6673,7 +8332,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         export_btn.click(
             do_export,
-            inputs=[export_video_select, export_privacy_confirm],
+            inputs=[export_video_select, export_privacy_confirm, export_include_url],
             outputs=[export_file, export_path_box],
             concurrency_id="library-index-io",
             concurrency_limit=1,

@@ -432,15 +432,15 @@ ExportClip use case (application)
 - 発話区間時刻しかないcueは区間全体が一つのEffective Export Plan rangeへ含まれる場合だけ採用し、一部切断または分断では省略+warningとする。paddingで新たに含まれた区間も同じ規則で採用する。
 - 行幅、最大秒数などは実素材評価後に決める。
 
-### 9.4 Burn-in
+### 9.4 OutputProfile / Burn-in / Audio finishing
 
-本線から外す。SRT利用実績があり、焼き込み需要が確認された場合だけ次をspikeする。
+`experiment/short-video-finishing`で、元比率・9:16・1:1、字幕preset、font glyph検査、音量正規化、ローカルBGMを型付き`OutputProfile`へ統合した。previewと保存は同じresolver・字幕分割・canvas filterを使う。
 
-- libass/filter availability
-- 日本語font discoveryまたは同梱
-- Windows filter path escaping
-- 複数range precise export後の追加再encode時間
-- 配布環境差
+- ASSはjob固有stagingの相対名を参照し、Windows drive-letterをfilterへ埋め込まない。
+- BGM pathは一時的なrender入力とし、profile/manifestにはbasenameとcontent fingerprintだけを保持する。
+- OutputProfile適用時はpreciseな結合済みResult timelineを入力にして再encodeし、video duration、audio stream、最大音量をpublish前にprobeする。
+- `ShortVideoOptions`は互換adapterとして残し、新規保存use caseはOutputProfileを正とする。
+- 実験統合前に、利用者所有の実素材で字幕可読性、処理時間、音量の主観評価を行う。
 
 ## 10. Application commandと外部契約
 
@@ -706,9 +706,8 @@ Phase 5合格時だけ、pywebviewとTauriを比較する。sidecar、installer�
 
 需要または計測根拠が出るまで保留する。
 
-- 字幕焼き込み
-- 字幕style UI
-- batch clipの高度化
+- 字幕animation、色picker等の自由装飾
+- 複数profile総当たり等のbatch高度化
 - LLM要約、章分け、自動候補
 - 映像埋め込み検索
 - WebSocket進捗
@@ -725,6 +724,19 @@ ASR公開後の失敗許容derived-data stage、revision紐付け、loopback限�
 LLMへ自由な時刻を生成させない。候補はTranscript revisionとanalysis runへ紐づくderived dataとして
 別run/tableへ保存し、Edit planや成果物へ自動反映しない。採用判断はsegment根拠・尺・重複の
 機械検証と、ローカルでの候補preview評価を分けて行う。
+
+### 14.1 公開YouTube字幕のCodex連携（独立した任意adapter）
+
+2026-09-26の利用者依頼による追加。既存のUI/backend ownerを置換しない。
+`cut_mcp.py`はstdio上のinitialize/ping/toolsだけを持つ読み取り中心のMCP adapterとし、
+`moment_retrieval/youtube_captions.py`のUI非依存DTO・取得処理を利用する。
+既存依存関係を更新しないため、MCPのこの限定された契約は標準ライブラリで実装する。
+HTTP公開、SDK追加、認証機構変更、OpenAI API呼び出しは行わない。
+
+Library store・Search generation・application document repositoryへ接続せず、
+public字幕の有効期限付きメモリだけを所有する。これはASRの代替公開経路ではなく、
+ダウンロード前の内容確認用adapterである。将来のローカル編集MCPは別の承認・設計とし、
+既存documentのprocess-local状態やsingle-writer規則をこの実装で迂回しない。
 
 ## 15. 各フェーズ共通の完了条件
 

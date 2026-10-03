@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,8 @@ from cut_clip import cut_clips
 from . import db
 from .application import ApplicationError, DOCUMENTS, DocumentRepository, SaveTicket
 from .edit_domain import EffectiveExportPlan, make_effective_export_plan, ms_to_seconds
+from .export_jobs import EXPORT_JOBS, ExportJobRegistry, ExportStage
+from .output_profile import OutputProfile
 from .publication import private_source_fingerprint
 from .subtitles import SubtitleValidationError, validate_srt_text
 
@@ -30,6 +33,42 @@ class SaveError(RuntimeError):
 class ProbedArtifact:
     duration_ms: int
     tolerance_ms: int
+
+
+@dataclass(frozen=True)
+class ProbedAudioArtifact:
+    present: bool
+    max_volume_db: float | None
+
+
+def probe_staged_audio(path: Path) -> ProbedAudioArtifact:
+    """Verify an output audio stream and measure its maximum sample level."""
+    try:
+        completed = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=index", "-of", "json", str(path),
+        ], capture_output=True, text=True, check=True)
+        if not (json.loads(completed.stdout).get("streams") or []):
+            return ProbedAudioArtifact(False, None)
+        volume = subprocess.run([
+            "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+            "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-",
+        ], capture_output=True, text=True, check=True)
+        match = re.search(
+            r"max_volume:\s*(-?(?:inf|\d+(?:\.\d+)?))\s*dB",
+            volume.stderr,
+        )
+        if not match:
+            raise ValueError("max volume is missing")
+        raw = match.group(1)
+        return ProbedAudioArtifact(
+            True, -120.0 if raw == "-inf" else float(raw),
+        )
+    except (
+        OSError, ValueError, TypeError, json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        raise SaveError("AUDIO_PROBE_FAILED: staged audio could not be verified") from exc
 
 
 def _positive_fraction(value: object) -> Fraction | None:
@@ -125,6 +164,27 @@ class SaveResult:
     ticket: SaveTicket
 
 
+@dataclass(frozen=True)
+class ExportVariantRequest:
+    output_path: Path
+    output_profile: OutputProfile
+    subtitle_text: str | None = None
+    warnings: tuple[str, ...] = ()
+    postprocessor: Callable[[Path, Path, float], None] | None = None
+
+
+@dataclass(frozen=True)
+class ExportVariantFailure:
+    output_name: str
+    error_code: str
+
+
+@dataclass(frozen=True)
+class BatchSaveResult:
+    results: tuple[SaveResult, ...]
+    failures: tuple[ExportVariantFailure, ...]
+
+
 class ArtifactTransaction:
     def __init__(
         self, output_path: Path, source_path: Path, effective_plan: EffectiveExportPlan,
@@ -132,6 +192,10 @@ class ArtifactTransaction:
         cancel_event: threading.Event | None = None,
         cutter: Callable = cut_clips,
         probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+        audio_probe: Callable[[Path], ProbedAudioArtifact] = probe_staged_audio,
+        postprocessor: Callable[[Path, Path, float], None] | None = None,
+        output_profile: OutputProfile | None = None,
+        progress_callback: Callable[[ExportStage], None] | None = None,
     ):
         self.output_path = Path(output_path)
         self.source_path = Path(source_path)
@@ -141,6 +205,19 @@ class ArtifactTransaction:
         self.cancel_event = cancel_event or threading.Event()
         self.cutter = cutter
         self.probe = probe
+        self.audio_probe = audio_probe
+        # A postprocessor receives a precisely joined result-timeline artifact
+        # (not the original source) and writes the final staging artifact.  This
+        # keeps captions and portrait transforms aligned with multi-range edits.
+        self.postprocessor = postprocessor
+        # This is render metadata only.  It intentionally contains no source
+        # path or transcript and is therefore safe for the local artifact manifest.
+        self.output_profile = output_profile.validate() if output_profile else None
+        self.progress_callback = progress_callback
+
+    def _progress(self, stage: ExportStage) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(stage)
 
     def execute(
         self, ticket: SaveTicket, subtitle_text: str | None = None,
@@ -190,13 +267,31 @@ class ArtifactTransaction:
                 [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
                 for item in self.effective_plan.plan.kept_ranges
             ]
+            staged_joined = (
+                staging / f".joined-{self.output_path.name}"
+                if self.postprocessor is not None else staged_video
+            )
+            self._progress(ExportStage.JOINING)
             self.cutter(
-                self.source_path, ranges, staged_video, precise=self.precise,
+                self.source_path, ranges, staged_joined, precise=self.precise,
                 duration=ms_to_seconds(self.effective_plan.plan.source_duration_ms),
                 pad=0.0, cancel_event=self.cancel_event,
             )
             if self.cancel_event.is_set():
                 raise SaveError("save was cancelled")
+            if self.postprocessor is not None:
+                self._progress(ExportStage.RENDERING)
+                try:
+                    self.postprocessor(
+                        staged_joined,
+                        staged_video,
+                        ms_to_seconds(self.effective_plan.timeline_map.result_duration_ms),
+                    )
+                finally:
+                    staged_joined.unlink(missing_ok=True)
+                if self.cancel_event.is_set():
+                    raise SaveError("save was cancelled")
+            self._progress(ExportStage.PROBING)
             probed = self.probe(staged_video)
             if probed.duration_ms <= 0 or probed.tolerance_ms < 0:
                 raise SaveError("ARTIFACT_PROBE_FAILED: staged video timing is invalid")
@@ -222,6 +317,32 @@ class ArtifactTransaction:
                     "FAST_MODE_DURATION_DRIFT: staged video differs from the planned "
                     f"duration by {duration_delta_ms} ms"
                 )
+            audio_verification = None
+            if self.output_profile is not None and (
+                self.output_profile.audio.normalize_source
+                or self.output_profile.audio.bgm_enabled
+            ):
+                audio_probe = self.audio_probe(staged_video)
+                expected_audio = bool(
+                    self.output_profile.audio.normalization_applied is True
+                    or self.output_profile.audio.bgm_applied is True
+                )
+                if expected_audio and not audio_probe.present:
+                    raise SaveError(
+                        "AUDIO_STREAM_MISSING: processed output has no audio stream"
+                    )
+                clipped = bool(
+                    audio_probe.present
+                    and audio_probe.max_volume_db is not None
+                    and audio_probe.max_volume_db > -0.1
+                )
+                if clipped:
+                    manifest_warnings.append("AUDIO_CLIPPING_DETECTED")
+                audio_verification = {
+                    "present": audio_probe.present,
+                    "max_volume_db": audio_probe.max_volume_db,
+                    "clipping_detected": clipped,
+                }
             subtitle_path = None
             if subtitle_text is not None:
                 try:
@@ -250,6 +371,10 @@ class ArtifactTransaction:
                 "duration_matches_plan": duration_matches_plan,
                 "warnings": manifest_warnings,
             }
+            if self.output_profile is not None:
+                manifest["output_profile"] = self.output_profile.to_manifest()
+            if audio_verification is not None:
+                manifest["audio_verification"] = audio_verification
             staged_manifest.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -258,6 +383,7 @@ class ArtifactTransaction:
             # Keep this as the final operation before the first public replace.
             # The manifest remains the commit marker for crash recovery.
             _verify_source(self.source_path, self.expected_source_fingerprint)
+            self._progress(ExportStage.PUBLISHING)
             os.replace(staged_video, self.output_path)
             if subtitle_path:
                 os.replace(staged_srt, subtitle_path)
@@ -284,10 +410,103 @@ def save_document(
     documents: DocumentRepository = DOCUMENTS,
     cutter: Callable = cut_clips,
     probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+    audio_probe: Callable[[Path], ProbedAudioArtifact] = probe_staged_audio,
+    postprocessor: Callable[[Path, Path, float], None] | None = None,
+    output_profile: OutputProfile | None = None,
+    export_job_id: str | None = None,
+    export_jobs: ExportJobRegistry = EXPORT_JOBS,
     source_fingerprint_resolver: Callable[[str, str], str | None] = (
         _resolve_expected_source_fingerprint
     ),
 ) -> SaveResult:
+    if export_job_id is not None:
+        if export_jobs.get(export_job_id) is None:
+            raise ApplicationError("export job is missing")
+        if cancel_event is None:
+            cancel_event = export_jobs.cancel_event(export_job_id)
+
+    def report(stage: ExportStage) -> None:
+        if export_job_id is not None:
+            export_jobs.transition(export_job_id, stage)
+
+    try:
+        report(ExportStage.VALIDATING)
+        document = documents.get(document_id)
+        if not document or document.closed:
+            raise ApplicationError("document is closed or missing")
+        expected_fingerprint = document.expected_source_fingerprint
+        if expected_fingerprint is None:
+            expected_fingerprint = source_fingerprint_resolver(
+                document.public_video_id, document.source_generation,
+            )
+        # Validate before creating a SaveTicket, staging directory, or output claim.
+        _verify_source(Path(source_path), expected_fingerprint)
+        ticket = documents.begin_save(document_id, expected_fingerprint)
+        recover_artifact_transactions(Path(output_path).parent)
+        effective = make_effective_export_plan(ticket.snapshot, pad_before_ms, pad_after_ms)
+        # A second rendering pass (caption burn-in / portrait layout) must start
+        # from frame-accurate joined ranges.  The fast stream-copy path remains
+        # available only for the unchanged standard export.
+        effective_precise = bool(
+            precise or subtitle_text is not None or postprocessor is not None
+        )
+        transaction = ArtifactTransaction(
+            output_path, source_path, effective, effective_precise,
+            expected_fingerprint, cancel_event, cutter, probe, audio_probe,
+            postprocessor, output_profile, report,
+        )
+        result = transaction.execute(ticket, subtitle_text, warnings)
+        documents.complete_save(ticket, result.commit_id)
+        if export_job_id is not None:
+            export_jobs.complete(export_job_id)
+        return result
+    except Exception as exc:
+        if export_job_id is not None:
+            current = export_jobs.get(export_job_id)
+            if current is not None and not current.terminal:
+                if cancel_event is not None and cancel_event.is_set():
+                    export_jobs.acknowledge_cancel(export_job_id)
+                else:
+                    export_jobs.fail(export_job_id, _export_error_code(exc))
+        raise
+
+
+def _export_error_code(exc: Exception) -> str:
+    if isinstance(exc, ApplicationError):
+        return getattr(exc, "code", "APPLICATION_ERROR")
+    prefix = str(exc or "").partition(":")[0].strip().upper()
+    if prefix and all(ch.isalnum() or ch == "_" for ch in prefix):
+        return prefix[:80]
+    if isinstance(exc, SaveError):
+        return "SAVE_FAILED"
+    return "EXPORT_FAILED"
+
+
+def save_document_variants(
+    document_id: str,
+    source_path: Path,
+    variants: list[ExportVariantRequest] | tuple[ExportVariantRequest, ...],
+    *,
+    pad_before_ms: int = 0,
+    pad_after_ms: int = 0,
+    cancel_event: threading.Event | None = None,
+    documents: DocumentRepository = DOCUMENTS,
+    cutter: Callable = cut_clips,
+    probe: Callable[[Path], ProbedArtifact] = probe_staged_video,
+    audio_probe: Callable[[Path], ProbedAudioArtifact] = probe_staged_audio,
+    source_fingerprint_resolver: Callable[[str, str], str | None] = (
+        _resolve_expected_source_fingerprint
+    ),
+) -> BatchSaveResult:
+    """Join one immutable edit snapshot once, then fan out output profiles.
+
+    Each public artifact still uses its own claim, staging directory, probe and
+    manifest.  A failed variant therefore does not roll back another variant
+    which has already been verified and published.
+    """
+    requested = tuple(variants)
+    if not requested:
+        raise ValueError("at least one export variant is required")
     document = documents.get(document_id)
     if not document or document.closed:
         raise ApplicationError("document is closed or missing")
@@ -296,19 +515,77 @@ def save_document(
         expected_fingerprint = source_fingerprint_resolver(
             document.public_video_id, document.source_generation,
         )
-    # Validate before creating a SaveTicket, staging directory, or output claim.
-    _verify_source(Path(source_path), expected_fingerprint)
+    source_path = Path(source_path)
+    _verify_source(source_path, expected_fingerprint)
     ticket = documents.begin_save(document_id, expected_fingerprint)
-    recover_artifact_transactions(Path(output_path).parent)
-    effective = make_effective_export_plan(ticket.snapshot, pad_before_ms, pad_after_ms)
-    effective_precise = bool(precise or subtitle_text is not None)
-    transaction = ArtifactTransaction(
-        output_path, source_path, effective, effective_precise,
-        expected_fingerprint, cancel_event, cutter, probe,
+    effective = make_effective_export_plan(
+        ticket.snapshot, pad_before_ms, pad_after_ms,
     )
-    result = transaction.execute(ticket, subtitle_text, warnings)
-    documents.complete_save(ticket, result.commit_id)
-    return result
+    if cancel_event is not None and cancel_event.is_set():
+        raise SaveError("save was cancelled")
+    output_parents = {Path(item.output_path).parent for item in requested}
+    for output_parent in output_parents:
+        output_parent.mkdir(parents=True, exist_ok=True)
+        # Recover public artifact transactions before creating the shared
+        # intermediate.  Running recovery inside the fan-out loop could remove
+        # the active batch workspace because both are intentionally hidden.
+        recover_artifact_transactions(output_parent)
+    common_parent = Path(requested[0].output_path).parent
+    results: list[SaveResult] = []
+    failures: list[ExportVariantFailure] = []
+    with tempfile.TemporaryDirectory(
+        prefix=".variant-export-job-", dir=common_parent,
+    ) as temporary_name:
+        joined = Path(temporary_name) / "joined.mp4"
+        ranges = [
+            [ms_to_seconds(item.start_ms), ms_to_seconds(item.end_ms)]
+            for item in effective.plan.kept_ranges
+        ]
+        cutter(
+            source_path, ranges, joined, precise=True,
+            duration=ms_to_seconds(effective.plan.source_duration_ms),
+            pad=0.0, cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise SaveError("save was cancelled")
+
+        def reuse_joined(
+            _source: Path, _ranges, target: Path, **_kwargs,
+        ) -> Path:
+            shutil.copy2(joined, target)
+            return Path(target)
+
+        for variant in requested:
+            output_path = Path(variant.output_path)
+            try:
+                transaction = ArtifactTransaction(
+                    output_path,
+                    source_path,
+                    effective,
+                    True,
+                    expected_fingerprint,
+                    cancel_event,
+                    reuse_joined,
+                    probe,
+                    audio_probe,
+                    variant.postprocessor,
+                    variant.output_profile,
+                )
+                result = transaction.execute(
+                    ticket,
+                    variant.subtitle_text,
+                    list(variant.warnings),
+                )
+                documents.complete_save(ticket, result.commit_id)
+                results.append(result)
+            except Exception as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise
+                failures.append(ExportVariantFailure(
+                    output_path.name,
+                    _export_error_code(exc),
+                ))
+    return BatchSaveResult(tuple(results), tuple(failures))
 
 
 def recover_artifact_transactions(output_root: Path) -> list[Path]:

@@ -24,8 +24,14 @@ credentials*.json
 *.vindex.zip
 benchmark-results/
 
+# Local source-only UI snapshots (never include user media or indexes)
+.ui-backups/
+
 # OS
 Thumbs.db
 .DS_Store
 *.lnk
 .claude/settings.local.json
+
+# OAuth client bundled into a distributed copy of CUT (do not publish)
+youtube_oauth_client.json

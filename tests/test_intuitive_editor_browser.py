@@ -449,11 +449,12 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
           }));
         }""")
         self.assertGreaterEqual(layout["#intuitive-preview-panel"]["w"], 480)
-        self.assertGreaterEqual(layout["#intuitive-search-panel"]["w"], 400)
+        studio = page.locator("#intuitive-editor-tab.studio-layout").count() > 0
+        self.assertGreaterEqual(layout["#intuitive-search-panel"]["w"], 280 if studio else 400)
         self.assertGreaterEqual(layout["#intuitive-transcript-panel"]["w"], 280)
         self.assertLess(
-            layout["#intuitive-preview-panel"]["x"],
-            layout["#intuitive-search-panel"]["x"],
+            layout["#intuitive-search-panel" if studio else "#intuitive-preview-panel"]["x"],
+            layout["#intuitive-preview-panel" if studio else "#intuitive-search-panel"]["x"],
         )
         self.assertLess(
             layout["#intuitive-search-panel"]["x"],
@@ -467,6 +468,36 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
             layout["#intuitive-save-bar"]["y"] - 8,
         )
         self.assertLessEqual(layout["#intuitive-save-bar"]["bottom"], 900)
+
+        output_tab = page.get_by_role("tab", name="③ 出力・字幕", exact=True)
+        output_tab.click()
+        page.get_by_label("選択字幕の本文").wait_for(state="visible")
+        page.get_by_role("button", name="ASR字幕を読み込む", exact=True).wait_for(
+            state="visible"
+        )
+        page.get_by_role("button", name="この字幕を反映", exact=True).wait_for(
+            state="visible"
+        )
+        page.get_by_role("paragraph").filter(
+            has_text="字幕一覧（行をクリックして選択）"
+        ).wait_for(state="visible")
+        page.get_by_role("button", name="ASR字幕を読み込む", exact=True).click()
+        caption_text = page.get_by_label("選択字幕の本文")
+        page.wait_for_function(
+            "(selector) => document.querySelector(selector)?.value.includes('alpha')",
+            arg="#intuitive-output-workspace textarea",
+        )
+        caption_text.fill("edited caption")
+        page.get_by_role("button", name="この字幕を反映", exact=True).click()
+        page.get_by_text(
+            "確認するには「出力プレビューを更新」を押してください。",
+            exact=False,
+        ).wait_for(state="visible")
+        self.assertIn(
+            "edited caption",
+            page.locator("#intuitive-output-workspace").inner_text(),
+        )
+        overall_timeline_tab.click()
 
         def run_editor_command(action):
             revision = int(root.get_attribute("data-revision"))
@@ -1194,6 +1225,108 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
         ]
         self.assertEqual(leftovers, [])
 
+    def test_studio_layout_controls_reflow_without_editor_mutation(self):
+        if os.environ.get("CUT_VIDEO_UI_LAYOUT", "studio").lower() == "classic":
+            self.skipTest("Studio-only presentation controls")
+        context = self.browser.new_context(viewport={"width": 1440, "height": 900})
+        self.addCleanup(context.close)
+        page = context.new_page()
+        page.set_default_timeout(30_000)
+        page.goto(self.base_url, wait_until="domcontentloaded")
+        page.locator("#intuitive-video-card-grid .intuitive-video-card").first.click()
+        root = page.locator("#intuitive-toolbox [data-intuitive-root]")
+        root.wait_for(state="visible")
+        controls = page.locator("#studio-layout-controls")
+        controls.wait_for(state="visible")
+        controls.locator("summary").click()
+        controls.wait_for(state="attached")
+        page.wait_for_function(
+            "() => document.querySelector('#studio-layout-controls')"
+            ".hasAttribute('data-studio-ready')"
+        )
+        before = (root.get_attribute("data-revision"), root.get_attribute("data-edit-dirty"))
+        self.assertIsNotNone(before[0])
+        self.assertIsNotNone(before[1])
+        geometry = page.evaluate("""() => {
+          const rect = (id) => document.querySelector(id).getBoundingClientRect();
+          return {search: rect('#intuitive-search-panel'), preview: rect('#intuitive-preview-panel'), transcript: rect('#intuitive-transcript-panel')};
+        }""")
+        self.assertLess(geometry["search"]["x"], geometry["preview"]["x"])
+        self.assertLess(geometry["preview"]["x"], geometry["transcript"]["x"])
+        self.assertAlmostEqual(geometry["search"]["y"], geometry["preview"]["y"], delta=3)
+        self.assertAlmostEqual(geometry["preview"]["y"], geometry["transcript"]["y"], delta=3)
+        playback = page.locator("#intuitive-preview-video .controls").bounding_box()
+        self.assertIsNotNone(playback)
+        self.assertLessEqual(playback["y"] + playback["height"], geometry["preview"]["bottom"] + 2)
+        page.locator("#studio-layout-controls [name=order]").select_option("reverse-sides")
+        page.locator("#studio-layout-controls [name=search]").evaluate(
+            "input => { input.value = '32'; input.dispatchEvent(new Event('input', {bubbles:true})); }"
+        )
+        changed = page.evaluate("""() => {
+          const rect = (id) => document.querySelector(id).getBoundingClientRect();
+          return {search: rect('#intuitive-search-panel'), preview: rect('#intuitive-preview-panel'), transcript: rect('#intuitive-transcript-panel')};
+        }""")
+        self.assertGreater(changed["search"]["width"], geometry["search"]["width"])
+        self.assertLess(changed["transcript"]["x"], changed["preview"]["x"])
+        self.assertLess(changed["preview"]["x"], changed["search"]["x"])
+        self.assertAlmostEqual(changed["search"]["y"], changed["preview"]["y"], delta=3)
+        page.locator("#studio-layout-controls [name=height]").evaluate(
+            "input => { input.value = '440'; input.dispatchEvent(new Event('input', {bubbles:true})); }"
+        )
+        self.assertAlmostEqual(
+            page.locator("#intuitive-preview-panel").bounding_box()["height"], 440, delta=4
+        )
+        self.assertAlmostEqual(
+            page.locator("#intuitive-preview-video").bounding_box()["height"], 440, delta=4
+        )
+        after = (root.get_attribute("data-revision"), root.get_attribute("data-edit-dirty"))
+        self.assertEqual(after, before)
+        page.reload(wait_until="domcontentloaded")
+        page.locator("#studio-layout-controls summary").click()
+        page.wait_for_function(
+            "() => document.querySelector('#studio-layout-controls')"
+            ".hasAttribute('data-studio-ready')"
+        )
+        self.assertEqual(page.locator("#studio-layout-controls [name=order]").input_value(), "reverse-sides")
+        page.evaluate("localStorage.setItem('cut-video-studio-layout-v1', '{bad')")
+        page.reload(wait_until="domcontentloaded")
+        page.locator("#studio-layout-controls summary").click()
+        page.wait_for_function(
+            "() => document.querySelector('#studio-layout-controls')"
+            ".hasAttribute('data-studio-ready')"
+        )
+        self.assertEqual(page.locator("#studio-layout-controls [name=order]").input_value(), "normal")
+        page.evaluate(
+            "localStorage.setItem('cut-video-studio-layout-v1', "
+            "'{\"search\":null,\"transcript\":99,\"height\":\"Infinity\",\"order\":\"bad\"}')"
+        )
+        page.reload(wait_until="domcontentloaded")
+        page.locator("#studio-layout-controls summary").click()
+        page.wait_for_function(
+            "() => document.querySelector('#studio-layout-controls')"
+            ".hasAttribute('data-studio-ready')"
+        )
+        self.assertEqual(page.locator("#studio-layout-controls [name=search]").input_value(), "24")
+        self.assertEqual(page.locator("#studio-layout-controls [name=transcript]").input_value(), "28")
+        self.assertEqual(page.locator("#studio-layout-controls [name=height]").input_value(), "360")
+
+        denied = self.browser.new_context(viewport={"width": 1440, "height": 900})
+        self.addCleanup(denied.close)
+        denied.add_init_script("Storage.prototype.setItem = () => { throw new Error('denied'); };")
+        denied_page = denied.new_page()
+        denied_page.goto(self.base_url, wait_until="domcontentloaded")
+        denied_controls = denied_page.locator("#studio-layout-controls")
+        denied_controls.wait_for(state="visible")
+        denied_controls.locator("summary").click()
+        denied_page.wait_for_function(
+            "() => document.querySelector('#studio-layout-controls')"
+            ".hasAttribute('data-studio-ready')"
+        )
+        denied_controls.locator("[name=search]").evaluate(
+            "input => { input.value = '31'; input.dispatchEvent(new Event('input', {bubbles:true})); }"
+        )
+        self.assertEqual(denied_controls.locator("[name=search]").input_value(), "31")
+
     @unittest.skipUnless(
         os.environ.get("CUT_VIDEO_RUN_BROWSER_PERF") == "1",
         "600-second browser performance measurement is opt-in",
@@ -1422,13 +1555,16 @@ class IntuitiveEditorBrowserTests(unittest.TestCase):
                                 layout["search"]["bottom"]) - 2,
                         )
                     else:
+                        first, second = ("search", "preview") if page.locator(
+                            "#intuitive-editor-tab.studio-layout"
+                        ).count() else ("preview", "search")
                         self.assertGreaterEqual(
-                            layout["search"]["y"],
-                            layout["preview"]["bottom"] - 2,
+                            layout[second]["y"],
+                            layout[first]["bottom"] - 2,
                         )
                         self.assertGreaterEqual(
                             layout["transcript"]["y"],
-                            layout["search"]["bottom"] - 2,
+                            layout[second]["bottom"] - 2,
                         )
                 finally:
                     context.close()

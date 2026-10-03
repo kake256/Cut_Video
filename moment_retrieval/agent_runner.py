@@ -139,5 +139,7 @@ def run_agent(
             process.kill()
             raise AgentError("AIの処理が時間内に終わりませんでした。") from exc
     if code != 0:
-        raise AgentError(f"{AGENT_LABELS.get(agent, agent)} が異常終了しました（exit {code}）。")
+        # The CLI's own last words (e.g. an expired login) tell the user what to fix.
+        detail = " / ".join(lines[-3:])[-300:]
+        raise AgentError(f"{AGENT_LABELS.get(agent, agent)} が異常終了しました（exit {code}）: {detail}")
     return "\n".join(lines)

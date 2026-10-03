@@ -463,7 +463,8 @@ def auto_jobs_view():
         if job.uploads and not allowed:
             parts.append(f"- 公開: {html.escape(reason)}")
         recent = "\n".join(job.log[-8:])
-        parts.append(f"<details><summary>ログ</summary>\n\n```\n{recent}\n```\n</details>")
+        # Blank lines around the HTML block keep the next job's heading rendered as Markdown.
+        parts.append(f"\n<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n")
     running = [(job.job_id, job.job_id) for job in jobs if job.state in {"queued", "running"}]
     return (
         "\n".join(parts),
@@ -8512,7 +8513,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         demo.load(auto_channel_rows, outputs=[auto_channels_df])
         demo.load(lambda: gr.update(choices=auto_channel_choices()), outputs=[auto_channel_remove])
         demo.load(lambda: channel_policy.settings()["daily_limit"], outputs=[auto_limit])
-        demo.load(auto_jobs_view, outputs=auto_job_outputs)
+        demo.load(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
         auto_timer.tick(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
         auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md], concurrency_id="youtube-account")
         auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md])

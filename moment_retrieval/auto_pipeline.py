@@ -343,7 +343,14 @@ class AutoPipeline:
         after = self._latest_run_id(job.video_id)
         if not after or after == before:
             raise PipelineError(f"{label} が候補を保存しませんでした。")
-        summary = [line for line in output.splitlines() if line.strip()][-6:]
+        # Keep the agent's closing report; drop CLI chatter such as token counts.
+        noise = {"codex", "tokens used", "user", "assistant"}
+        summary = [
+            line for line in output.splitlines()
+            if line.strip() and line.strip().lower() not in noise
+            and not line.strip().replace(",", "").isdigit() and not line.startswith("mcp:")
+        ]
+        summary = list(dict.fromkeys(summary))[-4:]
         for line in summary:
             self._log(job, f"  {label}: {line}")
         return after

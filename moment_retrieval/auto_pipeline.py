@@ -45,6 +45,8 @@ class AutoJob:
     max_duration_sec: float = 60.0
     layout: str = "blur"
     upload: bool = True
+    # Only fetch the source and attach it to its (shared) transcript; no clipping.
+    link_only: bool = False
     model: str = ""
     effort: str = ""
     state: str = "queued"
@@ -183,7 +185,7 @@ class AutoPipeline:
 
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
                max_duration_sec: float = 60.0, layout: str = "blur", upload: bool = True,
-               model: str = "", effort: str = "") -> AutoJob:
+               model: str = "", effort: str = "", link_only: bool = False) -> AutoJob:
         if agent not in agent_runner.AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
         try:
@@ -200,7 +202,7 @@ class AutoPipeline:
             job_id="auto_" + secrets.token_hex(6), source=validate_source(source), agent=agent,
             clip_count=int(clip_count), min_duration_sec=float(min_duration_sec),
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
-            model=model, effort=effort,
+            model=model, effort=effort, link_only=bool(link_only),
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -260,6 +262,10 @@ class AutoPipeline:
             self._check_cancel(job)
             job.step = STEPS[1]
             job.video_id = self.steps["index"](job, Path(local_path))
+            if job.link_only:
+                job.state = "done"
+                self._log(job, "元動画をダウンロードして文字起こしに関連付けました。切り抜きはしていません。")
+                return
             self._check_cancel(job)
             job.step = STEPS[2]
             job.highlight_run_id = self.steps["select"](job)

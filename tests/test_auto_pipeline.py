@@ -216,6 +216,17 @@ class PipelineTest(_Isolated):
         relink.assert_called_once_with(ids["shared"], downloaded)
         self.assertEqual(video_id, ids["shared"])
 
+    def test_link_only_job_downloads_and_links_without_clipping(self):
+        calls = []
+        pipeline = self._pipeline(calls)
+        job = auto_pipeline.AutoJob(job_id="auto_link", source="https://www.twitch.tv/videos/123456",
+                                    agent="codex", link_only=True)
+        pipeline.jobs[job.job_id] = job
+        pipeline.run(job)
+        self.assertEqual(job.state, "done")
+        self.assertEqual(calls, ["metadata", "download", "index"])
+        self.assertIn("関連付けました", job.log[-1])
+
     def test_unfinished_jobs_are_marked_failed_after_restart(self):
         directory = config.CACHE_ROOT / "auto_jobs"
         directory.mkdir(parents=True)

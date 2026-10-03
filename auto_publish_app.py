@@ -303,27 +303,30 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
         raise gr.Error(str(exc)) from exc
     log = "\n".join(messages)
     new_ids = [item["video_id"] for item in library_videos() if item["video_id"] not in before]
-    if start_clipping:
-        if not new_ids:
-            log += "\n切り抜きは開始していません（新しく使える動画がありません。元動画URLのない共有zipは、元動画をこのPCに用意してください）。"
-        for video_id in new_ids:
-            conn = db.get_conn()
-            try:
-                origin = source_origin.origin_url_for_video(conn, db.get_video(conn, video_id) or {})
-            finally:
-                conn.close()
-            if not origin:
-                continue
-            try:
-                job = _auto_pipeline().submit(
-                    origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                    max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
-                    model=model or "", effort=(effort or "") if agent == "codex" else "",
-                )
-            except PipelineError as exc:
-                log += f"\n切り抜きを開始できませんでした: {exc}"
-                continue
-            log += f"\n切り抜きジョブを開始しました（{job.job_id}）。元動画をダウンロードして共有された文字起こしに関連付けます。"
+    if not new_ids:
+        log += "\n元動画のダウンロードは行いませんでした（新しく使える動画がありません。元動画URLのない共有zipは、元動画をこのPCに用意してください）。"
+    for video_id in new_ids:
+        conn = db.get_conn()
+        try:
+            origin = source_origin.origin_url_for_video(conn, db.get_video(conn, video_id) or {})
+        finally:
+            conn.close()
+        if not origin:
+            continue
+        # The original video is always fetched from the bundled URL; clipping is optional.
+        try:
+            job = _auto_pipeline().submit(
+                origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
+                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                model=model or "", effort=(effort or "") if agent == "codex" else "",
+                link_only=not start_clipping,
+            )
+        except PipelineError as exc:
+            log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
+            continue
+        what = "続けて切り抜き・アップロードまで進めます" if start_clipping else "切り抜きは行いません"
+        log += (f"\n元動画のダウンロードを開始しました（{job.job_id}）。"
+                f"共有された文字起こしに関連付けます（{what}）。")
     choices = library_choices()
     return log, gr.update(choices=choices), gr.update(choices=choices)
 
@@ -417,9 +420,10 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             share_export_md = gr.Markdown("")
             gr.Markdown("### 読み込む")
             share_import_file = gr.File(label="共有zip（.vindex.zip）", file_types=[".zip"], type="filepath", height=120)
+            gr.Markdown("<small>元動画のURLが入ったzipなら、読み込み後に元動画を自動でダウンロードして関連付けます。</small>")
             share_start = gr.Checkbox(
                 value=True,
-                label="読み込んだら、元動画をダウンロードして「切り抜き」タブの設定で切り抜き・アップロードまで進める",
+                label="続けて「切り抜き」タブの設定で切り抜き・アップロードまで進める",
             )
             share_import_btn = gr.Button("読み込む", variant="primary")
             share_import_log = gr.Textbox(label="読み込みログ", interactive=False, lines=6)

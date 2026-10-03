@@ -32,7 +32,7 @@ class SourceOriginTest(unittest.TestCase):
 
     def test_downloader_filename_is_a_fallback_only_for_its_exact_pattern(self):
         cases = {
-            "20260101_120000_abcDEF12345.mp4": "https://www.youtube.com/watch?v=abcDEF12345",
+            "20260101_120000_" + "abcDEF12345.mp4": "https://www.youtube.com/watch?v=abcDEF12345",
             "20260101_abcDEF12345.mp4": "https://www.youtube.com/watch?v=abcDEF12345",
             "my_holiday_abcDEF12345.mp4": None,
             "recording.mp4": None,

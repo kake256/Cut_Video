@@ -430,6 +430,23 @@ class AutoPipeline:
         detail = " / ".join(item for item in (job.model, job.effort) if item)
         self._log(job, f"{label}{f'（{detail}）' if detail else ''} に文字起こしを渡して候補を選んでもらいます。")
 
+        if job.agent == "local":
+            from .local_selector import LocalSelectionError, select_clips
+
+            try:
+                select_clips(
+                    job.video_id, clip_count=job.clip_count, min_duration_sec=job.min_duration_sec,
+                    max_duration_sec=job.max_duration_sec, model=job.model,
+                    log=lambda message: self._log(job, message, replace_progress=True),
+                )
+            except LocalSelectionError as exc:
+                raise PipelineError(str(exc)) from exc
+            self._check_cancel(job)
+            after = self._latest_run_id(job.video_id)
+            if not after or after == before:
+                raise PipelineError(f"{label} が候補を保存しませんでした。")
+            return after
+
         def register(process):
             with self.lock:
                 self.processes[job.job_id] = process

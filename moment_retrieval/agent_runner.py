@@ -19,13 +19,14 @@ from pathlib import Path
 from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-AGENTS = ("codex", "claude")
-AGENT_LABELS = {"codex": "Codex", "claude": "Claude Code"}
+AGENTS = ("codex", "claude", "local")
+AGENT_LABELS = {"codex": "Codex", "claude": "Claude Code", "local": "ローカルAI（Ollama）"}
 DEFAULT_CODEX_MODEL = "gpt-6-luna"
 DEFAULT_EFFORT = "high"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODELS = (("既定", ""), ("Opus", "opus"), ("Sonnet", "sonnet"))
 _MODEL_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_OLLAMA_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 CLAUDE_TOOLS = ("cut_list_videos", "cut_read_transcript", "cut_search_transcript", "cut_propose_clips")
 
 
@@ -76,7 +77,8 @@ def codex_models() -> list[tuple[str, str]]:
 
 def validate_model(agent: str, model: str, effort: str) -> tuple[str, str]:
     model, effort = str(model or "").strip(), str(effort or "").strip()
-    if model and not _MODEL_SLUG.fullmatch(model):
+    pattern = _OLLAMA_MODEL if agent == "local" else _MODEL_SLUG
+    if model and not pattern.fullmatch(model):
         raise AgentError("モデル名が正しくありません。")
     if effort and (agent != "codex" or effort not in EFFORTS):
         raise AgentError("推論の強さが正しくありません。")
@@ -97,7 +99,12 @@ def find_executable(agent: str) -> str | None:
 
 
 def available_agents() -> dict[str, bool]:
-    return {agent: find_executable(agent) is not None for agent in AGENTS}
+    """Usable right now: CLIs that are installed, and a running local Ollama."""
+    from .ai_setup import ollama_models
+
+    found = {agent: find_executable(agent) is not None for agent in ("codex", "claude")}
+    found["local"] = bool(ollama_models())
+    return found
 
 
 def _mcp_server() -> dict:

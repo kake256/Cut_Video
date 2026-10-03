@@ -17,7 +17,7 @@ os.chdir(Path(__file__).resolve().parent)
 
 import gradio as gr  # noqa: E402
 
-from moment_retrieval import agent_runner, gcloud_setup, youtube_upload  # noqa: E402
+from moment_retrieval import agent_runner, ai_setup, config, gcloud_setup, youtube_upload  # noqa: E402
 from moment_retrieval.auto_pipeline import (  # noqa: E402
     LIBRARY_PREFIX, AutoPipeline, PipelineError, library_videos,
 )
@@ -163,10 +163,10 @@ def auto_disconnect_account() -> str:
 
 
 def auto_agent_status() -> str:
-    found = agent_runner.available_agents()
+    status = ai_setup.all_status()
+    short = {"codex": "Codex", "claude": "Claude Code", "local": "ローカルAI"}
     return " / ".join(
-        f"{agent_runner.AGENT_LABELS[name]}: {'利用可' if ok else '見つかりません'}"
-        for name, ok in found.items()
+        f"{short[name]}: {'利用可' if item['ready'] else item['detail']}" for name, item in status.items()
     )
 
 
@@ -212,11 +212,39 @@ def auto_jobs_view():
 def model_choices(agent: str) -> list[tuple[str, str]]:
     if agent == "claude":
         return list(agent_runner.CLAUDE_MODELS)
+    if agent == "local":
+        models = ai_setup.ollama_models() or []
+        return [(name, name) for name in models] or [(config.LLM_ANALYSIS_MODEL, config.LLM_ANALYSIS_MODEL)]
     return agent_runner.codex_models()
 
 
 def default_model(agent: str) -> str:
-    return agent_runner.DEFAULT_CODEX_MODEL if agent == "codex" else ""
+    if agent == "codex":
+        return agent_runner.DEFAULT_CODEX_MODEL
+    if agent == "local":
+        return config.LLM_ANALYSIS_MODEL
+    return ""
+
+
+_AI_ORDER = (("codex", "Codex"), ("claude", "Claude Code"), ("local", "ローカルAI（Ollama・無料・PC内で完結）"))
+
+
+def ai_setup_view() -> str:
+    status = ai_setup.all_status()
+    lines = ["| AI | 状態 |", "|---|---|"]
+    for key, label in _AI_ORDER:
+        item = status[key]
+        mark = "✅" if item["ready"] else ("⚠️" if item["installed"] else "—")
+        lines.append(f"| {label} | {mark} {html.escape(item['detail'])} |")
+    return "\n".join(lines)
+
+
+def ai_install(agent: str) -> str:
+    return ai_setup.install(agent) + "\n\n" + ai_setup_view()
+
+
+def ai_login(agent: str) -> str:
+    return ai_setup.login(agent) + "\n\n" + ai_setup_view()
 
 
 def on_agent_change(agent: str):
@@ -369,7 +397,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 auto_library_refresh = gr.Button("一覧を更新", scale=1)
             with gr.Row():
                 auto_agent = gr.Radio(
-                    choices=[("Codex", "codex"), ("Claude Code", "claude")], value="codex",
+                    choices=[("Codex", "codex"), ("Claude Code", "claude"), ("ローカルAI", "local")], value="codex",
                     label="見どころを選ぶAI", scale=2,
                 )
                 auto_model = gr.Dropdown(
@@ -429,6 +457,20 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             share_import_log = gr.Textbox(label="読み込みログ", interactive=False, lines=6)
 
         with gr.Tab("設定"):
+            gr.Markdown("### 見どころを選ぶAI")
+            ai_status_md = gr.Markdown("")
+            gr.Markdown(
+                "<small>使いたいAIだけ準備すれば十分です。インストールやログインは別ウィンドウで進み、"
+                "ブラウザでのログインが必要なものは自動で開きます。ローカルAIはアカウント不要ですが、"
+                "数GBのダウンロードとメモリ16GB程度が必要です。</small>"
+            )
+            with gr.Row():
+                ai_codex_install = gr.Button("Codexをインストール")
+                ai_codex_login = gr.Button("Codexにログイン")
+                ai_claude_install = gr.Button("Claude Codeをインストール")
+                ai_claude_login = gr.Button("Claude Codeにログイン")
+                ai_local_install = gr.Button("ローカルAIをセットアップ")
+                ai_refresh = gr.Button("状態を更新")
             gr.Markdown("### YouTubeアカウント")
             auto_account_md = gr.Markdown("")
             auto_agents_md = gr.Markdown("")
@@ -483,6 +525,13 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                          concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
     gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
     bundle_btn.click(bundle_client, outputs=[bundle_md])
+    demo.load(ai_setup_view, outputs=[ai_status_md])
+    ai_refresh.click(ai_setup_view, outputs=[ai_status_md]).then(summary_status, outputs=[status_md])
+    ai_codex_install.click(lambda: ai_install("codex"), outputs=[ai_status_md])
+    ai_codex_login.click(lambda: ai_login("codex"), outputs=[ai_status_md])
+    ai_claude_install.click(lambda: ai_install("claude"), outputs=[ai_status_md])
+    ai_claude_login.click(lambda: ai_login("claude"), outputs=[ai_status_md])
+    ai_local_install.click(lambda: ai_install("local"), outputs=[ai_status_md])
     auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md],
                            concurrency_id="youtube-account").then(summary_status, outputs=[status_md])
     auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md]).then(

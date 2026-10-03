@@ -61,6 +61,7 @@ from moment_retrieval.edit_domain import (
     make_effective_export_plan,
 )
 from moment_retrieval.share import ShareError, export_index, import_index, relink_video
+from moment_retrieval import source_origin
 from moment_retrieval.vector_index import VectorIndex
 from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
@@ -4126,6 +4127,33 @@ def on_save(
 
 # ---------- 動画の追加 (インデックス作成) ----------
 
+def _record_download_and_relink(url: str, path: Path) -> tuple[list[str], bool]:
+    """Remember a download's YouTube origin and attach a waiting shared index to it."""
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        canonical = source_origin.record_download(conn, path, url)
+        targets = (
+            source_origin.unlinked_videos_for_origin(conn, canonical)
+            if canonical else []
+        )
+    finally:
+        conn.close()
+    messages: list[str] = []
+    for public_id in targets:
+        try:
+            video = relink_video(public_id, Path(path))
+        except ShareError as exc:
+            messages.append(f"共有インデックスとの自動関連付けを見送りました: {exc}")
+            continue
+        messages.append(
+            "共有インデックスに自動で関連付けました: "
+            f"{video.get('display_name') or public_id}（共有された文字起こしをそのまま使います）"
+        )
+        return messages, True
+    return messages, False
+
+
 def do_index(
     video_path: str,
     asr_model: str,
@@ -4169,6 +4197,14 @@ def do_index(
                 if local_path is None:
                     log_lines.append("エラー: ダウンロードに失敗しました(ファイルパスを取得できませんでした)。")
                     yield "\n".join(log_lines), gr.update()
+                    return
+                relink_messages, relinked = _record_download_and_relink(
+                    video_path, Path(local_path)
+                )
+                log_lines.extend(relink_messages)
+                if relinked:
+                    log_lines.append("文字起こしは不要なため、インデックス作成を省略しました。")
+                    yield "\n".join(log_lines), gr.update(choices=list_video_choices())
                     return
                 video_path = str(local_path)
             except DownloadError as e:
@@ -5859,7 +5895,9 @@ def stop_indexing():
 
 # ---------- インデックスの共有 (エクスポート/インポート) ----------
 
-def do_export(video_choice: str, privacy_confirmed: bool = False):
+def do_export(
+    video_choice: str, privacy_confirmed: bool = False, include_source_url: bool = False,
+):
     video_id = parse_video_choice(video_choice)
     if not video_id:
         raise gr.Error("エクスポートする動画を選択してください。")
@@ -5868,11 +5906,26 @@ def do_export(video_choice: str, privacy_confirmed: bool = False):
             "全文文字起こし等を含むことと、個人情報を確認したことに同意してください。"
         )
     try:
-        out_path = export_index(video_id, confirm_sensitive=True)
+        out_path = export_index(
+            video_id, confirm_sensitive=True,
+            include_source_url=bool(include_source_url),
+        )
     except ShareError as e:
         raise gr.Error(str(e))
     gr.Info(f"エクスポートしました: {out_path}")
-    return str(out_path), f"保存先: {out_path}"
+    status = f"保存先: {out_path}"
+    if include_source_url:
+        conn = db.get_conn()
+        try:
+            video = db.get_video(conn, video_id)
+            url = source_origin.origin_url_for_video(conn, video) if video else None
+        finally:
+            conn.close()
+        status += (
+            f"（元動画URLを同梱: {url}）" if url
+            else "（YouTube由来と確認できないため、URLは同梱していません）"
+        )
+    return str(out_path), status
 
 
 def do_import(zip_file):
@@ -8116,7 +8169,9 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "他のPCと再文字起こしなしで共有できます。\n\n"
             "**注意:** 共有zipには、全文文字起こし、単語時刻、検索チャンク、"
             "埋め込みベクトルが含まれます。動画本体、元ファイル名、送信元PCの"
-            "パス、旧内部IDは含めません。インポート後は元動画の再関連付けが必要です。"
+            "パス、旧内部IDは含めません。インポート後は元動画の再関連付けが必要です。\n\n"
+            "YouTube由来の動画はURLも同梱できます。受け取った人が「動画の追加」で"
+            "そのURLを指定すると、ダウンロード後に自動で関連付き、文字起こしは不要です。"
         )
         with gr.Row():
             gr.Markdown("### エクスポート")
@@ -8128,6 +8183,10 @@ with gr.Blocks(title="動画シーン検索") as demo:
         export_privacy_confirm = gr.Checkbox(
             label="共有内容を確認し、文字起こしに個人情報・機密情報がないことを確認しました",
             value=False,
+        )
+        export_include_url = gr.Checkbox(
+            label="YouTube由来の動画なら元動画URLを同梱する（受け取った人がURLからダウンロードすると自動で関連付きます）",
+            value=True,
         )
         export_btn = gr.Button("エクスポート", variant="primary")
         export_file = gr.File(label="ダウンロード", interactive=False)
@@ -8162,7 +8221,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
         )
         export_btn.click(
             do_export,
-            inputs=[export_video_select, export_privacy_confirm],
+            inputs=[export_video_select, export_privacy_confirm, export_include_url],
             outputs=[export_file, export_path_box],
             concurrency_id="library-index-io",
             concurrency_limit=1,

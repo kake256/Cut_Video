@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -205,6 +205,21 @@ CREATE TABLE IF NOT EXISTS highlight_candidates (
 );
 CREATE INDEX IF NOT EXISTS idx_highlight_candidates_run
 ON highlight_candidates(highlight_run_id, ordinal);
+
+-- Canonical public YouTube URL of a file CUT downloaded (sender side).
+CREATE TABLE IF NOT EXISTS downloaded_sources (
+    path TEXT PRIMARY KEY,
+    origin_url TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Origin URL carried in an imported share package (recipient side).
+CREATE TABLE IF NOT EXISTS shared_source_origins (
+    public_video_id TEXT PRIMARY KEY,
+    origin_url TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_shared_source_origins_url ON shared_source_origins(origin_url);
 """
 
 

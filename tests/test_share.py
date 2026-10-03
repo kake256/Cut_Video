@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from moment_retrieval import config, db
+from moment_retrieval import config, db, source_origin
 from moment_retrieval.publication import (
     LeaseManager,
     build_vector_index_draft,
@@ -330,6 +330,66 @@ class SharePackageTest(unittest.TestCase):
                 self.assertNotIn(source_id, joined)
                 self.assertNotIn(source_path, joined)
                 self.assertIn("再関連付け", joined)
+
+    def test_youtube_origin_is_opt_in_shared_and_drives_relink_lookup(self):
+        url = "https://www.youtube.com/watch?v=abcDEF12345"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with configured_store(root / "source"):
+                source_id, source_path = self._seed_source(root / "source")
+                conn = db.get_conn()
+                try:
+                    source_origin.record_download(conn, source_path, "https://youtu.be/abcDEF12345")
+                finally:
+                    conn.close()
+                plain = export_index(source_id, root / "plain", confirm_sensitive=True)
+                shared = export_index(
+                    source_id, root / "shared", confirm_sensitive=True, include_source_url=True,
+                )
+            with zipfile.ZipFile(plain) as package:
+                self.assertNotIn("source_origin", json.loads(package.read("manifest.json")))
+            with zipfile.ZipFile(shared) as package:
+                manifest = json.loads(package.read("manifest.json"))
+            self.assertEqual(manifest["source_origin"], {"kind": "youtube", "url": url})
+            self.assertTrue(manifest["privacy"]["source_url_included"])
+
+            with configured_store(root / "destination"):
+                messages = " ".join(import_index(shared))
+                self.assertIn(url, messages)
+                conn = db.get_conn()
+                try:
+                    waiting = source_origin.unlinked_videos_for_origin(conn, "https://youtu.be/abcDEF12345")
+                finally:
+                    conn.close()
+                self.assertEqual(len(waiting), 1)
+                downloaded = root / "20260101_abcDEF12345.mp4"
+                downloaded.write_bytes(b"synthetic source")
+                with patch("moment_retrieval.utils.probe_duration", return_value=42.0):
+                    relink_video(waiting[0], downloaded)
+                conn = db.get_conn()
+                try:
+                    self.assertEqual(source_origin.unlinked_videos_for_origin(conn, url), [])
+                finally:
+                    conn.close()
+
+    def test_import_drops_non_youtube_origin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _source_id, _source_path = self._export_fixture(root / "source", root / "packages")
+            with zipfile.ZipFile(archive) as package:
+                manifest = json.loads(package.read("manifest.json"))
+                vectors_raw = package.read("vectors.npy")
+            manifest["source_origin"] = {"kind": "youtube", "url": "https://evil.example/watch?v=abcDEF12345"}
+            forged = self._write_package(root / "forged.vindex.zip", manifest, vectors_raw)
+            with configured_store(root / "destination"):
+                messages = " ".join(import_index(forged))
+                conn = db.get_conn()
+                try:
+                    rows = conn.execute("SELECT * FROM shared_source_origins").fetchall()
+                finally:
+                    conn.close()
+            self.assertEqual(rows, [])
+            self.assertNotIn("evil.example", messages)
 
     def test_relink_rejects_duration_mismatch_and_accepts_matching_source(self):
         with tempfile.TemporaryDirectory() as temporary:

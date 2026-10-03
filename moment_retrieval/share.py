@@ -23,6 +23,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from . import config, db
+from .source_origin import canonical_youtube_url, origin_url_for_video, remember_shared_origin
 from .vector_index import VectorIndex
 
 
@@ -302,7 +303,14 @@ def _read_package(zip_path: Path) -> tuple[dict[str, Any], np.ndarray]:
     chunks = _sanitize_ranges(manifest.get("chunks"), "chunks")
     vectors = _validate_vectors(vectors_raw, len(chunks))
     _validate_embedding_metadata(manifest, vectors, legacy=is_legacy)
+    origin = manifest.get("source_origin")
+    # Only a re-normalized public YouTube URL survives; anything else is dropped.
+    source_url = (
+        canonical_youtube_url(origin.get("url"))
+        if isinstance(origin, dict) and origin.get("kind") == "youtube" else None
+    )
     return {
+        "source_url": source_url,
         "duration": duration,
         "segments": segments,
         "chunks": chunks,
@@ -317,11 +325,13 @@ def export_index(
     out_dir: Path = Path("exports"),
     *,
     confirm_sensitive: bool = False,
+    include_source_url: bool = False,
 ) -> Path:
     """指定動画の匿名化インデックスをzipへ出力する。
 
     パッケージには全文文字起こし、単語時刻、検索チャンク、埋め込みが
-    含まれる。送信元パスや旧video_idは含めない。
+    含まれる。送信元パスや旧video_idは含めない。``include_source_url`` が真で
+    元動画が公開YouTube由来と分かる場合だけ、正規化した動画URLを同梱する。
     """
     if not confirm_sensitive:
         raise ShareError(
@@ -343,6 +353,9 @@ def export_index(
 
             raw_segments = db.get_segments(conn, video_id)
             storage_id = video["video_id"]
+            source_url = (
+                origin_url_for_video(conn, video) if include_source_url else None
+            )
             active_revision = db.get_active_transcript_revision(conn, storage_id)
             if active_revision is None:
                 chunk_rows = conn.execute(
@@ -406,6 +419,7 @@ def export_index(
                 "contains_embeddings": True,
                 "source_path_included": False,
                 "source_name_included": False,
+                "source_url_included": source_url is not None,
             },
             "video": {
                 "public_video_id": public_id,
@@ -425,6 +439,10 @@ def export_index(
                 "overlap_seconds": config.OVERLAP_SEC,
             },
             "package_source_token": _opaque_id("source"),
+            **(
+                {"source_origin": {"kind": "youtube", "url": source_url}}
+                if source_url else {}
+            ),
             "segments": segments,
             "chunks": chunks,
         }
@@ -608,6 +626,8 @@ def _import_index_locked(zip_path: Path, conn, writer_lease) -> Iterator[str]:
             )
             new_chunk_ids.append(int(cursor.lastrowid))
         yield f"  検索用チャンクを登録しました ({len(new_chunk_ids)} 件)"
+        if package.get("source_url"):
+            remember_shared_origin(conn, video_id, package["source_url"], commit=False)
 
         conn.commit()
         db_committed = True
@@ -668,6 +688,12 @@ def _import_index_locked(zip_path: Path, conn, writer_lease) -> Iterator[str]:
             "警告: 元動画は未接続です。検索はできますが、"
             "プレビュー・保存には再関連付けが必要です。"
         )
+        if package.get("source_url"):
+            post_messages.append(f"  元動画URL: {package['source_url']}")
+            post_messages.append(
+                "  「動画の追加」でこのURLを指定すると、ダウンロード後に自動で関連付けます"
+                "（文字起こしはやり直しません）。"
+            )
         post_messages.append("インポートが完了しました。")
         return post_messages
     except ShareError:

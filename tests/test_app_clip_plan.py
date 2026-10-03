@@ -4164,7 +4164,9 @@ class ClipPlanTest(unittest.TestCase):
         ):
             result = app_module.do_export("synthetic choice", True)
 
-        export.assert_called_once_with("synthetic-video", confirm_sensitive=True)
+        export.assert_called_once_with(
+            "synthetic-video", confirm_sensitive=True, include_source_url=False,
+        )
         self.assertEqual(result, (str(out_path), f"保存先: {out_path}"))
 
     def test_library_index_events_share_one_serial_writer_lane(self):

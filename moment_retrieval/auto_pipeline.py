@@ -4,7 +4,7 @@ One background worker runs jobs in order.  Every step reuses an existing,
 separately tested path: ``download_video``, ``index_video.py`` (own process),
 an AI agent through CUT's MCP (``agent_runner``), ``export_shorts.py`` (own
 process) and ``youtube_upload``.  Uploads are always private; the GUI offers
-a one-click "publish" per clip only when ``channel_policy`` allows it.
+a one-click "publish" per clip.
 """
 from __future__ import annotations
 
@@ -251,10 +251,7 @@ class AutoPipeline:
                         "js_runtimes": {"deno": {}, "node": {}}}) as ydl:
             info = ydl.extract_info(job.source, download=False)
         channel = channel_policy.channel_from_info(info or {})
-        video = channel_policy.video_from_info(info or {})
-        allowed = channel_policy.is_allowed(channel, video)
-        self._log(job, f"動画: {info.get('title', '')} / チャンネル: "
-                       f"{channel.name if channel else '不明'}（{'許可済み' if allowed else '未許可'}）")
+        self._log(job, f"動画: {info.get('title', '')} / チャンネル: {channel.name if channel else '不明'}")
         return info, channel, None
 
     def _download(self, job: AutoJob) -> str:
@@ -401,13 +398,15 @@ class AutoPipeline:
                 receipt = result or receipt
             if receipt:
                 job.uploads.append({**receipt, "file": Path(output).name})
-        allowed, reason = channel_policy.can_publish(job.source_channel_key, job.source_video_key)
-        self._log(job, "非公開でアップロードしました。" + (
-            "ジョブ一覧の「公開する」で公開できます。" if allowed else reason
-        ))
+        if job.uploads:
+            self._log(job, "非公開でアップロードしました。ジョブ一覧の「公開する」かYouTube Studioで公開できます。")
 
     def publish(self, job_id: str, youtube_video_id: str) -> dict:
-        """One-click publish from the GUI, re-checking the policy every time."""
+        """One-click publish from the GUI.
+
+        CUT is meant for footage the user has permission to clip, so there is no
+        allow-list; publishing stays an explicit click per video.
+        """
         from . import youtube_upload
 
         with self.lock:
@@ -418,11 +417,7 @@ class AutoPipeline:
             raise PipelineError("公開する動画が見つかりません。")
         if upload.get("privacy_status") == "public":
             raise PipelineError("この動画は公開済みです。")
-        allowed, reason = channel_policy.can_publish(job.source_channel_key, job.source_video_key)
-        if not allowed:
-            raise PipelineError(reason)
         result = youtube_upload.publish(youtube_video_id)
-        channel_policy.record_publication(youtube_video_id, job.source_channel_key)
         with self.lock:
             upload["privacy_status"] = "public"
             upload["watch_url"] = result["watch_url"]

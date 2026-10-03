@@ -37,46 +37,12 @@ class ChannelPolicyTest(_Isolated):
         self.assertEqual(tw.key, "twitch:streamer")
         self.assertIsNone(channel_policy.channel_from_info({"extractor_key": "Generic"}))
 
-    def test_twitch_channel_url_resolves_without_network(self):
-        channel = channel_policy.resolve_channel("https://www.twitch.tv/SomeStreamer/videos",
-                                                 extract=lambda url: self.fail("no network"))
-        self.assertEqual(channel.key, "twitch:somestreamer")
-
-    def test_video_permission_is_exact_and_keeps_channel_binding(self):
-        channel = channel_policy.SourceChannel("youtube:UCabc", "A", "https://youtube.test/channel/UCabc")
-        video = channel_policy.SourceVideo("youtube:abcDEF12345", channel.key, "One", "https://youtube.test/watch?v=abcDEF12345")
-        channel_policy.add_video(video, "この動画の切り抜き許可")
-        self.assertTrue(channel_policy.can_publish(channel.key, video.key)[0])
-        self.assertFalse(channel_policy.can_publish(channel.key, "youtube:otherDEF12")[0])
-        self.assertFalse(channel_policy.can_publish("youtube:UCother", video.key)[0])
-        channel_policy.add_channel(channel, "チャンネル全体の許可")
-        self.assertTrue(channel_policy.can_publish(channel.key, "youtube:otherDEF12")[0])
-
-    def test_resolve_video_requires_one_supported_video(self):
-        info = {"extractor_key": "Youtube", "id": "abcDEF12345", "channel_id": "UCabc",
-                "channel": "A", "title": "One", "webpage_url": "https://youtube.test/watch?v=abcDEF12345"}
-        video = channel_policy.resolve_video("https://youtube.test/watch?v=abcDEF12345", extract=lambda _: info)
-        self.assertEqual(video.key, "youtube:abcDEF12345")
-        self.assertEqual(video.channel_key, "youtube:UCabc")
-        playlist = {**info, "_type": "playlist", "entries": [info]}
-        with self.assertRaises(ValueError):
-            channel_policy.resolve_video("https://youtube.test/playlist?list=PLabc", extract=lambda _: playlist)
-
-    def test_publishing_needs_allowlist_note_and_respects_daily_limit(self):
-        channel = channel_policy.SourceChannel("twitch:alice", "Alice", "https://www.twitch.tv/alice")
-        with self.assertRaises(ValueError):
-            channel_policy.add_channel(channel, "  ")
-        self.assertFalse(channel_policy.can_publish("twitch:alice")[0])
-        channel_policy.add_channel(channel, "配信者のガイドラインで切り抜き可")
-        self.assertTrue(channel_policy.can_publish("twitch:alice")[0])
-        self.assertFalse(channel_policy.can_publish(None)[0])
-        channel_policy.save_settings(1)
-        channel_policy.record_publication("vid1", "twitch:alice")
-        allowed, reason = channel_policy.can_publish("twitch:alice")
-        self.assertFalse(allowed)
-        self.assertIn("上限", reason)
-        channel_policy.remove_channel("twitch:alice")
-        self.assertEqual(channel_policy.list_channels(), [])
+    def test_video_identity_ignores_playlists(self):
+        video = channel_policy.video_from_info(
+            {"extractor_key": "Youtube", "channel_id": "UCabc", "id": "abcDEF12345", "title": "T"})
+        self.assertEqual((video.key, video.channel_key), ("youtube:abcDEF12345", "youtube:UCabc"))
+        self.assertIsNone(channel_policy.video_from_info(
+            {"extractor_key": "YoutubeTab", "channel_id": "UCabc", "id": "PL1", "_type": "playlist"}))
 
 
 class AgentRunnerTest(unittest.TestCase):
@@ -153,40 +119,23 @@ class PipelineTest(_Isolated):
         reloaded = auto_pipeline.AutoPipeline(steps={})
         self.assertEqual(reloaded.jobs["auto_test"].highlight_run_id, "highlight_1")
 
-    def test_publish_is_refused_unless_channel_is_allowed(self):
+    def test_publish_needs_only_the_click_and_happens_once(self):
         calls = []
         pipeline = self._pipeline(calls)
         job = auto_pipeline.AutoJob(job_id="auto_pub", source="https://www.twitch.tv/videos/123456", agent="codex")
         pipeline.jobs[job.job_id] = job
         pipeline.run(job)
-        with self.assertRaises(auto_pipeline.PipelineError):
-            pipeline.publish("auto_pub", "yt1")
-        channel_policy.add_channel(channel_policy.SourceChannel("twitch:alice", "Alice", "u"), "許可済み")
         with patch.object(youtube_upload, "publish",
                           return_value={"video_id": "yt1", "privacy_status": "public",
                                         "watch_url": "https://www.youtube.com/watch?v=yt1"}) as publish:
             result = pipeline.publish("auto_pub", "yt1")
         publish.assert_called_once_with("yt1")
         self.assertEqual(job.uploads[0]["privacy_status"], "public")
-        self.assertEqual(channel_policy.published_in_last_day(), 1)
+        self.assertIn("watch?v=yt1", result["watch_url"])
         with self.assertRaises(auto_pipeline.PipelineError):
             pipeline.publish("auto_pub", "yt1")
-        self.assertIn("watch?v=yt1", result["watch_url"])
-
-    def test_publish_rechecks_exact_video_permission(self):
-        calls = []
-        pipeline = self._pipeline(calls)
-        job = auto_pipeline.AutoJob(job_id="auto_exact", source="https://www.twitch.tv/videos/123456", agent="codex")
-        pipeline.jobs[job.job_id] = job
-        pipeline.run(job)
-        video = channel_policy.SourceVideo("twitch-video:123456", "twitch:alice", "Source", job.source)
-        channel_policy.add_video(video, "この動画だけ許可")
-        with patch.object(youtube_upload, "publish", return_value={"watch_url": "https://youtube.test/watch?v=yt1"}):
-            pipeline.publish("auto_exact", "yt1")
-        job.uploads[0]["privacy_status"] = "private"
-        channel_policy.remove_video(video.key)
         with self.assertRaises(auto_pipeline.PipelineError):
-            pipeline.publish("auto_exact", "yt1")
+            pipeline.publish("auto_pub", "unknown")
 
     def test_failure_and_cancel_end_the_job_readably(self):
         calls = []

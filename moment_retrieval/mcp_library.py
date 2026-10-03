@@ -2,19 +2,24 @@
 
 Codex may read the active transcript (only after explicit consent per call),
 search it, and *propose* clip ranges by segment ID.  Proposals are fitted to
-ASR segment boundaries here and stored as an ordinary highlight run, so the
-existing highlight UI stays the only place where clips are previewed and
-exported.  Nothing in this module renders media or loads Whisper/BGE-M3.
+ASR segment boundaries here and stored as an ordinary highlight run.  When the
+user asks for it, the run can be exported as 9:16 Shorts by a separate
+``export_shorts.py`` process; this module itself never renders media, loads
+Whisper/BGE-M3, or uploads anything.
 """
 from __future__ import annotations
 
 import json
 import math
+import secrets
 import statistics
+import subprocess
+import sys
 import unicodedata
+from pathlib import Path
 from typing import Callable
 
-from moment_retrieval import db
+from moment_retrieval import config, db
 from moment_retrieval.highlight_analysis import (
     AnalysisValidationError,
     fit_boundary,
@@ -29,6 +34,7 @@ MAX_SEARCH_HITS = 50
 MAX_PROPOSALS = 10
 DEFAULT_MIN_DURATION_SEC = 20.0
 DEFAULT_MAX_DURATION_SEC = 180.0
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class LibraryToolError(ValueError):
@@ -48,8 +54,10 @@ def _ms(seconds: float) -> int:
 class LibraryTools:
     """Small façade over the SQLite library; one connection per call."""
 
-    def __init__(self, conn_factory: Callable = db.get_conn):
+    def __init__(self, conn_factory: Callable = db.get_conn, spawn: Callable = subprocess.Popen):
         self.conn_factory = conn_factory
+        self.spawn = spawn
+        self.jobs: dict[str, object] = {}
 
     def _open(self):
         conn = self.conn_factory()
@@ -316,6 +324,91 @@ class LibraryTools:
             "exported": False,
             "notice": (
                 "候補はCUTの「見どころ候補」に保存しただけで、動画はまだ書き出していません。"
-                "利用者がCUTでプレビューし、採用する候補を保存してください。"
+                "利用者が自動書き出しを依頼している場合は cut_export_shorts を、"
+                "そうでなければ利用者がCUTでプレビューして保存してください。"
             ),
+        }
+
+    @staticmethod
+    def _jobs_dir() -> Path:
+        return config.CACHE_ROOT / "mcp_exports"
+
+    def _running_job(self) -> str | None:
+        for job_id, process in self.jobs.items():
+            if process.poll() is None:
+                return job_id
+        return None
+
+    def start_short_export(self, video_id: str, highlight_run_id: str, *,
+                           layout: str = "blur", burn_captions: bool = True) -> dict:
+        """Start a background 9:16 export of every candidate in one run."""
+        conn = self._open()
+        try:
+            video, revision, _segments = self._transcript(conn, video_id)
+            latest = db.get_latest_ready_highlight_run(conn, video_id, revision)
+        finally:
+            conn.close()
+        if latest is None or latest["highlight_run_id"] != highlight_run_id:
+            raise LibraryToolError(
+                "PROPOSAL_NOT_LATEST",
+                "この候補は最新の見どころ候補ではありません。提案し直してください。",
+            )
+        if not video.get("path") or not Path(video["path"]).is_file():
+            raise LibraryToolError("SOURCE_MISSING", "元動画が見つかりません。CUTで動画を関連付けてください。")
+        running = self._running_job()
+        if running:
+            raise LibraryToolError("EXPORT_BUSY", f"別の書き出し（{running}）が実行中です。完了を待ってください。")
+        job_id = "export_" + secrets.token_hex(8)
+        job_dir = self._jobs_dir()
+        job_dir.mkdir(parents=True, exist_ok=True)
+        status_file = job_dir / f"{job_id}.json"
+        status_file.write_text(json.dumps({"state": "starting", "log": "", "outputs": []}), encoding="utf-8")
+        command = [
+            sys.executable, str(REPO_ROOT / "export_shorts.py"),
+            "--video-id", video["public_video_id"],
+            "--highlight-run-id", highlight_run_id,
+            "--layout", layout,
+            "--status-file", str(status_file),
+        ]
+        if not burn_captions:
+            command.append("--no-captions")
+        # Output stays out of the MCP stdout channel; progress goes to the status file.
+        self.jobs[job_id] = self.spawn(
+            command, cwd=str(REPO_ROOT), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return {
+            "job_id": job_id,
+            "state": "running",
+            "format": "9:16 Short 1080x1920",
+            "layout": layout,
+            "burn_captions": burn_captions,
+            "notice": "書き出しを開始しました。cut_export_status で進捗を確認してください。投稿はしません。",
+        }
+
+    def export_status(self, job_id: str) -> dict:
+        status_file = self._jobs_dir() / f"{job_id}.json"
+        if not job_id.startswith("export_") or not status_file.is_file():
+            raise LibraryToolError("JOB_NOT_FOUND", "書き出しジョブが見つかりません。")
+        status = json.loads(status_file.read_text(encoding="utf-8"))
+        process = self.jobs.get(job_id)
+        state = status.get("state", "running")
+        if process is not None and process.poll() not in (None, 0) and state not in ("failed", "done"):
+            state = "failed"
+            status["log"] = (status.get("log") or "") + "\n書き出し処理が異常終了しました。"
+        root = config.ARTIFACT_ROOT.resolve()
+        outputs = []
+        for item in status.get("outputs") or []:
+            path = Path(item)
+            try:
+                outputs.append(str(path.resolve().relative_to(root)))
+            except ValueError:
+                outputs.append(path.name)
+        log_lines = [line for line in str(status.get("log") or "").splitlines() if line.strip()]
+        return {
+            "job_id": job_id,
+            "state": state,
+            "outputs_relative_to_clips": outputs,
+            "log_tail": log_lines[-6:],
+            "notice": "done になったら、ファイルはCUTの clips フォルダにあります。YouTubeへの投稿は行っていません。",
         }

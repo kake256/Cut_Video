@@ -1,12 +1,14 @@
 """MCP library tools against a synthetic SQLite library (no media, no models)."""
+import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cut_mcp
-from moment_retrieval import db
+from moment_retrieval import config, db
 from moment_retrieval.mcp_library import LibraryToolError, LibraryTools
 
 
@@ -94,6 +96,39 @@ class LibraryToolsTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "TRANSCRIPT_CHANGED")
         with self.assertRaises(LibraryToolError):
             self.tools.read_transcript("vid_missing")
+
+    def test_short_export_runs_in_background_for_the_latest_proposal_only(self):
+        source = Path(self.tmp.name) / "synthetic.mp4"
+        source.write_bytes(b"synthetic")
+        proposal = self.tools.propose_clips(self.public_id, self.revision, [
+            {"start_segment_id": self.segment_ids[1], "end_segment_id": self.segment_ids[2],
+             "title": "カレー作り", "reason": "料理の導入"}], min_duration_sec=20, max_duration_sec=60)
+        commands = []
+
+        class _Process:
+            def poll(self):
+                return None
+
+        tools = LibraryTools(self.connect, spawn=lambda command, **kwargs: commands.append(command) or _Process())
+        with patch.object(config, "CACHE_ROOT", Path(self.tmp.name) / "cache"), \
+                patch.object(config, "ARTIFACT_ROOT", Path(self.tmp.name) / "clips"):
+            with self.assertRaises(LibraryToolError) as ctx:
+                tools.start_short_export(self.public_id, "highlight_stale")
+            self.assertEqual(ctx.exception.code, "PROPOSAL_NOT_LATEST")
+            started = tools.start_short_export(self.public_id, proposal["highlight_run_id"], layout="crop")
+            self.assertIn("--layout", commands[0])
+            self.assertEqual(commands[0][commands[0].index("--layout") + 1], "crop")
+            self.assertNotIn("--no-captions", commands[0])
+            with self.assertRaises(LibraryToolError) as ctx:
+                tools.start_short_export(self.public_id, proposal["highlight_run_id"])
+            self.assertEqual(ctx.exception.code, "EXPORT_BUSY")
+            clip = Path(self.tmp.name) / "clips" / "highlights" / "v" / "a.mp4"
+            status_file = Path(self.tmp.name) / "cache" / "mcp_exports" / f"{started['job_id']}.json"
+            status_file.write_text(json.dumps({"state": "done", "log": "1/1 保存完了", "outputs": [str(clip)]}),
+                                   encoding="utf-8")
+            status = tools.export_status(started["job_id"])
+        self.assertEqual(status["state"], "done")
+        self.assertEqual(status["outputs_relative_to_clips"], [str(Path("highlights") / "v" / "a.mp4")])
 
     def test_mcp_requires_transfer_consent_and_validates_nested_items(self):
         tools = cut_mcp.CaptionTools(library=self.tools)

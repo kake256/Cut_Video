@@ -128,6 +128,7 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(names, [
             "cut_inspect_youtube", "cut_read_youtube_captions", "cut_forget_youtube_preview",
             "cut_list_videos", "cut_read_transcript", "cut_search_transcript", "cut_propose_clips",
+            "cut_export_shorts", "cut_export_status",
         ])
         self.assertEqual(self.request("ping")["result"], {})
         self.assertEqual(self.request("not-supported")["error"]["code"], -32601)
@@ -182,7 +183,7 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([m["id"] for m in responses], [1, 2, 3])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 7)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 9)
         self.assertTrue(responses[2]["result"]["isError"])
         self.assertIn("INVALID_URL", responses[2]["result"]["content"][0]["text"])
         self.assertEqual(result.stderr, b"")

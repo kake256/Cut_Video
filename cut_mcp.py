@@ -42,8 +42,10 @@ INSTRUCTIONS = (
     "Local library: cut_list_videos, then cut_read_transcript/cut_search_transcript send the user's local "
     "transcript text to Codex, so set allow_transcript_transfer=true only when the user asked to use it. "
     "To suggest clips, call cut_propose_clips with segment IDs you actually read; CUT snaps them to "
-    "segment boundaries and stores them as highlight candidates. Nothing is exported until the user "
-    "previews and saves them in CUT, so never claim a clip file was created."
+    "segment boundaries and stores them as highlight candidates. Only when the user asked for automatic "
+    "export, call cut_export_shorts with the returned highlight_run_id and poll cut_export_status until done; "
+    "otherwise the user previews and saves in CUT. Never claim a file exists before status is done. "
+    "No tool uploads or publishes anything."
 )
 
 
@@ -165,6 +167,31 @@ LIBRARY_TOOLS = [
         }, ["video_id", "transcript_revision", "candidates"]),
         "annotations": {"readOnlyHint": False, "destructiveHint": False,
                         "idempotentHint": False, "openWorldHint": False},
+    },
+]
+LIBRARY_TOOLS += [
+    {
+        "name": "cut_export_shorts",
+        "description": (
+            "cut_propose_clipsで保存した候補を全件、9:16ショート（1080x1920）のmp4としてCUTのclipsフォルダへ"
+            "書き出す。利用者が自動書き出しを依頼した場合だけ使う。バックグラウンドで実行し、"
+            "job_idを返す。字幕焼き込みは既定で有効。YouTubeへの投稿はしない。"
+        ),
+        "inputSchema": _schema({
+            "video_id": _VIDEO_ID,
+            "highlight_run_id": {"type": "string", "maxLength": 80},
+            "layout": {"type": "string", "enum": ["blur", "crop"], "default": "blur"},
+            "burn_captions": {"type": "boolean", "default": True},
+        }, ["video_id", "highlight_run_id"]),
+        "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                        "idempotentHint": False, "openWorldHint": False},
+    },
+    {
+        "name": "cut_export_status",
+        "description": "cut_export_shortsの進捗を返す。stateがdoneになるまで間隔をあけて確認する。",
+        "inputSchema": _schema({"job_id": {"type": "string", "maxLength": 80}}, ["job_id"]),
+        "annotations": {"readOnlyHint": True, "destructiveHint": False,
+                        "idempotentHint": True, "openWorldHint": False},
     },
 ]
 TOOLS = TOOLS + LIBRARY_TOOLS
@@ -324,6 +351,14 @@ class CaptionTools:
             return self.library.read_transcript(
                 arguments["video_id"], arguments.get("start_index", 0), arguments.get("max_segments", 120),
             )
+        if name == "cut_export_shorts":
+            return self.library.start_short_export(
+                arguments["video_id"], arguments["highlight_run_id"],
+                layout=arguments.get("layout", "blur"),
+                burn_captions=arguments.get("burn_captions", True),
+            )
+        if name == "cut_export_status":
+            return self.library.export_status(arguments["job_id"])
         if name == "cut_search_transcript":
             return self.library.search_transcript(
                 arguments["query"], arguments.get("video_id"), arguments.get("max_hits", 20),
@@ -364,7 +399,7 @@ class StdioServer:
             result = {
                 "protocolVersion": requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[-1],
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "cut-youtube", "version": "0.2.0"},
+                "serverInfo": {"name": "cut-youtube", "version": "0.3.0"},
                 "instructions": INSTRUCTIONS,
             }
         elif method == "ping":

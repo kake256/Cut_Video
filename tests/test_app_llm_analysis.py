@@ -608,11 +608,28 @@ class AppLlmAnalysisTest(unittest.TestCase):
                 return_value="no summary",
             ),
             patch.object(app, "_has_ready_llm_analysis", return_value=False),
+            patch.object(app, "_latest_highlight_view", return_value=("none", [])),
         ):
             outputs = app.load_summary_highlight_workspace("vid_synthetic")
 
         self.assertIn("保存済み要約がない", outputs[1])
         self.assertEqual(outputs[3]["value"], "")
+        self.assertFalse(outputs[4]["interactive"])
+
+    def test_saved_candidates_without_summary_stay_selectable(self):
+        with (
+            patch.object(app, "format_latest_llm_analysis", return_value="no summary"),
+            patch.object(app, "_has_ready_llm_analysis", return_value=False),
+            patch.object(
+                app, "_latest_highlight_view",
+                return_value=("codex candidates", [("candidate", "candidate-1")]),
+            ),
+        ):
+            outputs = app.load_summary_highlight_workspace("vid_synthetic")
+
+        self.assertEqual(outputs[2], "codex candidates")
+        self.assertEqual(outputs[3]["value"], "candidate-1")
+        self.assertIn("プレビュー・保存できます", outputs[1])
         self.assertFalse(outputs[4]["interactive"])
 
     def test_latest_ready_analysis_is_escaped_and_time_linked(self):

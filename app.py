@@ -4465,12 +4465,20 @@ def load_summary_highlight_workspace(video_choice: str):
             "再要約せず見どころ候補を生成できます。"
         )
     else:
-        highlight_markdown, choices = (
-            "この動画には利用できる保存済み要約がありません。"
-            "先に上の「この動画をローカルLLMで解析」を実行してください。",
-            [],
-        )
-        status = "保存済み要約がないため、見どころ候補はまだ生成できません。"
+        # Candidates proposed without a summary (e.g. Codex via MCP) must stay
+        # previewable and savable; only new generation needs a summary.
+        highlight_markdown, choices = _latest_highlight_view(video_choice)
+        if choices:
+            status = (
+                "保存済み要約はありませんが、保存済みの見どころ候補（Codexの提案など）は"
+                "プレビュー・保存できます。新しい候補の生成には要約が必要です。"
+            )
+        else:
+            highlight_markdown = (
+                "この動画には利用できる保存済み要約がありません。"
+                "先に上の「この動画をローカルLLMで解析」を実行してください。"
+            )
+            status = "保存済み要約がないため、見どころ候補はまだ生成できません。"
     return (
         summary,
         status,
@@ -5521,6 +5529,10 @@ def export_highlight_candidates(
             EXPORT_JOBS.transition(export_job_id, ExportStage.VALIDATING)
         video, candidates = _highlight_export_context(video_choice)
         if export_scope == "selected":
+            if not selected_candidate_id:
+                raise gr.Error(
+                    "候補が選択されていません。「保存済み候補を表示」で一覧を出してから候補を選んでください。"
+                )
             candidates = [
                 candidate for candidate in candidates
                 if candidate["highlight_candidate_id"] == selected_candidate_id

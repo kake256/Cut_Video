@@ -125,7 +125,10 @@ class StdioTests(unittest.TestCase):
         self.assertIn("untrusted", initialized["instructions"])
         self.assertIsNone(self.server.dispatch({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         names = [tool["name"] for tool in self.request("tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["cut_inspect_youtube", "cut_read_youtube_captions", "cut_forget_youtube_preview"])
+        self.assertEqual(names, [
+            "cut_inspect_youtube", "cut_read_youtube_captions", "cut_forget_youtube_preview",
+            "cut_list_videos", "cut_read_transcript", "cut_search_transcript", "cut_propose_clips",
+        ])
         self.assertEqual(self.request("ping")["result"], {})
         self.assertEqual(self.request("not-supported")["error"]["code"], -32601)
         self.assertEqual(self.request("initialize", {"protocolVersion": "future"})["result"]["protocolVersion"], "2025-06-18")
@@ -179,7 +182,7 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([m["id"] for m in responses], [1, 2, 3])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 3)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 7)
         self.assertTrue(responses[2]["result"]["isError"])
         self.assertIn("INVALID_URL", responses[2]["result"]["content"][0]["text"])
         self.assertEqual(result.stderr, b"")

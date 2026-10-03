@@ -23,6 +23,7 @@ This repository uses model-routed subagents to keep the main thread focused and 
 - Preserve the separate-process Whisper indexing design in `index_video.py`; never load WhisperModel in a Gradio worker thread.
 - Use `venv\Scripts\python.exe` for Python commands.
 - Never inspect, upload, commit, or send `data/`, `video/`, `clips/`, `exports/`, `.env`, credentials, or private transcripts to external services.
+  - Exception (user decision, 2026-10-03): the runtime `cut_mcp.py` library tools may return a local transcript to Codex when the user explicitly asks for that video in the conversation (`allow_transcript_transfer=true`). This does not permit development agents to read `data/` directly.
 - Do not commit, push, delete user data, change authentication, or make billing-related changes without explicit user authorization.
 
 ## Canonical product documents

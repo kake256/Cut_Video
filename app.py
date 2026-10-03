@@ -4555,10 +4555,10 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
         candidates = db.get_highlight_candidates(conn, ready["highlight_run_id"])
         result = ready.get("result") or {}
         generation_mode = str(result.get("generation_mode") or "summary")
-        generation_description = (
-            "自然言語クエリ検索"
-            if generation_mode == "query" else "要約から自動選定"
-        )
+        generation_description = {
+            "query": "自然言語クエリ検索",
+            "mcp": "Codexの提案（MCP経由・未書き出し）",
+        }.get(generation_mode, "要約から自動選定")
         requested = int(
             result.get("requested_count") or ready.get("requested_count") or 0
         )
@@ -4567,6 +4567,11 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             query_html = (
                 "<li>クエリ: "
                 f"{html.escape(str(result['query']))}</li>"
+            )
+        elif generation_mode == "mcp" and result.get("note"):
+            query_html = (
+                "<li>Codexのメモ: "
+                f"{html.escape(str(result['note']))}</li>"
             )
         parts = [
             '<div class="highlight-candidate-view">',

@@ -3,7 +3,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from moment_retrieval import config, youtube_upload
 
@@ -155,6 +156,19 @@ class AutoPublishAppTest(unittest.TestCase):
         self.assertEqual(auto_publish_app.APP_PORT, 7870)
         self.assertIsNotNone(auto_publish_app.demo)
         self.assertFalse(hasattr(app, "auto_submit"))
+
+    def test_quit_stops_running_jobs_then_exits_later(self):
+        import auto_publish_app
+
+        jobs = [SimpleNamespace(job_id="auto_run", state="running"), SimpleNamespace(job_id="auto_done", state="done")]
+        pipeline = SimpleNamespace(list_jobs=lambda: jobs, cancel=Mock())
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
+                patch.object(auto_publish_app.threading, "Timer") as timer:
+            update = auto_publish_app.shutdown_app()
+        pipeline.cancel.assert_called_once_with("auto_run")
+        self.assertEqual(timer.call_args[0][0], 3.0)
+        timer.return_value.start.assert_called_once()
+        self.assertIn("終了しました", update["value"])
 
 
 if __name__ == "__main__":

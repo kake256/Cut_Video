@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import os
 import socket
+import threading
 import webbrowser
 from pathlib import Path
 
@@ -377,8 +378,47 @@ def auto_cancel(job_id: str):
     return auto_jobs_view()
 
 
+# Close the tab if the browser allows it; otherwise replace the page with a notice
+# so the user does not see a connection error once the server stops.
+_QUIT_JS = """() => {
+    try { window.open('', '_self'); window.close(); } catch (e) {}
+    setTimeout(() => {
+        document.body.innerHTML =
+            '<div style="display:flex;align-items:center;justify-content:center;'
+            + 'height:100vh;font-family:sans-serif;font-size:1.4rem;color:#888;">'
+            + 'アプリを終了しました。このタブは閉じてください。</div>';
+    }, 200);
+}"""
+
+
+def shutdown_app():
+    """Stop running jobs (and their child processes), then end this server process."""
+    pipeline = _auto_pipeline()
+    for job in pipeline.list_jobs():
+        if job.state in {"queued", "running"}:
+            pipeline.cancel(job.job_id)
+    # Let this response reach the browser before the process exits.
+    threading.Timer(3.0, lambda: os._exit(0)).start()
+    return gr.update(visible=True, value="**アプリを終了しました。このタブは閉じてください。**")
+
+
 with gr.Blocks(title="CUT 自動投稿") as demo:
-    gr.Markdown("# CUT 自動投稿")
+    with gr.Row():
+        gr.Markdown("# CUT 自動投稿")
+        quit_btn = gr.Button("アプリを終了", variant="stop", scale=0, min_width=120)
+        quit_confirm_btn = gr.Button("本当に終了する（実行中のジョブも停止）", variant="stop",
+                                     visible=False, scale=0)
+        quit_cancel_btn = gr.Button("キャンセル", visible=False, scale=0, min_width=100)
+    quit_msg = gr.Markdown(visible=False)
+    quit_btn.click(
+        lambda: (gr.update(visible=True), gr.update(visible=True), gr.update(visible=False)),
+        outputs=[quit_confirm_btn, quit_cancel_btn, quit_btn],
+    )
+    quit_cancel_btn.click(
+        lambda: (gr.update(visible=False), gr.update(visible=False), gr.update(visible=True)),
+        outputs=[quit_confirm_btn, quit_cancel_btn, quit_btn],
+    )
+    quit_confirm_btn.click(shutdown_app, outputs=[quit_msg], js=_QUIT_JS)
     status_md = gr.Markdown("")
     with gr.Tabs():
         with gr.Tab("切り抜き"):
@@ -560,7 +600,26 @@ def _port_in_use(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _disable_console_quick_edit() -> None:
+    """A click in the console starts text selection (QuickEdit), which blocks every write
+    to it and freezes the server. Turn that off for this app's own console window."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            enable_quick_edit, enable_extended_flags = 0x0040, 0x0080
+            kernel32.SetConsoleMode(handle, (mode.value & ~enable_quick_edit) | enable_extended_flags)
+    except (AttributeError, OSError):
+        pass
+
+
 if __name__ == "__main__":
+    _disable_console_quick_edit()
     if _port_in_use(APP_PORT):
         print(f"自動投稿アプリは既に起動しています: http://127.0.0.1:{APP_PORT}")
         webbrowser.open(f"http://127.0.0.1:{APP_PORT}")

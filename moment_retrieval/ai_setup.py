@@ -123,6 +123,20 @@ def install(agent: str, *, popen: Callable = subprocess.Popen) -> str:
     raise ValueError(f"unknown agent: {agent}")
 
 
+def prepare(agent: str, *, status: dict | None = None, popen: Callable = subprocess.Popen) -> str:
+    """One button per AI: install if missing, sign in if needed, otherwise report ready."""
+    if agent not in ("codex", "claude", "local"):
+        raise ValueError(f"unknown agent: {agent}")
+    current = status if status is not None else {
+        "codex": codex_status, "claude": claude_status, "local": ollama_status,
+    }[agent]()
+    if current["ready"]:
+        return "準備済みです。そのまま使えます。"
+    if agent == "local" or not current["installed"]:
+        return install(agent, popen=popen)
+    return login(agent, popen=popen)
+
+
 def login(agent: str, *, popen: Callable = subprocess.Popen) -> str:
     if agent not in LOGIN_COMMANDS:
         raise ValueError(f"unknown agent: {agent}")

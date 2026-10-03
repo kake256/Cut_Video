@@ -239,12 +239,9 @@ def ai_setup_view() -> str:
     return "\n".join(lines)
 
 
-def ai_install(agent: str) -> str:
-    return ai_setup.install(agent) + "\n\n" + ai_setup_view()
-
-
-def ai_login(agent: str) -> str:
-    return ai_setup.login(agent) + "\n\n" + ai_setup_view()
+def ai_prepare(agent: str) -> str:
+    """Install, sign in, or confirm readiness with a single button per AI."""
+    return ai_setup.prepare(agent) + "\n\n" + ai_setup_view()
 
 
 def on_agent_change(agent: str):
@@ -463,17 +460,14 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             gr.Markdown("### 見どころを選ぶAI")
             ai_status_md = gr.Markdown("")
             gr.Markdown(
-                "<small>使いたいAIだけ準備すれば十分です。インストールやログインは別ウィンドウで進み、"
-                "ブラウザでのログインが必要なものは自動で開きます。ローカルAIはアカウント不要ですが、"
-                "数GBのダウンロードとメモリ16GB程度が必要です。</small>"
+                "<small>使いたいAIのボタンを押すと、未インストールならインストール、未ログインならログインを"
+                "別ウィンドウで進めます（準備済みなら何もしません）。終わったらもう一度押すと状態が更新されます。"
+                "ローカルAIはアカウント不要ですが、数GBのダウンロードとメモリ16GB程度が必要です。</small>"
             )
             with gr.Row():
-                ai_codex_install = gr.Button("Codexをインストール")
-                ai_codex_login = gr.Button("Codexにログイン")
-                ai_claude_install = gr.Button("Claude Codeをインストール")
-                ai_claude_login = gr.Button("Claude Codeにログイン")
-                ai_local_install = gr.Button("ローカルAIをセットアップ")
-                ai_refresh = gr.Button("状態を更新")
+                ai_codex_btn = gr.Button("Codex")
+                ai_claude_btn = gr.Button("Claude")
+                ai_local_btn = gr.Button("ローカル")
             gr.Markdown("### YouTubeアカウント")
             auto_account_md = gr.Markdown("")
             auto_agents_md = gr.Markdown("")
@@ -529,12 +523,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
     bundle_btn.click(bundle_client, outputs=[bundle_md])
     demo.load(ai_setup_view, outputs=[ai_status_md])
-    ai_refresh.click(ai_setup_view, outputs=[ai_status_md]).then(summary_status, outputs=[status_md])
-    ai_codex_install.click(lambda: ai_install("codex"), outputs=[ai_status_md])
-    ai_codex_login.click(lambda: ai_login("codex"), outputs=[ai_status_md])
-    ai_claude_install.click(lambda: ai_install("claude"), outputs=[ai_status_md])
-    ai_claude_login.click(lambda: ai_login("claude"), outputs=[ai_status_md])
-    ai_local_install.click(lambda: ai_install("local"), outputs=[ai_status_md])
+    for button, agent in ((ai_codex_btn, "codex"), (ai_claude_btn, "claude"), (ai_local_btn, "local")):
+        button.click(lambda agent=agent: ai_prepare(agent), outputs=[ai_status_md]).then(
+            summary_status, outputs=[status_md])
     auto_connect_btn.click(auto_connect_account, outputs=[auto_account_md],
                            concurrency_id="youtube-account").then(summary_status, outputs=[status_md])
     auto_disconnect_btn.click(auto_disconnect_account, outputs=[auto_account_md]).then(

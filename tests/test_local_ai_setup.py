@@ -53,6 +53,23 @@ class AiSetupTest(unittest.TestCase):
             ai_setup.install("unknown", popen=popen)
 
 
+class PrepareTest(unittest.TestCase):
+    def test_one_button_installs_logs_in_or_reports_ready(self):
+        started = []
+        popen = lambda command, **kwargs: started.append(command[2])
+        ready = {"installed": True, "ready": True, "detail": ""}
+        self.assertIn("準備済み", ai_setup.prepare("codex", status=ready, popen=popen))
+        self.assertEqual(started, [])
+        with patch.object(ai_setup.shutil, "which", return_value="npm"):
+            ai_setup.prepare("codex", status={"installed": False, "ready": False}, popen=popen)
+        self.assertIn("@openai/codex", started[-1])
+        with patch.object(ai_setup.agent_runner, "find_executable", return_value="claude.cmd"):
+            ai_setup.prepare("claude", status={"installed": True, "ready": False}, popen=popen)
+        self.assertEqual(started[-1], '"claude.cmd" auth login')
+        ai_setup.prepare("local", status={"installed": True, "ready": False}, popen=popen)
+        self.assertIn("setup_ollama.bat", started[-1])
+
+
 class _Library:
     def __init__(self, rows):
         self.rows = rows

@@ -23,7 +23,9 @@ from typing import Any, Iterator
 import numpy as np
 
 from . import config, db
-from .source_origin import canonical_youtube_url, origin_url_for_video, remember_shared_origin
+from .source_origin import (
+    SOURCE_KINDS, canonical_source_url, origin_url_for_video, remember_shared_origin, source_kind,
+)
 from .vector_index import VectorIndex
 
 
@@ -304,11 +306,13 @@ def _read_package(zip_path: Path) -> tuple[dict[str, Any], np.ndarray]:
     vectors = _validate_vectors(vectors_raw, len(chunks))
     _validate_embedding_metadata(manifest, vectors, legacy=is_legacy)
     origin = manifest.get("source_origin")
-    # Only a re-normalized public YouTube URL survives; anything else is dropped.
+    # Only a re-normalized public YouTube/Twitch URL of the declared kind survives.
     source_url = (
-        canonical_youtube_url(origin.get("url"))
-        if isinstance(origin, dict) and origin.get("kind") == "youtube" else None
+        canonical_source_url(origin.get("url"))
+        if isinstance(origin, dict) and origin.get("kind") in SOURCE_KINDS else None
     )
+    if source_url and source_kind(source_url) != origin.get("kind"):
+        source_url = None
     return {
         "source_url": source_url,
         "duration": duration,
@@ -331,7 +335,7 @@ def export_index(
 
     パッケージには全文文字起こし、単語時刻、検索チャンク、埋め込みが
     含まれる。送信元パスや旧video_idは含めない。``include_source_url`` が真で
-    元動画が公開YouTube由来と分かる場合だけ、正規化した動画URLを同梱する。
+    元動画が公開YouTube/TwitchのURL由来と分かる場合だけ、正規化したURLを同梱する。
     """
     if not confirm_sensitive:
         raise ShareError(
@@ -440,7 +444,7 @@ def export_index(
             },
             "package_source_token": _opaque_id("source"),
             **(
-                {"source_origin": {"kind": "youtube", "url": source_url}}
+                {"source_origin": {"kind": source_kind(source_url), "url": source_url}}
                 if source_url else {}
             ),
             "segments": segments,

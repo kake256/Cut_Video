@@ -5923,7 +5923,7 @@ def do_export(
             conn.close()
         status += (
             f"（元動画URLを同梱: {url}）" if url
-            else "（YouTube由来と確認できないため、URLは同梱していません）"
+            else "（YouTube/Twitch由来と確認できないため、URLは同梱していません）"
         )
     return str(out_path), status
 
@@ -8170,7 +8170,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             "**注意:** 共有zipには、全文文字起こし、単語時刻、検索チャンク、"
             "埋め込みベクトルが含まれます。動画本体、元ファイル名、送信元PCの"
             "パス、旧内部IDは含めません。インポート後は元動画の再関連付けが必要です。\n\n"
-            "YouTube由来の動画はURLも同梱できます。受け取った人が「動画の追加」で"
+            "YouTube/Twitch由来の動画はURLも同梱できます。受け取った人が「動画の追加」で"
             "そのURLを指定すると、ダウンロード後に自動で関連付き、文字起こしは不要です。"
         )
         with gr.Row():
@@ -8185,7 +8185,7 @@ with gr.Blocks(title="動画シーン検索") as demo:
             value=False,
         )
         export_include_url = gr.Checkbox(
-            label="YouTube由来の動画なら元動画URLを同梱する（受け取った人がURLからダウンロードすると自動で関連付きます）",
+            label="YouTube/Twitch由来の動画なら元動画URLを同梱する（受け取った人がURLからダウンロードすると自動で関連付きます）",
             value=True,
         )
         export_btn = gr.Button("エクスポート", variant="primary")

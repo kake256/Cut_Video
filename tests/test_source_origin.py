@@ -34,6 +34,7 @@ class SourceOriginTest(unittest.TestCase):
         cases = {
             "20260101_120000_" + "abcDEF12345.mp4": "https://www.youtube.com/watch?v=abcDEF12345",
             "20260101_abcDEF12345.mp4": "https://www.youtube.com/watch?v=abcDEF12345",
+            "20260101_000000_" + "v2888064772.mp4": "https://www.twitch.tv/videos/2888064772",
             "my_holiday_abcDEF12345.mp4": None,
             "recording.mp4": None,
         }
@@ -41,6 +42,16 @@ class SourceOriginTest(unittest.TestCase):
             with self.subTest(name=name):
                 video = {"path": str(Path(self.tmp.name) / name)}
                 self.assertEqual(source_origin.origin_url_for_video(self.conn, video), expected)
+
+    def test_twitch_vod_urls_are_canonicalized_and_others_rejected(self):
+        self.assertEqual(
+            source_origin.canonical_source_url("https://twitch.tv/videos/2888064772?t=1h"),
+            "https://www.twitch.tv/videos/2888064772",
+        )
+        for url in ("http://www.twitch.tv/videos/2888064772", "https://www.twitch.tv/somechannel",
+                    "https://evil.example/videos/2888064772", "https://www.twitch.tv/videos/12"):
+            with self.subTest(url=url):
+                self.assertIsNone(source_origin.canonical_source_url(url))
 
     def test_no_unlinked_match_for_non_youtube_or_unknown_url(self):
         self.assertEqual(source_origin.unlinked_videos_for_origin(self.conn, "https://example.com/x"), [])

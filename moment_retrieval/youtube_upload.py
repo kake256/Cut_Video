@@ -1,8 +1,10 @@
-"""Upload saved clips to the user's own YouTube channel as *private* videos.
+"""Upload saved clips to the user's own YouTube channel.
 
-Publishing stays a human step in YouTube Studio: this module never sets any
-privacy status other than ``private``.  Credentials live under the private
-library directory (git-ignored) and are created by the user's own OAuth flow.
+Uploads are always ``private``.  A video becomes public only through
+``publish``, which the GUI calls when the user presses "公開する" on a clip
+whose source channel is allow-listed (see ``channel_policy``).  Credentials
+live under the private library directory (git-ignored) and are created by the
+user's own OAuth flow.
 """
 from __future__ import annotations
 
@@ -14,7 +16,11 @@ from typing import Callable, Iterator
 
 from . import config
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    # Read-only access shows which channel is linked in the GUI.
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
 PRIVACY_STATUS = "private"
 CATEGORY_PEOPLE_AND_BLOGS = "22"
 MAX_TITLE = 100
@@ -62,6 +68,7 @@ class UploadMetadata:
     tags: tuple[str, ...]
 
     def request_body(self) -> dict:
+        status = {"privacyStatus": PRIVACY_STATUS, "selfDeclaredMadeForKids": False}
         return {
             "snippet": {
                 "title": self.title,
@@ -69,10 +76,7 @@ class UploadMetadata:
                 "tags": list(self.tags),
                 "categoryId": CATEGORY_PEOPLE_AND_BLOGS,
             },
-            "status": {
-                "privacyStatus": PRIVACY_STATUS,
-                "selfDeclaredMadeForKids": False,
-            },
+            "status": status,
         }
 
 
@@ -133,6 +137,43 @@ def load_credentials(*, interactive: bool = True):
     return creds
 
 
+def _service(service_factory: Callable | None, *, interactive: bool = True):
+    if service_factory is not None:
+        return service_factory()
+    from googleapiclient.discovery import build
+
+    return build("youtube", "v3", credentials=load_credentials(interactive=interactive),
+                 cache_discovery=False)
+
+
+def connected_channel(*, service_factory: Callable | None = None) -> dict | None:
+    """Return the linked channel's id/title, or None when not linked yet."""
+    if service_factory is None and not token_path().is_file():
+        return None
+    try:
+        service = _service(service_factory, interactive=False)
+        response = service.channels().list(part="snippet", mine=True).execute()
+    except UploadError:
+        return None
+    items = response.get("items") or []
+    if not items:
+        return None
+    return {"id": items[0].get("id"), "title": (items[0].get("snippet") or {}).get("title")}
+
+
+def connect_account() -> dict | None:
+    """Run the browser consent flow now and report the linked channel."""
+    load_credentials(interactive=True)
+    return connected_channel()
+
+
+def disconnect_account() -> bool:
+    if token_path().is_file():
+        token_path().unlink()
+        return True
+    return False
+
+
 def upload_private(
     video_path: Path,
     *,
@@ -148,13 +189,7 @@ def upload_private(
         yield f"アップロード済みのため省略しました: {video_path.name}", previous
         return
     metadata = metadata_for(video_path)
-    if service_factory is None:
-        from googleapiclient.discovery import build
-
-        creds = load_credentials()
-        service = build("youtube", "v3", credentials=creds, cache_discovery=False)
-    else:
-        service = service_factory()
+    service = _service(service_factory)
     from googleapiclient.http import MediaFileUpload
 
     media = MediaFileUpload(str(video_path), mimetype="video/mp4", chunksize=CHUNK_BYTES, resumable=True)
@@ -178,3 +213,19 @@ def upload_private(
     }
     receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     yield f"アップロード完了（非公開）: {result['studio_url']}", result
+
+
+def publish(video_id: str, *, service_factory: Callable | None = None) -> dict:
+    """Make one uploaded video public; callers check channel_policy first."""
+    service = _service(service_factory)
+    response = service.videos().update(
+        part="status",
+        body={"id": video_id, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}},
+    ).execute()
+    status = (response.get("status") or {}).get("privacyStatus")
+    if status != "public":
+        raise UploadError(
+            "YouTubeが公開を受け付けませんでした。APIプロジェクトが未監査の場合は非公開に固定されます。"
+        )
+    return {"video_id": video_id, "privacy_status": status,
+            "watch_url": f"https://www.youtube.com/watch?v={video_id}"}

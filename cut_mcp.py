@@ -15,6 +15,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 import io
 import json
+import os
 import math
 from pathlib import Path
 import secrets
@@ -451,6 +452,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--print-codex-config", action="store_true", help="Print configuration; never edit Codex settings.")
     args = parser.parse_args()
+    # Relative library paths (data/, clips/) resolve like the app's, whatever cwd the client uses.
+    os.chdir(Path(__file__).resolve().parent)
     if args.print_codex_config:
         root = Path(__file__).resolve().parent
         command = (root / "venv" / "Scripts" / "python.exe").as_posix()

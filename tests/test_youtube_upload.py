@@ -36,6 +36,22 @@ class _Service:
         self.inserted.append(body)
         return _Request(body)
 
+    def update(self, part, body):
+        self.updated = body
+        privacy = getattr(self, "result_privacy", "public")
+        return type("_Exec", (), {"execute": lambda _self: {"status": {"privacyStatus": privacy}}})()
+
+
+class PublishTest(unittest.TestCase):
+    def test_publish_sets_public_and_reports_locked_private(self):
+        service = _Service()
+        result = youtube_upload.publish("abcDEF12345", service_factory=lambda: service)
+        self.assertEqual(service.updated["status"]["privacyStatus"], "public")
+        self.assertIn("watch?v=abcDEF12345", result["watch_url"])
+        service.result_privacy = "private"
+        with self.assertRaises(youtube_upload.UploadError):
+            youtube_upload.publish("abcDEF12345", service_factory=lambda: service)
+
 
 class YouTubeUploadTest(unittest.TestCase):
     def setUp(self):

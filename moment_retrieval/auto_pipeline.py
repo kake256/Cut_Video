@@ -64,11 +64,57 @@ def _jobs_dir() -> Path:
     return config.CACHE_ROOT / "auto_jobs"
 
 
+LIBRARY_PREFIX = "library:"
+
+
+def library_videos() -> list[dict]:
+    """Transcribed library videos (also those made in the editor app) usable for a job.
+
+    A video qualifies when its source file is on this PC, or when a shared
+    index carries its original URL (the job then downloads and relinks it).
+    """
+    from . import source_origin
+
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        result = []
+        for video in db.list_public_videos(conn):
+            public_id = video["public_video_id"]
+            if db.get_active_transcript_revision(conn, public_id) is None:
+                continue
+            raw = db.get_video(conn, public_id) or {}
+            available = video["source_state"] == "available" and Path(str(video["path"])).is_file()
+            origin = source_origin.origin_url_for_video(conn, raw)
+            if not available and not origin:
+                continue
+            result.append({
+                "video_id": public_id,
+                "name": video["display_name"],
+                "duration_sec": float(video.get("duration") or 0),
+                "source_available": available,
+                "origin_url": origin,
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def library_source(video_id: str) -> str:
+    """Job source for a library video: itself when local, else its original URL."""
+    video = next((item for item in library_videos() if item["video_id"] == video_id), None)
+    if video is None:
+        raise PipelineError("選んだ動画は文字起こし済みでないか、元動画が見つかりません。")
+    return LIBRARY_PREFIX + video_id if video["source_available"] else video["origin_url"]
+
+
 def validate_source(source: str) -> str:
-    """Accept an http(s) URL or a file inside the configured video folders."""
+    """Accept an http(s) URL, a library video, or a file inside the video folders."""
     value = str(source or "").strip().strip('"')
     if not value:
         raise PipelineError("動画のURLかファイルのパスを入力してください。")
+    if value.startswith(LIBRARY_PREFIX):
+        return library_source(value[len(LIBRARY_PREFIX):])
     if value.lower().startswith(("http://", "https://")):
         return value
     path = Path(value).expanduser()
@@ -241,6 +287,17 @@ class AutoPipeline:
                 self._save(job)
 
     def _metadata(self, job: AutoJob):
+        if job.source.startswith(LIBRARY_PREFIX):
+            conn = db.get_conn()
+            try:
+                db.init_db(conn)
+                video = db.get_public_video(conn, job.source[len(LIBRARY_PREFIX):])
+            finally:
+                conn.close()
+            if not video or not Path(str(video["path"])).is_file():
+                raise PipelineError("ライブラリの元動画が見つかりません。")
+            self._log(job, f"文字起こし済みの動画を使います: {video['display_name']}")
+            return None, None, str(Path(video["path"]).resolve())
         if not job.source.lower().startswith(("http://", "https://")):
             self._log(job, f"ローカルファイルを使います: {Path(job.source).name}（投稿は非公開）")
             return None, None, job.source
@@ -286,11 +343,37 @@ class AutoPipeline:
         finally:
             conn.close()
 
+    def _relink_shared(self, job: AutoJob, path: Path) -> str | None:
+        """Attach a downloaded file to an imported shared index with the same URL."""
+        if not job.source.lower().startswith(("http://", "https://")):
+            return None
+        from . import source_origin
+        from .share import ShareError, relink_video
+
+        conn = db.get_conn()
+        try:
+            db.init_db(conn)
+            waiting = source_origin.unlinked_videos_for_origin(conn, job.source)
+        finally:
+            conn.close()
+        for public_id in waiting:
+            try:
+                relink_video(public_id, path)
+            except ShareError as exc:
+                self._log(job, f"共有インデックスとの関連付けを見送りました: {exc}")
+                continue
+            self._log(job, "共有インデックスに関連付けました（文字起こしは共有されたものを使います）。")
+            return public_id
+        return None
+
     def _index(self, job: AutoJob, path: Path) -> str:
         existing = self._indexed_video_id(path)
         if existing:
             self._log(job, "文字起こし済みのため再利用します。")
             return existing
+        shared = self._relink_shared(job, path)
+        if shared:
+            return shared
         if not self.index_lock.acquire(timeout=1):
             self._log(job, "別の文字起こしが終わるのを待っています。")
             while not self.index_lock.acquire(timeout=5):

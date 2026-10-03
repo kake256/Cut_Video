@@ -18,7 +18,9 @@ os.chdir(Path(__file__).resolve().parent)
 import gradio as gr  # noqa: E402
 
 from moment_retrieval import agent_runner, gcloud_setup, youtube_upload  # noqa: E402
-from moment_retrieval.auto_pipeline import AutoPipeline, PipelineError  # noqa: E402
+from moment_retrieval.auto_pipeline import (  # noqa: E402
+    LIBRARY_PREFIX, AutoPipeline, PipelineError, library_videos,
+)
 
 APP_PORT = int(os.environ.get("CUT_AUTO_PUBLISH_PORT", "7870"))
 
@@ -234,11 +236,30 @@ def summary_status() -> str:
     return f"{youtube_part}　|　AI: {auto_agent_status()}"
 
 
-def auto_submit(sources: str, agent: str, model: str, clip_count, effort: str,
+def _duration_label(seconds: float) -> str:
+    seconds = int(seconds or 0)
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def library_choices() -> list[tuple[str, str]]:
+    choices = []
+    for video in library_videos():
+        note = "" if video["source_available"] else "（共有・元動画は自動でダウンロード）"
+        choices.append((f"{video['name']}　{_duration_label(video['duration_sec'])}{note}", video["video_id"]))
+    return choices
+
+
+def refresh_library():
+    choices = library_choices()
+    return gr.update(choices=choices), gr.update(choices=choices)
+
+
+def auto_submit(sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
                 min_sec, max_sec, layout: str, upload: bool):
     lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
+    lines += [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
     if not lines:
-        raise gr.Error("切り抜きたい動画のURLかファイルのパスを入力してください。")
+        raise gr.Error("動画のURLを入力するか、文字起こし済みの動画を選んでください。")
     submitted = []
     for line in lines[:10]:
         try:
@@ -251,7 +272,60 @@ def auto_submit(sources: str, agent: str, model: str, clip_count, effort: str,
             raise gr.Error(f"{line}: {exc}") from exc
         submitted.append(job.job_id)
     gr.Info(f"{len(submitted)}件のジョブを開始しました。")
-    return ("", *auto_jobs_view())
+    return ("", gr.update(value=[]), *auto_jobs_view())
+
+
+def export_shared_index(video_id: str, include_url: bool):
+    from moment_retrieval.share import ShareError, export_index
+
+    if not video_id:
+        raise gr.Error("書き出す動画を選んでください。")
+    try:
+        path = export_index(video_id, confirm_sensitive=True, include_source_url=bool(include_url))
+    except ShareError as exc:
+        raise gr.Error(str(exc)) from exc
+    return str(path.resolve()), f"書き出しました: {path.resolve()}"
+
+
+def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
+                        min_sec, max_sec, layout: str, upload: bool):
+    """Import a share zip; optionally start a job that downloads, relinks and clips it."""
+    from moment_retrieval import db, source_origin
+    from moment_retrieval.share import ShareError, import_index
+
+    path = getattr(uploaded, "name", None) or uploaded
+    if not path:
+        raise gr.Error("共有zipを選んでください。")
+    before = {item["video_id"] for item in library_videos()}
+    try:
+        messages = list(import_index(Path(str(path))))
+    except ShareError as exc:
+        raise gr.Error(str(exc)) from exc
+    log = "\n".join(messages)
+    new_ids = [item["video_id"] for item in library_videos() if item["video_id"] not in before]
+    if start_clipping:
+        if not new_ids:
+            log += "\n切り抜きは開始していません（新しく使える動画がありません。元動画URLのない共有zipは、元動画をこのPCに用意してください）。"
+        for video_id in new_ids:
+            conn = db.get_conn()
+            try:
+                origin = source_origin.origin_url_for_video(conn, db.get_video(conn, video_id) or {})
+            finally:
+                conn.close()
+            if not origin:
+                continue
+            try:
+                job = _auto_pipeline().submit(
+                    origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
+                    max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                    model=model or "", effort=(effort or "") if agent == "codex" else "",
+                )
+            except PipelineError as exc:
+                log += f"\n切り抜きを開始できませんでした: {exc}"
+                continue
+            log += f"\n切り抜きジョブを開始しました（{job.job_id}）。元動画をダウンロードして共有された文字起こしに関連付けます。"
+    choices = library_choices()
+    return log, gr.update(choices=choices), gr.update(choices=choices)
 
 
 def auto_publish(selection: str):
@@ -284,6 +358,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 label="動画のURL（YouTube / Twitch）またはファイルのパス　※1行に1つ",
                 lines=2, placeholder="https://www.youtube.com/watch?v=...",
             )
+            with gr.Row():
+                auto_library = gr.Dropdown(
+                    choices=[], multiselect=True, scale=5,
+                    label="または文字起こし済みの動画から選ぶ（編集用CUTで処理した動画も含む）",
+                )
+                auto_library_refresh = gr.Button("一覧を更新", scale=1)
             with gr.Row():
                 auto_agent = gr.Radio(
                     choices=[("Codex", "codex"), ("Claude Code", "claude")], value="codex",
@@ -322,6 +402,27 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_cancel_select = gr.Dropdown(choices=[], label="実行中のジョブ", scale=4)
                     auto_cancel_btn = gr.Button("停止", variant="stop", scale=1)
             auto_timer = gr.Timer(5)
+
+        with gr.Tab("インデックスの共有"):
+            gr.Markdown(
+                "文字起こし（インデックス）をzipで受け渡しします。受け取った人はWhisperで文字起こしをし直さずに"
+                "切り抜けます。zipには全文の文字起こしが含まれるので、渡す相手に注意してください。"
+            )
+            gr.Markdown("### 書き出す")
+            with gr.Row():
+                share_export_video = gr.Dropdown(choices=[], label="書き出す動画", scale=4)
+                share_include_url = gr.Checkbox(value=True, label="元動画のURLを同梱（YouTube / Twitch）", scale=2)
+                share_export_btn = gr.Button("共有zipを書き出す", scale=1)
+            share_export_file = gr.File(label="書き出したzip", interactive=False, height=80)
+            share_export_md = gr.Markdown("")
+            gr.Markdown("### 読み込む")
+            share_import_file = gr.File(label="共有zip（.vindex.zip）", file_types=[".zip"], type="filepath", height=120)
+            share_start = gr.Checkbox(
+                value=True,
+                label="読み込んだら、元動画をダウンロードして「切り抜き」タブの設定で切り抜き・アップロードまで進める",
+            )
+            share_import_btn = gr.Button("読み込む", variant="primary")
+            share_import_log = gr.Textbox(label="読み込みログ", interactive=False, lines=6)
 
         with gr.Tab("設定"):
             gr.Markdown("### YouTubeアカウント")
@@ -386,10 +487,21 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         summary_status, outputs=[status_md])
     auto_start_btn.click(
         auto_submit,
-        inputs=[auto_sources, auto_agent, auto_model, auto_clip_count, auto_effort,
+        inputs=[auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
                 auto_min_sec, auto_max_sec, auto_layout, auto_upload],
-        outputs=[auto_sources, *auto_job_outputs],
+        outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
+    demo.load(refresh_library, outputs=[auto_library, share_export_video])
+    auto_library_refresh.click(refresh_library, outputs=[auto_library, share_export_video])
+    share_export_btn.click(export_shared_index, inputs=[share_export_video, share_include_url],
+                           outputs=[share_export_file, share_export_md], concurrency_id="library-share")
+    share_import_btn.click(
+        import_shared_index,
+        inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+        outputs=[share_import_log, auto_library, share_export_video],
+        concurrency_id="library-share",
+    ).then(auto_jobs_view, outputs=auto_job_outputs)
     auto_publish_btn.click(auto_publish, inputs=[auto_publish_select], outputs=auto_job_outputs,
                            concurrency_id="youtube-publish", concurrency_limit=1)
     auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)

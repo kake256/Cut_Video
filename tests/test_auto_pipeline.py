@@ -163,6 +163,59 @@ class PipelineTest(_Isolated):
             with self.subTest(bad=bad), self.assertRaises(auto_pipeline.PipelineError):
                 auto_pipeline.validate_source(bad)
 
+    def _library(self):
+        from types import SimpleNamespace
+        from moment_retrieval import db, source_origin
+
+        conn_patch = patch.object(config, "DB_PATH", self.root / "lib" / "index.db")
+        conn_patch.start()
+        self.addCleanup(conn_patch.stop)
+        local = self.root / "video" / "local.mp4"
+        local.write_bytes(b"x")
+        conn = db.get_conn()
+        db.init_db(conn, create_backup=False)
+        ids = {}
+        for name, path in (("local", local), ("shared", self.root / "video" / "__unlinked__" / "s.mp4"),
+                           ("untranscribed", local.with_name("raw.mp4"))):
+            storage = "vid_" + name[0] * 32
+            db.insert_video(conn, storage, str(path), 60.0)
+            if name != "untranscribed":
+                db.insert_segment(conn, storage, SimpleNamespace(start=0.0, end=5.0, text="合成", words=[]))
+                db.mark_asr_complete(conn, storage)
+            ids[name] = db.public_video_id(conn, storage)
+        conn.execute("UPDATE videos SET source_state = 'missing' WHERE public_video_id = ?", (ids["shared"],))
+        source_origin.remember_shared_origin(conn, ids["shared"], "https://youtu.be/abcDEF12345")
+        conn.close()
+        return ids, local
+
+    def test_library_lists_transcribed_videos_and_maps_shared_ones_to_their_url(self):
+        ids, local = self._library()
+        listed = {item["video_id"]: item for item in auto_pipeline.library_videos()}
+        self.assertEqual(set(listed), {ids["local"], ids["shared"]})
+        self.assertEqual(auto_pipeline.validate_source("library:" + ids["local"]), "library:" + ids["local"])
+        self.assertEqual(auto_pipeline.validate_source("library:" + ids["shared"]),
+                         "https://www.youtube.com/watch?v=abcDEF12345")
+        with self.assertRaises(auto_pipeline.PipelineError):
+            auto_pipeline.validate_source("library:" + ids["untranscribed"])
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        job = auto_pipeline.AutoJob(job_id="auto_lib", source="library:" + ids["local"], agent="codex")
+        pipeline.jobs[job.job_id] = job
+        _info, _channel, path = pipeline._metadata(job)
+        self.assertEqual(Path(path), local.resolve())
+
+    def test_downloaded_url_relinks_to_an_imported_shared_index_instead_of_whisper(self):
+        ids, _local = self._library()
+        downloaded = self.root / "video" / "20260101_abcDEF12345.mp4"
+        downloaded.write_bytes(b"x")
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        job = auto_pipeline.AutoJob(job_id="auto_share", source="https://youtu.be/abcDEF12345", agent="codex")
+        pipeline.jobs[job.job_id] = job
+        with patch("moment_retrieval.share.relink_video") as relink, \
+                patch.object(pipeline, "_run_logged", side_effect=AssertionError("Whisper must not run")):
+            video_id = pipeline._index(job, downloaded)
+        relink.assert_called_once_with(ids["shared"], downloaded)
+        self.assertEqual(video_id, ids["shared"])
+
     def test_unfinished_jobs_are_marked_failed_after_restart(self):
         directory = config.CACHE_ROOT / "auto_jobs"
         directory.mkdir(parents=True)

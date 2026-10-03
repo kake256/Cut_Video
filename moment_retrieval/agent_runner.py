@@ -39,7 +39,7 @@ class ClipRequest:
     video_id: str
     clip_count: int = 3
     min_duration_sec: float = 20.0
-    max_duration_sec: float = 60.0
+    max_duration_sec: float = 180.0  # YouTube Shorts upper limit
     note: str = "自動投稿パイプライン"
 
     def prompt(self) -> str:

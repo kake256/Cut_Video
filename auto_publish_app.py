@@ -19,7 +19,7 @@ import gradio as gr  # noqa: E402
 
 from moment_retrieval import agent_runner, ai_setup, config, gcloud_setup, youtube_upload  # noqa: E402
 from moment_retrieval.auto_pipeline import (  # noqa: E402
-    LIBRARY_PREFIX, AutoPipeline, PipelineError, library_videos,
+    LIBRARY_PREFIX, SHORTS_MAX_SEC, AutoPipeline, PipelineError, library_videos,
 )
 
 APP_PORT = int(os.environ.get("CUT_AUTO_PUBLISH_PORT", "7870"))
@@ -405,14 +405,17 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     label="モデル", scale=2,
                 )
                 auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="本数", scale=2)
-            with gr.Accordion("詳細設定", open=False):
+            with gr.Accordion("長さ・レイアウト・アップロード・推論の強さ", open=False):
                 with gr.Row():
                     auto_effort = gr.Dropdown(
                         choices=list(agent_runner.EFFORTS), value=agent_runner.DEFAULT_EFFORT,
                         label="推論の強さ（Codex）",
                     )
-                    auto_min_sec = gr.Number(value=20, label="最短（秒）")
-                    auto_max_sec = gr.Number(value=60, label="最長（秒）")
+                    auto_min_sec = gr.Number(value=20, minimum=5, maximum=SHORTS_MAX_SEC, label="最短（秒）")
+                    auto_max_sec = gr.Number(
+                        value=SHORTS_MAX_SEC, minimum=5, maximum=SHORTS_MAX_SEC,
+                        label=f"最長（秒）※ショートの上限 {SHORTS_MAX_SEC}秒",
+                    )
                 with gr.Row():
                     auto_layout = gr.Radio(
                         choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",

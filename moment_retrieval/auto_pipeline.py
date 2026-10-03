@@ -24,6 +24,8 @@ from . import agent_runner, channel_policy, config, db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"done", "failed", "cancelled"}
+# YouTube Shorts accept vertical videos up to 3 minutes.
+SHORTS_MAX_SEC = 180
 STEPS = ("取り込み", "文字起こし", "候補選び", "書き出し", "投稿")
 
 
@@ -42,7 +44,7 @@ class AutoJob:
     agent: str
     clip_count: int = 3
     min_duration_sec: float = 20.0
-    max_duration_sec: float = 60.0
+    max_duration_sec: float = SHORTS_MAX_SEC
     layout: str = "blur"
     upload: bool = True
     # Only fetch the source and attach it to its (shared) transcript; no clipping.
@@ -184,7 +186,7 @@ class AutoPipeline:
             raise Cancelled()
 
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
-               max_duration_sec: float = 60.0, layout: str = "blur", upload: bool = True,
+               max_duration_sec: float = SHORTS_MAX_SEC, layout: str = "blur", upload: bool = True,
                model: str = "", effort: str = "", link_only: bool = False) -> AutoJob:
         if agent not in agent_runner.AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
@@ -194,8 +196,8 @@ class AutoPipeline:
             raise PipelineError(str(exc)) from exc
         if not 1 <= int(clip_count) <= 10:
             raise PipelineError("切り抜き本数は1〜10本で指定してください。")
-        if not 5 <= float(min_duration_sec) <= float(max_duration_sec) <= 180:
-            raise PipelineError("尺は 5秒 <= 最小 <= 最大 <= 180秒 で指定してください。")
+        if not 5 <= float(min_duration_sec) <= float(max_duration_sec) <= SHORTS_MAX_SEC:
+            raise PipelineError(f"長さは 5秒 <= 最短 <= 最長 <= {SHORTS_MAX_SEC}秒（ショートの上限）で指定してください。")
         if layout not in {"blur", "crop"}:
             raise PipelineError("レイアウトを選択してください。")
         job = AutoJob(

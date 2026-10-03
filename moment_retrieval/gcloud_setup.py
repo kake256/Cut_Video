@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import threading
 import webbrowser
 from pathlib import Path
 from typing import Callable
@@ -58,10 +59,77 @@ def active_account(*, runner: Callable = subprocess.run) -> str | None:
     return next((item.get("account") for item in accounts if item.get("status") == "ACTIVE"), None)
 
 
-def login(*, runner: Callable = subprocess.run) -> str | None:
-    """gcloud's own browser sign-in; returns the account now active."""
-    _run(["auth", "login", "--brief", "--quiet"], timeout=600, runner=runner)
+_PENDING_LOGIN: subprocess.Popen | None = None
+
+
+def start_login(*, spawn: Callable = subprocess.Popen, opener: Callable = webbrowser.open,
+                wait_sec: float = 30) -> str:
+    """Begin gcloud's copy-the-code sign-in and open its link in the browser.
+
+    gcloud's own browser launch can hand Google a broken URL on some Windows
+    setups (HTTP 400), so CUT opens the link itself and the user pastes back
+    the verification code shown by Google.
+    """
+    global _PENDING_LOGIN
+    gcloud = find_gcloud()
+    if not gcloud:
+        raise SetupError("Google Cloud SDK（gcloud）が見つかりません。")
+    cancel_login()
+    process = spawn(
+        [gcloud, "auth", "login", "--no-launch-browser", "--brief"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    found: list[str] = []
+
+    def read_until_url():
+        for line in iter(process.stdout.readline, ""):
+            text = line.strip()
+            if text.startswith("https://accounts.google.com/"):
+                found.append(text)
+                return
+
+    reader = threading.Thread(target=read_until_url, daemon=True)
+    reader.start()
+    reader.join(wait_sec)
+    if not found:
+        process.kill()
+        raise SetupError("gcloudからログイン用のリンクを取得できませんでした。")
+    _PENDING_LOGIN = process
+    opener(found[0])
+    return found[0]
+
+
+def finish_login(code: str, *, timeout: float = 120,
+                 runner: Callable = subprocess.run) -> str | None:
+    """Send the verification code to the waiting gcloud and report the account."""
+    global _PENDING_LOGIN
+    process = _PENDING_LOGIN
+    if process is None or process.poll() is not None:
+        raise SetupError("先に「Googleにログイン」を押してリンクを開いてください。")
+    code = str(code or "").strip()
+    if not code or any(ch.isspace() for ch in code):
+        raise SetupError("ブラウザに表示された確認コードを貼り付けてください。")
+    try:
+        process.stdin.write(code + "\n")
+        process.stdin.flush()
+        process.stdin.close()
+        exit_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        raise SetupError("ログインが時間内に終わりませんでした。もう一度お試しください。") from exc
+    finally:
+        _PENDING_LOGIN = None
+    if exit_code != 0:
+        raise SetupError("ログインに失敗しました。コードが正しいか、期限切れでないか確認してもう一度お試しください。")
     return active_account(runner=runner)
+
+
+def cancel_login() -> None:
+    global _PENDING_LOGIN
+    if _PENDING_LOGIN is not None and _PENDING_LOGIN.poll() is None:
+        _PENDING_LOGIN.kill()
+    _PENDING_LOGIN = None
 
 
 def saved_project() -> str | None:

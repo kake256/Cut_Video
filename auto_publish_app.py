@@ -85,10 +85,22 @@ def gcp_status() -> str:
 
 def gcp_login() -> str:
     try:
-        gcloud_setup.login()
+        url = gcloud_setup.start_login()
     except gcloud_setup.SetupError as exc:
         return f"**Google Cloud:** {exc}"
-    return gcp_status()
+    return (
+        "**Google Cloud:** ブラウザでログイン画面を開きました（開かない場合は"
+        f"[こちらのリンク]({url})）。使うGoogleアカウントでログインして許可すると確認コードが表示されるので、"
+        "下の「確認コード」に貼り付けて「コードを送信」を押してください。"
+    )
+
+
+def gcp_submit_code(code: str):
+    try:
+        gcloud_setup.finish_login(code)
+    except gcloud_setup.SetupError as exc:
+        return f"**Google Cloud:** {exc}", gr.update()
+    return gcp_status(), ""
 
 
 def gcp_create_project(confirmed: bool) -> str:
@@ -323,6 +335,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     )
                     gcp_create_btn = gr.Button("2. プロジェクト作成とAPI有効化")
                     gcp_pages_btn = gr.Button("3. 設定ページを開く")
+                with gr.Row():
+                    gcp_code = gr.Textbox(label="確認コード（ログイン後にブラウザに表示されたもの）", type="password", scale=3)
+                    gcp_code_btn = gr.Button("コードを送信", scale=1)
                 gcp_result_md = gr.Markdown("")
             with gr.Accordion("配布用: OAuthクライアントをアプリに同梱（他の人に使ってもらう場合）", open=False):
                 gr.Markdown(
@@ -402,6 +417,8 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
         demo.load(gcp_status, outputs=[gcp_status_md])
         gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
+        gcp_code_btn.click(gcp_submit_code, inputs=[gcp_code], outputs=[gcp_status_md, gcp_code],
+                           concurrency_id="gcp-setup")
         gcp_create_btn.click(gcp_create_project, inputs=[gcp_confirm], outputs=[gcp_result_md],
                              concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
         gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])

@@ -71,6 +71,44 @@ class GcloudSetupTest(unittest.TestCase):
         self.assertTrue(all("project=cut-youtube-abc123" in url for url in opened))
         self.assertIn("clients/create", opened[-1])
 
+    def test_copy_code_login_opens_link_and_sends_the_code(self):
+        import io
+
+        class _Process:
+            def __init__(self):
+                self.stdout = io.StringIO(
+                    "Go to the following link in your browser:\n\n"
+                    "    https://accounts.google.com/o/oauth2/auth?a=1&b=2\n\n"
+                )
+                self.stdin = io.StringIO()
+                self.sent = ""
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.sent = self.stdin.getvalue()
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        process = _Process()
+        process.stdin.close = lambda: None
+        opened = []
+        url = gcloud_setup.start_login(spawn=lambda *a, **k: process, opener=opened.append, wait_sec=2)
+        self.assertEqual(url, "https://accounts.google.com/o/oauth2/auth?a=1&b=2")
+        self.assertEqual(opened, [url])
+        with self.assertRaises(gcloud_setup.SetupError):
+            gcloud_setup.finish_login("has space")
+        account = gcloud_setup.finish_login("4/abcCODE", runner=_FakeGcloud(account="you@example.com"))
+        self.assertEqual(process.sent, "4/abcCODE\n")
+        self.assertEqual(account, "you@example.com")
+        with self.assertRaises(gcloud_setup.SetupError):
+            gcloud_setup.finish_login("4/again")
+
     def test_missing_gcloud_is_reported(self):
         with patch.object(gcloud_setup, "find_gcloud", return_value=None):
             with self.assertRaises(gcloud_setup.SetupError):

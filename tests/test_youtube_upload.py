@@ -115,5 +115,30 @@ class SavedPathMappingTest(unittest.TestCase):
             self.assertEqual(app._saved_highlight_paths([str(original)], out), [original.resolve()])
 
 
+
+class ClientSecretTest(unittest.TestCase):
+    def test_only_desktop_client_json_is_installed(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp) / "lib"):
+            web = Path(tmp) / "web.json"
+            web.write_text(json.dumps({"web": {"client_id": "a", "client_secret": "b"}}), encoding="utf-8")
+            with self.assertRaises(youtube_upload.UploadError):
+                youtube_upload.install_client_secret(web)
+            self.assertFalse(youtube_upload.client_secret_path().exists())
+            desktop = Path(tmp) / "desktop.json"
+            desktop.write_text(json.dumps({"installed": {"client_id": "a", "client_secret": "b"}}), encoding="utf-8")
+            youtube_upload.install_client_secret(desktop)
+            self.assertTrue(youtube_upload.client_secret_path().is_file())
+
+
+class AutoPublishAppTest(unittest.TestCase):
+    def test_standalone_app_builds_and_editor_no_longer_has_the_tab(self):
+        import auto_publish_app
+        import app
+
+        self.assertEqual(auto_publish_app.APP_PORT, 7870)
+        self.assertIsNotNone(auto_publish_app.demo)
+        self.assertFalse(hasattr(app, "auto_submit"))
+
+
 if __name__ == "__main__":
     unittest.main()

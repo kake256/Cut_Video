@@ -167,6 +167,21 @@ def connect_account() -> dict | None:
     return connected_channel()
 
 
+def install_client_secret(source: Path) -> None:
+    """Validate a downloaded OAuth client JSON (desktop app) and store it privately."""
+    try:
+        data = json.loads(Path(source).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UploadError("JSONとして読み込めませんでした。Google Cloudからダウンロードしたファイルを選んでください。") from exc
+    if isinstance(data, dict) and "web" in data:
+        raise UploadError("「ウェブアプリケーション」用のクライアントです。種類「デスクトップアプリ」で作り直してください。")
+    installed = data.get("installed") if isinstance(data, dict) else None
+    if not isinstance(installed, dict) or not installed.get("client_id") or not installed.get("client_secret"):
+        raise UploadError("OAuthクライアント（デスクトップアプリ）のJSONではありません。")
+    client_secret_path().parent.mkdir(parents=True, exist_ok=True)
+    client_secret_path().write_text(json.dumps(data), encoding="utf-8")
+
+
 def disconnect_account() -> bool:
     if token_path().is_file():
         token_path().unlink()

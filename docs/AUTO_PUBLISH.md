@@ -1,4 +1,7 @@
-# 自動投稿タブ
+# CUT 自動投稿（別アプリ）
+
+`start_auto_publish.bat` で起動します（http://127.0.0.1:7870 、編集用のCUTとは別ウィンドウ）。
+編集用のCUT（`start.bat`）と同じライブラリ（`data/`）と保存先（`clips/`）を使うので、両方同時に開いて構いません。
 
 動画のURL（YouTube / Twitch など）か、動画フォルダ内のファイルを貼り付けると、次の流れを裏で自動実行します。
 
@@ -13,7 +16,8 @@
 
 ## 準備
 
-- YouTube: `docs/YOUTUBE_UPLOAD.md` の手順でOAuthクライアントを用意し、「YouTubeアカウントを連携」を押す。
+- YouTube: `docs/YOUTUBE_UPLOAD.md` の手順でOAuthクライアント（デスクトップアプリ）を作り、ダウンロードしたJSONを
+  アプリの「OAuthクライアントJSON」から読み込んでから「YouTubeアカウントを連携」を押す。
   連携には「アップロード」と「チャンネル名の読み取り」の許可を求めます。
 - AI: Codex（デスクトップ版に同梱のCLIを自動で探します）か Claude Code（`claude`）がログイン済みであること。
   - Codexは読み取り専用のサンドボックスで実行し、CUTのMCPツールの承認だけをこの実行に限って自動にします。

@@ -57,6 +57,9 @@ class LibraryToolsTest(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual((hits[0]["start_segment_id"], hits[0]["end_segment_id"]),
                          (self.segment_ids[3], self.segment_ids[4]))
+        single = self.tools.search_transcript("炒めます")["untrusted_source_data"]
+        self.assertEqual([(h["start_segment_id"], h["end_segment_id"]) for h in single],
+                         [(self.segment_ids[4], self.segment_ids[4])])
 
     def test_proposal_is_snapped_stored_and_hidden_from_summary(self):
         result = self.tools.propose_clips(self.public_id, self.revision, [

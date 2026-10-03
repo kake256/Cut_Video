@@ -153,11 +153,14 @@ class LibraryTools:
                 for index, row in enumerate(segments):
                     # Also match phrases split across two adjacent ASR segments.
                     joined = _normalize(row.get("text"))
-                    if index + 1 < len(segments):
-                        joined_next = joined + _normalize(segments[index + 1].get("text"))
-                    else:
-                        joined_next = joined
-                    if needle not in joined and needle not in joined_next:
+                    following = (
+                        _normalize(segments[index + 1].get("text"))
+                        if index + 1 < len(segments) else ""
+                    )
+                    # A match wholly inside the next segment is reported on that segment.
+                    if needle not in joined and (
+                        needle in following or needle not in joined + following
+                    ):
                         continue
                     end_row = row if needle in joined else segments[index + 1]
                     hits.append({

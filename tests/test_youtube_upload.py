@@ -196,6 +196,41 @@ class AutoPublishAppTest(unittest.TestCase):
             (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x"}', encoding="utf-8")
             self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur"))
 
+    def test_publish_from_job_list_asks_first_then_reports_each_result(self):
+        import auto_publish_app
+
+        with self.assertRaises(auto_publish_app.gr.Error):
+            auto_publish_app.request_publish("auto_a", [])
+        pending, message, row = auto_publish_app.request_publish("auto_a", ["yt1", "yt2"])
+        self.assertEqual(pending, {"job_id": "auto_a", "video_ids": ["yt1", "yt2"]})
+        self.assertIn("2本", message["value"])
+        self.assertTrue(row["visible"])
+
+        def publish(job_id, video_id):
+            if video_id == "yt2":
+                raise auto_publish_app.PipelineError("YouTubeが拒否")
+            return {"watch_url": f"https://www.youtube.com/watch?v={video_id}"}
+
+        pipeline = SimpleNamespace(publish=Mock(side_effect=publish))
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
+                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", "[]", None)), \
+                patch.object(auto_publish_app.gr, "Info"):
+            result = auto_publish_app.confirm_publish(pending)
+        self.assertIsNone(result[0])
+        self.assertFalse(result[1]["visible"])
+        self.assertIn("watch?v=yt1", result[2])
+        self.assertIn("yt2: YouTubeが拒否", result[2])
+
+    def test_upload_signature_ignores_progress_but_tracks_publication(self):
+        import auto_publish_app
+
+        job = SimpleNamespace(job_id="auto_a", uploads=[{"video_id": "yt1", "privacy_status": "private"}], log=["a"])
+        before = auto_publish_app.uploads_signature([job])
+        job.log.append("progress")
+        self.assertEqual(auto_publish_app.uploads_signature([job]), before)
+        job.uploads[0]["privacy_status"] = "public"
+        self.assertNotEqual(auto_publish_app.uploads_signature([job]), before)
+
     def test_quit_stops_running_jobs_then_exits_later(self):
         import auto_publish_app
 

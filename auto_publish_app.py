@@ -191,12 +191,20 @@ _AUTO_STATE_LABELS = {
 }
 
 
+def uploads_signature(jobs) -> str:
+    """Changes only when uploads or their public/private state change, so the publish
+    cards (and any ticked checkboxes) are not rebuilt on every progress refresh."""
+    return json.dumps([
+        [job.job_id, [[u.get("video_id"), u.get("privacy_status")] for u in job.uploads]]
+        for job in jobs if job.uploads
+    ])
+
+
 def auto_jobs_view():
     jobs = _auto_pipeline().list_jobs()[:10]
     if not jobs:
-        return "まだジョブはありません。", gr.update(choices=[], value=None), gr.update(choices=[], value=None)
+        return "まだジョブはありません。", uploads_signature([]), gr.update(choices=[], value=None)
     parts = []
-    publishable: list[tuple[str, str]] = []
     for job in jobs:
         state = _AUTO_STATE_LABELS.get(job.state, job.state)
         step = f" / {job.step}" if job.state == "running" and job.step else ""
@@ -206,21 +214,16 @@ def auto_jobs_view():
             parts.append(f"- チャンネル: {html.escape(job.source_channel)}")
         if job.source_video_key:
             parts.append(f"- 動画ID: {html.escape(job.source_video_key)}")
-        for upload in job.uploads:
-            status = "公開中" if upload.get("privacy_status") == "public" else "非公開"
-            link = upload.get("watch_url") or upload.get("studio_url")
-            parts.append(f"- [{status}] {html.escape(str(upload.get('title', '')))} — {link}")
-            if status == "非公開":
-                publishable.append(
-                    (f"{upload.get('title')}（{job.job_id}）", f"{job.job_id}|{upload.get('video_id')}")
-                )
+        if job.uploads:
+            public = sum(1 for u in job.uploads if u.get("privacy_status") == "public")
+            parts.append(f"- アップロード: {len(job.uploads)}本（公開中 {public}本）— 上の一覧から公開できます")
         recent = "\n".join(job.log[-8:])
         # Blank lines around the HTML block keep the next job's heading rendered as Markdown.
         parts.append(f"\n<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n")
     running = [(job.job_id, job.job_id) for job in jobs if job.state in {"queued", "running"}]
     return (
         "\n".join(parts),
-        gr.update(choices=publishable, value=publishable[0][1] if publishable else None),
+        uploads_signature(jobs),
         gr.update(choices=running, value=running[0][1] if running else None),
     )
 
@@ -448,18 +451,36 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
     return log, gr.update(choices=choices), gr.update(choices=choices)
 
 
-def auto_publish(selection: str):
-    if not selection or "|" not in selection:
-        raise gr.Error("公開する動画を選択してください。")
-    job_id, video_id = selection.split("|", 1)
-    try:
-        result = _auto_pipeline().publish(job_id, video_id)
-    except (PipelineError, youtube_upload.UploadError) as exc:
-        raise gr.Error(str(exc)) from exc
-    except Exception as exc:
-        raise gr.Error(f"公開に失敗しました: {exc}") from exc
-    gr.Info(f"公開しました: {result['watch_url']}")
-    return auto_jobs_view()
+def request_publish(job_id: str, video_ids):
+    """First click: remember what to publish and ask for confirmation."""
+    ids = [str(item) for item in (video_ids or []) if item]
+    if not ids:
+        raise gr.Error("公開する動画にチェックを入れてください。")
+    return ({"job_id": job_id, "video_ids": ids},
+            gr.update(value=f"**{job_id} の動画を{len(ids)}本公開します。よろしいですか？**"),
+            gr.update(visible=True))
+
+
+def confirm_publish(pending):
+    """Second click: publish each video; failures are listed instead of stopping the rest."""
+    pending = pending or {}
+    done, failed = [], []
+    for video_id in pending.get("video_ids", []):
+        try:
+            result = _auto_pipeline().publish(pending.get("job_id", ""), video_id)
+            done.append(result["watch_url"])
+        except (PipelineError, youtube_upload.UploadError) as exc:
+            failed.append(f"{video_id}: {exc}")
+        except Exception as exc:
+            failed.append(f"{video_id}: {type(exc).__name__}: {exc}")
+    if done:
+        gr.Info(f"{len(done)}本を公開しました。")
+    message = "\n".join([f"公開しました: {url}" for url in done] + [f"公開できませんでした: {item}" for item in failed])
+    return (None, gr.update(visible=False), message, *auto_jobs_view())
+
+
+def cancel_publish():
+    return None, gr.update(visible=False)
 
 
 def auto_cancel(job_id: str):
@@ -563,12 +584,52 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 auto_download_btn = gr.Button("ダウンロードと文字起こしだけ", size="lg", scale=1)
             gr.Markdown(
                 "<small>権利者から切り抜きの許可を得た動画だけに使ってください。文字起こしは選んだAIへ送られます。"
-                "アップロードは常に**非公開**で、公開は下の「公開する」かYouTube Studioで行います。</small>"
+                "アップロードは常に**非公開**で、公開は下のジョブの一覧かYouTube Studioで行います。</small>"
             )
             gr.Markdown("### ジョブ")
-            with gr.Row():
-                auto_publish_select = gr.Dropdown(choices=[], label="公開する動画", scale=4)
-                auto_publish_btn = gr.Button("公開する", scale=1)
+            auto_uploads_sig = gr.State("[]")
+            publish_pending = gr.State(None)
+            with gr.Row(visible=False) as publish_confirm_row:
+                publish_confirm_md = gr.Markdown("", scale=3)
+                publish_confirm_btn = gr.Button("公開する", variant="primary", scale=1)
+                publish_cancel_btn = gr.Button("キャンセル", scale=1)
+            publish_result_md = gr.Markdown("")
+
+            @gr.render(inputs=[auto_uploads_sig])
+            def render_publish_cards(signature):
+                entries = json.loads(signature or "[]")
+                if not entries:
+                    return
+                gr.Markdown("**アップロードした動画**（チェックして公開できます）")
+                for job_id, _uploads in entries:
+                    job = _auto_pipeline().jobs.get(job_id)
+                    if job is None:
+                        continue
+                    with gr.Group():
+                        lines = [f"**{html.escape(job_id)}** — 元動画: {html.escape(job.source)}"]
+                        for upload in job.uploads:
+                            public = upload.get("privacy_status") == "public"
+                            link = upload.get("watch_url") or upload.get("studio_url")
+                            lines.append(f"- [{'公開中' if public else '非公開'}] "
+                                         f"{html.escape(str(upload.get('title', '')))} — {link}")
+                        gr.Markdown("\n".join(lines), padding=True)
+                        private = [(str(u.get("title", "")), str(u.get("video_id")))
+                                   for u in job.uploads if u.get("privacy_status") != "public"]
+                        if not private:
+                            continue
+                        picked = gr.CheckboxGroup(choices=private, label="公開する動画")
+                        with gr.Row():
+                            publish_picked = gr.Button("チェックした動画を公開")
+                            publish_all = gr.Button("このジョブの全部を公開")
+                        publish_picked.click(
+                            lambda selection, job_id=job_id: request_publish(job_id, selection),
+                            inputs=[picked], outputs=[publish_pending, publish_confirm_md, publish_confirm_row],
+                        )
+                        publish_all.click(
+                            lambda job_id=job_id, ids=tuple(v for _t, v in private): request_publish(job_id, ids),
+                            outputs=[publish_pending, publish_confirm_md, publish_confirm_row],
+                        )
+
             auto_jobs_md = gr.Markdown("まだジョブはありません。")
             with gr.Accordion("実行中のジョブを停止", open=False):
                 with gr.Row():
@@ -648,7 +709,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 bundle_btn = gr.Button("このクライアントをアプリに同梱する")
                 bundle_md = gr.Markdown("")
 
-    auto_job_outputs = [auto_jobs_md, auto_publish_select, auto_cancel_select]
+    auto_job_outputs = [auto_jobs_md, auto_uploads_sig, auto_cancel_select]
     demo.load(summary_status, outputs=[status_md])
     demo.load(auto_account_status, outputs=[auto_account_md])
     demo.load(auto_agent_status, outputs=[auto_agents_md])
@@ -699,8 +760,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)
-    auto_publish_btn.click(auto_publish, inputs=[auto_publish_select], outputs=auto_job_outputs,
-                           concurrency_id="youtube-publish", concurrency_limit=1)
+    publish_confirm_btn.click(
+        confirm_publish, inputs=[publish_pending],
+        outputs=[publish_pending, publish_confirm_row, publish_result_md, *auto_job_outputs],
+        concurrency_id="youtube-publish", concurrency_limit=1,
+    )
+    publish_cancel_btn.click(cancel_publish, outputs=[publish_pending, publish_confirm_row])
     auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
 
 

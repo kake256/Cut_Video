@@ -168,6 +168,34 @@ class AutoPublishAppTest(unittest.TestCase):
         pipeline.submit.assert_called_once_with("https://youtu.be/abcDEF12345", "codex", link_only=True)
         self.assertEqual(result[0], "")
 
+    def test_only_the_visible_input_is_used(self):
+        import auto_publish_app
+
+        pipeline = SimpleNamespace(submit=Mock(return_value=SimpleNamespace(job_id="auto_x")))
+        common = ("codex", "gpt-6-luna", 1, "high", 20, 60, "blur", False)
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
+                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", None, None)), \
+                patch.object(auto_publish_app.gr, "Info"):
+            auto_publish_app.auto_submit("library", "https://youtu.be/abcDEF12345", ["vid_a"], *common)
+            auto_publish_app.auto_submit("url", "https://youtu.be/abcDEF12345", ["vid_a"], *common)
+        sources = [call.args[0] for call in pipeline.submit.call_args_list]
+        self.assertEqual(sources, ["library:vid_a", "https://youtu.be/abcDEF12345"])
+        url_visible, library_visible, download_visible = auto_publish_app.on_mode_change("library")
+        self.assertEqual((url_visible["visible"], library_visible["visible"], download_visible["visible"]),
+                         (False, True, False))
+
+    def test_length_layout_and_effort_are_saved_as_defaults(self):
+        import auto_publish_app
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur"))
+            auto_publish_app.save_ui_settings("max", 15, 45, "crop")
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("max", 15.0, 45.0, "crop"))
+            with self.assertRaises(auto_publish_app.gr.Error):
+                auto_publish_app.save_ui_settings("high", 50, 20, "blur")
+            (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x"}', encoding="utf-8")
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur"))
+
     def test_quit_stops_running_jobs_then_exits_later(self):
         import auto_publish_app
 

@@ -200,31 +200,40 @@ def uploads_signature(jobs) -> str:
     ])
 
 
-def auto_jobs_view():
-    jobs = _auto_pipeline().list_jobs()[:10]
-    if not jobs:
-        return "まだジョブはありません。", uploads_signature([]), gr.update(choices=[], value=None)
-    parts = []
+def _job_history_markdown(jobs) -> str:
+    lines = []
     for job in jobs:
         state = _AUTO_STATE_LABELS.get(job.state, job.state)
-        step = f" / {job.step}" if job.state == "running" and job.step else ""
-        parts.append(f"### {html.escape(job.job_id)} — {state}{html.escape(step)}")
-        parts.append(f"- 元動画: {html.escape(job.source)}")
-        if job.source_channel:
-            parts.append(f"- チャンネル: {html.escape(job.source_channel)}")
-        if job.source_video_key:
-            parts.append(f"- 動画ID: {html.escape(job.source_video_key)}")
-        if job.uploads:
-            public = sum(1 for u in job.uploads if u.get("privacy_status") == "public")
-            parts.append(f"- アップロード: {len(job.uploads)}本（公開中 {public}本）— 上の一覧から公開できます")
+        uploads = f"・アップロード {len(job.uploads)}本" if job.uploads else ""
         recent = "\n".join(job.log[-8:])
-        # Blank lines around the HTML block keep the next job's heading rendered as Markdown.
-        parts.append(f"\n<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n")
-    running = [(job.job_id, job.job_id) for job in jobs if job.state in {"queued", "running"}]
+        lines.append(
+            f"**{html.escape(job.job_id)}** — {state}{uploads}　{html.escape(job.source)}\n\n"
+            f"<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n"
+        )
+    return "\n".join(lines) or "まだジョブはありません。"
+
+
+def auto_jobs_view():
+    """Running jobs stay visible; finished ones go to the collapsed history."""
+    jobs = _auto_pipeline().list_jobs()[:10]
+    active = [job for job in jobs if job.state in {"queued", "running"}]
+    if active:
+        parts = []
+        for job in active:
+            state = _AUTO_STATE_LABELS.get(job.state, job.state)
+            step = f"（{job.step}）" if job.step else ""
+            last = job.log[-1] if job.log else ""
+            parts.append(f"- **{html.escape(job.job_id)}** {state}{html.escape(step)} — "
+                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>")
+        running_md = "\n".join(parts)
+    else:
+        running_md = "実行中のジョブはありません。"
+    running = [(job.job_id, job.job_id) for job in active]
     return (
-        "\n".join(parts),
+        running_md,
         uploads_signature(jobs),
         gr.update(choices=running, value=running[0][1] if running else None),
+        _job_history_markdown(jobs),
     )
 
 
@@ -587,6 +596,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 "アップロードは常に**非公開**で、公開は下のジョブの一覧かYouTube Studioで行います。</small>"
             )
             gr.Markdown("### ジョブ")
+            auto_jobs_md = gr.Markdown("実行中のジョブはありません。")
             auto_uploads_sig = gr.State("[]")
             publish_pending = gr.State(None)
             with gr.Row(visible=False) as publish_confirm_row:
@@ -630,7 +640,8 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                             outputs=[publish_pending, publish_confirm_md, publish_confirm_row],
                         )
 
-            auto_jobs_md = gr.Markdown("まだジョブはありません。")
+            with gr.Accordion("ジョブの履歴（ログ）", open=False):
+                auto_history_md = gr.Markdown("まだジョブはありません。")
             with gr.Accordion("実行中のジョブを停止", open=False):
                 with gr.Row():
                     auto_cancel_select = gr.Dropdown(choices=[], label="実行中のジョブ", scale=4)
@@ -709,7 +720,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 bundle_btn = gr.Button("このクライアントをアプリに同梱する")
                 bundle_md = gr.Markdown("")
 
-    auto_job_outputs = [auto_jobs_md, auto_uploads_sig, auto_cancel_select]
+    auto_job_outputs = [auto_jobs_md, auto_uploads_sig, auto_cancel_select, auto_history_md]
     demo.load(summary_status, outputs=[status_md])
     demo.load(auto_account_status, outputs=[auto_account_md])
     demo.load(auto_agent_status, outputs=[auto_agents_md])

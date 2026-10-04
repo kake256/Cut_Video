@@ -65,6 +65,39 @@ class CaptionTest(unittest.TestCase):
         self.assertEqual([(round(w.start, 2), w.text) for w in words], [(0.0, "あ"), (0.3, "い"), (1.8, "うえ")])
 
 
+class AiCaptionTest(unittest.TestCase):
+    def _words(self, text, step=0.2):
+        return [Word(i * step, i * step + step, ch) for i, ch in enumerate(text)]
+
+    def test_ai_lines_get_whisper_times_even_after_corrections(self):
+        words = self._words("でんちねでんちのつかいみちはなに")  # Whisper heard it in kana
+        lines = ["でんちね。", "でんちの使い道は何？"]
+        captions = finishing.captions_from_ai_lines(words, lines)
+        self.assertEqual([c.text for c in captions], lines)
+        self.assertAlmostEqual(captions[0].start, 0.0, places=2)
+        self.assertAlmostEqual(captions[1].start, 4 * 0.2 - 0.05, places=2)
+        self.assertLessEqual(captions[0].end, captions[1].start)
+
+    def test_lines_unrelated_to_the_speech_are_rejected(self):
+        words = self._words("きょうはいいてんきですね")
+        self.assertIsNone(finishing.captions_from_ai_lines(words, ["まったく違う内容をでっち上げた字幕"]))
+
+    def test_plan_keeps_caption_lines_trimmed(self):
+        plan = finishing.validate_plan({"captions": ["  電池ね。 ", "", "あ" * 40]}, 30)
+        self.assertEqual(plan.caption_lines, ["電池ね。", "あ" * 24])
+
+
+class SpeechSnapTest(unittest.TestCase):
+    def test_lines_start_at_the_voice_and_end_shortly_after_it(self):
+        captions = [Caption(0.5, 3.5, "早すぎる"), Caption(5.0, 6.0, "ちょうど")]
+        regions = [(0.9, 2.0), (5.0, 6.1)]
+        snapped = finishing.snap_captions_to_speech(captions, regions)
+        self.assertAlmostEqual(snapped[0].start, 0.87, places=2)
+        self.assertAlmostEqual(snapped[0].end, 2.25, places=2)
+        self.assertEqual((snapped[1].start, snapped[1].end), (5.0, 6.0))
+        self.assertEqual(finishing.snap_captions_to_speech(captions, []), captions)
+
+
 class RenderPlanTest(unittest.TestCase):
     def test_effect_line_pops_and_audio_is_mixed_with_a_limiter(self):
         plan = FinishPlan(hook_text="引き", sound_effects=[(1.0, "thud")])

@@ -273,7 +273,8 @@ class AutoPipeline:
             job.video_id = self.steps["index"](job, Path(local_path))
             if job.link_only:
                 job.state = "done"
-                self._log(job, "元動画をダウンロードして文字起こしに関連付けました。切り抜きはしていません。")
+                self._log(job, "ダウンロードと文字起こしが完了しました（切り抜きはしていません）。"
+                               "「文字起こし済みの動画から選ぶ」から切り抜けます。")
                 return
             self._check_cancel(job)
             job.step = STEPS[2]

@@ -157,6 +157,17 @@ class AutoPublishAppTest(unittest.TestCase):
         self.assertIsNotNone(auto_publish_app.demo)
         self.assertFalse(hasattr(app, "auto_submit"))
 
+    def test_download_only_button_starts_link_only_jobs(self):
+        import auto_publish_app
+
+        pipeline = SimpleNamespace(submit=Mock(return_value=SimpleNamespace(job_id="auto_dl")))
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
+                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", None, None)), \
+                patch.object(auto_publish_app.gr, "Info"):
+            result = auto_publish_app.auto_download_only("https://youtu.be/abcDEF12345\n\n")
+        pipeline.submit.assert_called_once_with("https://youtu.be/abcDEF12345", "codex", link_only=True)
+        self.assertEqual(result[0], "")
+
     def test_quit_stops_running_jobs_then_exits_later(self):
         import auto_publish_app
 

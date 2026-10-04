@@ -280,6 +280,23 @@ def refresh_library():
     return gr.update(choices=choices), gr.update(choices=choices)
 
 
+def auto_download_only(sources: str):
+    """Download and transcribe URLs (or index local files) without clipping or uploading."""
+    lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
+    if not lines:
+        raise gr.Error("ダウンロードしたい動画のURLを入力してください。")
+    submitted = []
+    for line in lines[:10]:
+        try:
+            # The AI is not called in link-only jobs; any valid agent satisfies validation.
+            job = _auto_pipeline().submit(line, "codex", link_only=True)
+        except PipelineError as exc:
+            raise gr.Error(f"{line}: {exc}") from exc
+        submitted.append(job.job_id)
+    gr.Info(f"{len(submitted)}件のダウンロードと文字起こしを開始しました。")
+    return ("", *auto_jobs_view())
+
+
 def auto_submit(sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
                 min_sec, max_sec, layout: str, upload: bool):
     lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
@@ -458,7 +475,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                         choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",
                     )
                     auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
-            auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg")
+            with gr.Row():
+                auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg", scale=3)
+                auto_download_btn = gr.Button("ダウンロードと文字起こしだけ", size="lg", scale=1)
             gr.Markdown(
                 "<small>権利者から切り抜きの許可を得た動画だけに使ってください。文字起こしは選んだAIへ送られます。"
                 "アップロードは常に**非公開**で、公開は下の「公開する」かYouTube Studioで行います。</small>"
@@ -578,6 +597,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 auto_min_sec, auto_max_sec, auto_layout, auto_upload],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
+    auto_download_btn.click(auto_download_only, inputs=[auto_sources],
+                            outputs=[auto_sources, *auto_job_outputs]).then(
+        refresh_library, outputs=[auto_library, share_export_video])
     demo.load(refresh_library, outputs=[auto_library, share_export_video])
     auto_library_refresh.click(refresh_library, outputs=[auto_library, share_export_video])
     share_export_btn.click(export_shared_index, inputs=[share_export_video, share_include_url],

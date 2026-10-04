@@ -225,7 +225,7 @@ class PipelineTest(_Isolated):
         pipeline.run(job)
         self.assertEqual(job.state, "done")
         self.assertEqual(calls, ["metadata", "download", "index"])
-        self.assertIn("関連付けました", job.log[-1])
+        self.assertIn("文字起こしが完了しました", job.log[-1])
 
     def test_backfill_records_clips_uploaded_before_tracking(self):
         from moment_retrieval import db, used_ranges

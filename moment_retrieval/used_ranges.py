@@ -54,6 +54,30 @@ def record_from_clip(clip_path: Path, title: str = "") -> bool:
         conn.close()
 
 
+def backfill_from_jobs(jobs: list) -> int:
+    """Record clips uploaded before ranges were tracked, using each job's highlight run.
+
+    Matches an upload to its candidate by title; safe to run repeatedly (duplicates are ignored).
+    """
+    added = 0
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        for job in jobs:
+            if not (job.uploads and job.video_id and job.highlight_run_id):
+                continue
+            by_title = {str(c["title"]): c for c in db.get_highlight_candidates(conn, job.highlight_run_id)}
+            for upload in job.uploads:
+                candidate = by_title.get(str(upload.get("title") or ""))
+                if candidate and db.add_used_clip_range(
+                    conn, job.video_id, candidate["start_sec"], candidate["end_sec"], candidate["title"],
+                ):
+                    added += 1
+    finally:
+        conn.close()
+    return added
+
+
 def prompt_lines(used: list[dict]) -> str:
     """Human-readable list for AI prompts (times only plus the clip title)."""
     def clock(seconds: float) -> str:

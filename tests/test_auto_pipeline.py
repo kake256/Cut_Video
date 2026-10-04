@@ -227,6 +227,31 @@ class PipelineTest(_Isolated):
         self.assertEqual(calls, ["metadata", "download", "index"])
         self.assertIn("関連付けました", job.log[-1])
 
+    def test_backfill_records_clips_uploaded_before_tracking(self):
+        from moment_retrieval import db, used_ranges
+
+        ids, _local = self._library()
+        conn = db.get_conn()
+        try:
+            revision = db.get_active_transcript_revision(conn, ids["local"])
+            analysis = db.create_analysis_run(conn, ids["local"], revision, provider="t", model="t", prompt_version="v")
+            db.replace_analysis_chapters(conn, analysis, [{"start_segment_id": 1, "end_segment_id": 1, "start_sec": 0,
+                                                           "end_sec": 5, "title": "章", "summary": "", "tags": []}])
+            db.update_analysis_run(conn, analysis, status="ready", summary="s", tags=[], result={})
+            run = db.create_highlight_run(conn, ids["local"], revision, analysis, provider="t", model="t",
+                                          prompt_version="v", requested_count=1, min_duration_sec=1, max_duration_sec=5)
+            db.replace_highlight_candidates(conn, run, [{
+                "source_chapter_ordinal": 0, "anchor_start_segment_id": 1, "anchor_end_segment_id": 1,
+                "start_segment_id": 1, "end_segment_id": 1, "start_sec": 0.0, "end_sec": 5.0,
+                "title": "投稿済み", "summary": "", "reason": "r", "category": "c", "tags": []}])
+        finally:
+            conn.close()
+        job = auto_pipeline.AutoJob(job_id="auto_old_upload", source="x", agent="codex", video_id=ids["local"],
+                                    highlight_run_id=run, uploads=[{"title": "投稿済み", "video_id": "yt"}])
+        self.assertEqual(used_ranges.backfill_from_jobs([job]), 1)
+        self.assertEqual(used_ranges.backfill_from_jobs([job]), 0)
+        self.assertEqual(used_ranges.for_video(ids["local"])[0]["title"], "投稿済み")
+
     def test_unfinished_jobs_are_marked_failed_after_restart(self):
         directory = config.CACHE_ROOT / "auto_jobs"
         directory.mkdir(parents=True)

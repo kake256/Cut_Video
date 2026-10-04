@@ -148,6 +148,13 @@ class AutoPipeline:
             **(steps or {}),
         }
         self._load()
+        try:
+            from .used_ranges import backfill_from_jobs
+
+            # Clips uploaded before posted ranges were tracked still count as used.
+            backfill_from_jobs(list(self.jobs.values()))
+        except Exception:  # never block startup on bookkeeping
+            pass
 
     # ---------- persistence / bookkeeping ----------
     def _load(self) -> None:

@@ -49,6 +49,7 @@ class AutoJob:
     upload: bool = True
     # Only fetch the source and attach it to its (shared) transcript; no clipping.
     link_only: bool = False
+    focus: str = ""  # optional: what kind of scene to look for
     model: str = ""
     effort: str = ""
     state: str = "queued"
@@ -110,6 +111,15 @@ def library_source(video_id: str) -> str:
     if video is None:
         raise PipelineError("選んだ動画は文字起こし済みでないか、元動画が見つかりません。")
     return LIBRARY_PREFIX + video_id if video["source_available"] else video["origin_url"]
+
+
+MAX_FOCUS_CHARS = 200
+
+
+def clean_focus(text: str) -> str:
+    """One-line user request for the AI; quotes and newlines are flattened."""
+    value = " ".join(str(text or "").replace("「", "").replace("」", "").replace("'", "").split())
+    return value[:MAX_FOCUS_CHARS]
 
 
 def validate_source(source: str) -> str:
@@ -194,7 +204,7 @@ class AutoPipeline:
 
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
                max_duration_sec: float = SHORTS_MAX_SEC, layout: str = "blur", upload: bool = True,
-               model: str = "", effort: str = "", link_only: bool = False) -> AutoJob:
+               model: str = "", effort: str = "", link_only: bool = False, focus: str = "") -> AutoJob:
         if agent not in agent_runner.AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
         try:
@@ -211,7 +221,7 @@ class AutoPipeline:
             job_id="auto_" + secrets.token_hex(6), source=validate_source(source), agent=agent,
             clip_count=int(clip_count), min_duration_sec=float(min_duration_sec),
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
-            model=model, effort=effort, link_only=bool(link_only),
+            model=model, effort=effort, link_only=bool(link_only), focus=clean_focus(focus),
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -444,6 +454,8 @@ class AutoPipeline:
             self._log(job, f"投稿済みの{len(used)}か所と重ならない場面を選ぶよう指示します。")
         detail = " / ".join(item for item in (job.model, job.effort) if item)
         self._log(job, f"{label}{f'（{detail}）' if detail else ''} に文字起こしを渡して候補を選んでもらいます。")
+        if job.focus:
+            self._log(job, f"探す場面: {job.focus}")
 
         if job.agent == "local":
             from .local_selector import LocalSelectionError, select_clips
@@ -453,13 +465,17 @@ class AutoPipeline:
                     job.video_id, clip_count=job.clip_count, min_duration_sec=job.min_duration_sec,
                     max_duration_sec=job.max_duration_sec, model=job.model,
                     log=lambda message: self._log(job, message, replace_progress=True), used=used,
+                    focus=job.focus,
                 )
             except LocalSelectionError as exc:
                 raise PipelineError(str(exc)) from exc
             self._check_cancel(job)
             after = self._latest_run_id(job.video_id)
             if not after or after == before:
-                raise PipelineError(f"{label} が候補を保存しませんでした。")
+                raise PipelineError(
+                f"「{job.focus}」に当てはまる場面が見つかりませんでした。" if job.focus
+                else f"{label} が候補を保存しませんでした。"
+            )
             return after
 
         def register(process):
@@ -469,7 +485,7 @@ class AutoPipeline:
         output = agent_runner.run_agent(
             job.agent,
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
-                                     used_ranges=tuple(used)),
+                                     used_ranges=tuple(used), focus=job.focus),
             register_process=register,
             model=job.model,
             effort=job.effort,
@@ -477,7 +493,10 @@ class AutoPipeline:
         self._check_cancel(job)
         after = self._latest_run_id(job.video_id)
         if not after or after == before:
-            raise PipelineError(f"{label} が候補を保存しませんでした。")
+            raise PipelineError(
+                f"「{job.focus}」に当てはまる場面が見つかりませんでした。" if job.focus
+                else f"{label} が候補を保存しませんでした。"
+            )
         # Keep the agent's closing report; drop CLI chatter such as token counts.
         noise = {"codex", "tokens used", "user", "assistant"}
         summary = [

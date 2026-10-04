@@ -208,6 +208,8 @@ def _job_history_markdown(jobs) -> str:
     for job in jobs:
         state = _AUTO_STATE_LABELS.get(job.state, job.state)
         uploads = f"・アップロード {len(job.uploads)}本" if job.uploads else ""
+        if getattr(job, "focus", ""):
+            uploads += f"・探した場面: {html.escape(job.focus)}"
         recent = "\n".join(job.log[-8:])
         lines.append(
             f"**{html.escape(job.job_id)}** — {state}{uploads}　{html.escape(job.source)}\n\n"
@@ -382,7 +384,7 @@ def auto_download_only(sources: str):
 
 
 def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
-                min_sec, max_sec, layout: str, upload: bool):
+                min_sec, max_sec, layout: str, upload: bool, focus: str = ""):
     # Only the input that is shown counts; a leftover value in the hidden one is ignored.
     if mode == "library":
         lines = [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
@@ -398,7 +400,7 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
             job = _auto_pipeline().submit(
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
                 max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
-                model=model or "", effort=(effort or "") if agent == "codex" else "",
+                model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -420,7 +422,7 @@ def export_shared_index(video_id: str, include_url: bool):
 
 
 def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
-                        min_sec, max_sec, layout: str, upload: bool):
+                        min_sec, max_sec, layout: str, upload: bool, focus: str = ""):
     """Import a share zip; optionally start a job that downloads, relinks and clips it."""
     from moment_retrieval import db, source_origin
     from moment_retrieval.share import ShareError, import_index
@@ -451,7 +453,7 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
                 origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
                 max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "",
-                link_only=not start_clipping,
+                link_only=not start_clipping, focus=focus or "",
             )
         except PipelineError as exc:
             log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
@@ -567,6 +569,11 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     label="モデル", scale=2,
                 )
                 auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="本数", scale=2)
+            auto_focus = gr.Textbox(
+                label="探したい場面（任意）　空欄なら見どころ全般から選びます",
+                placeholder="例: 謎解きができなくてキレている箇所",
+                max_length=200,
+            )
             with gr.Accordion("長さ・レイアウト・推論の強さ・アップロード", open=False):
                 with gr.Row():
                     auto_effort = gr.Dropdown(
@@ -744,7 +751,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     auto_start_btn.click(
         auto_submit,
         inputs=[auto_mode, auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
     auto_mode.change(on_mode_change, inputs=[auto_mode],
@@ -762,7 +769,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     share_import_btn.click(
         import_shared_index,
         inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus],
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)

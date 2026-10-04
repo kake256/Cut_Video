@@ -95,6 +95,22 @@ class _Provider:
 
 
 class UsedRangesTest(unittest.TestCase):
+    def test_focus_changes_the_prompt_only_when_given(self):
+        from moment_retrieval import agent_runner, auto_pipeline
+
+        plain = agent_runner.ClipRequest("vid_x", 3).prompt()
+        focused = agent_runner.ClipRequest("vid_x", 3, focus="謎解きができなくてキレている箇所").prompt()
+        self.assertNotIn("利用者が探している場面", plain)
+        self.assertIn("「謎解きができなくてキレている箇所」", focused)
+        self.assertIn("件数未満でよく", focused)
+        local = local_selector._prompt([{"segment_id": 1, "start_ms": 0, "end_ms": 1000, "text": "x"}], 20, 60,
+                                       focus="キレている")
+        self.assertIn("「キレている」", local)
+        self.assertNotIn("探している場面", local_selector._prompt(
+            [{"segment_id": 1, "start_ms": 0, "end_ms": 1000, "text": "x"}], 20, 60))
+        self.assertEqual(auto_pipeline.clean_focus(" 「謎解き」で\n キレる'場面' "), "謎解きで キレる場面")
+        self.assertEqual(len(auto_pipeline.clean_focus("あ" * 500)), auto_pipeline.MAX_FOCUS_CHARS)
+
     def test_overlap_rule_and_prompts_mention_posted_scenes(self):
         from moment_retrieval import agent_runner, used_ranges
 

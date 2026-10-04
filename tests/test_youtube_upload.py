@@ -44,6 +44,28 @@ class _Service:
 
 
 class PublishTest(unittest.TestCase):
+    def test_publish_scope_is_requested_and_old_tokens_are_detected(self):
+        self.assertIn("https://www.googleapis.com/auth/youtube", youtube_upload.SCOPES)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
+            self.assertEqual(youtube_upload.missing_scopes(), [])
+            youtube_upload.token_path().write_text(json.dumps({"scopes": youtube_upload.SCOPES[:2]}), encoding="utf-8")
+            self.assertEqual(youtube_upload.missing_scopes(), ["https://www.googleapis.com/auth/youtube"])
+            with self.assertRaises(youtube_upload.UploadError):
+                youtube_upload.load_credentials(interactive=False)
+
+    def test_missing_permission_error_is_explained(self):
+        class _Denied:
+            def videos(self):
+                return self
+
+            def update(self, part, body):
+                return SimpleNamespace(execute=lambda: (_ for _ in ()).throw(
+                    RuntimeError("HttpError 403 insufficientPermissions")))
+
+        with self.assertRaises(youtube_upload.UploadError) as ctx:
+            youtube_upload.publish("abcDEF12345", service_factory=_Denied)
+        self.assertIn("連携", str(ctx.exception))
+
     def test_publish_sets_public_and_reports_locked_private(self):
         service = _Service()
         result = youtube_upload.publish("abcDEF12345", service_factory=lambda: service)
@@ -196,30 +218,26 @@ class AutoPublishAppTest(unittest.TestCase):
             (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x"}', encoding="utf-8")
             self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur"))
 
-    def test_publish_from_job_list_asks_first_then_reports_each_result(self):
+    def test_publish_buttons_publish_right_away_and_summarise_failures(self):
         import auto_publish_app
 
         with self.assertRaises(auto_publish_app.gr.Error):
-            auto_publish_app.request_publish("auto_a", [])
-        pending, message, row = auto_publish_app.request_publish("auto_a", ["yt1", "yt2"])
-        self.assertEqual(pending, {"job_id": "auto_a", "video_ids": ["yt1", "yt2"]})
-        self.assertIn("2本", message["value"])
-        self.assertTrue(row["visible"])
+            auto_publish_app.publish_now("auto_a", [])
 
         def publish(job_id, video_id):
-            if video_id == "yt2":
-                raise auto_publish_app.PipelineError("YouTubeが拒否")
+            if video_id != "yt1":
+                raise auto_publish_app.PipelineError("権限がありません")
             return {"watch_url": f"https://www.youtube.com/watch?v={video_id}"}
 
         pipeline = SimpleNamespace(publish=Mock(side_effect=publish))
         with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
-                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", "[]", None)), \
+                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", "[]", None, "history")), \
                 patch.object(auto_publish_app.gr, "Info"):
-            result = auto_publish_app.confirm_publish(pending)
-        self.assertIsNone(result[0])
-        self.assertFalse(result[1]["visible"])
-        self.assertIn("watch?v=yt1", result[2])
-        self.assertIn("yt2: YouTubeが拒否", result[2])
+            result = auto_publish_app.publish_now("auto_a", ["yt1", "yt2", "yt3"])
+        self.assertEqual(pipeline.publish.call_count, 3)
+        self.assertIn("watch?v=yt1", result[0])
+        self.assertIn("2本を公開できませんでした: 権限がありません", result[0])
+        self.assertEqual(len(result), 5)
 
     def test_upload_signature_ignores_progress_but_tracks_publication(self):
         import auto_publish_app

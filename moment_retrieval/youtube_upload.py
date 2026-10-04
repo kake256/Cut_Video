@@ -21,7 +21,24 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     # Read-only access shows which channel is linked in the GUI.
     "https://www.googleapis.com/auth/youtube.readonly",
+    # Changing a video's privacy (the "publish" button) needs the full YouTube scope;
+    # youtube.upload alone only allows inserting new videos.
+    "https://www.googleapis.com/auth/youtube",
 ]
+
+
+def _token_scopes() -> set[str]:
+    try:
+        return set(json.loads(token_path().read_text(encoding="utf-8")).get("scopes") or [])
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def missing_scopes() -> list[str]:
+    """Scopes the saved token lacks (e.g. linked before publishing was supported)."""
+    if not token_path().is_file():
+        return []
+    return [scope for scope in SCOPES if scope not in _token_scopes()]
 PRIVACY_STATUS = "private"
 CATEGORY_PEOPLE_AND_BLOGS = "22"
 MAX_TITLE = 100
@@ -144,7 +161,11 @@ def load_credentials(*, interactive: bool = True):
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     creds = None
-    if token_path().is_file():
+    if token_path().is_file() and missing_scopes():
+        # An older token without the newer scopes: ask once in the browser to add them.
+        if not interactive:
+            raise UploadError("追加の許可が必要です。「YouTubeアカウントを連携」をやり直してください。")
+    elif token_path().is_file():
         creds = Credentials.from_authorized_user_file(str(token_path()), SCOPES)
     if creds and creds.valid:
         return creds
@@ -183,7 +204,7 @@ def connected_channel(*, service_factory: Callable | None = None) -> dict | None
         service = _service(service_factory, interactive=False)
         response = service.channels().list(part="snippet", mine=True).execute()
     except UploadError:
-        return None
+        return {"id": "", "title": "", "needs_relink": True} if missing_scopes() else None
     items = response.get("items") or []
     if not items:
         return None
@@ -281,10 +302,18 @@ def upload_private(
 def publish(video_id: str, *, service_factory: Callable | None = None) -> dict:
     """Make one uploaded video public; callers check channel_policy first."""
     service = _service(service_factory)
-    response = service.videos().update(
-        part="status",
-        body={"id": video_id, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}},
-    ).execute()
+    try:
+        response = service.videos().update(
+            part="status",
+            body={"id": video_id, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}},
+        ).execute()
+    except Exception as exc:
+        if "insufficientPermissions" in str(exc) or "insufficient authentication scopes" in str(exc):
+            raise UploadError(
+                "公開する許可がありません。「設定」タブで「YouTubeアカウントを連携」をやり直し、"
+                "「YouTubeアカウントの管理」を許可してください。"
+            ) from exc
+        raise
     status = (response.get("status") or {}).get("privacyStatus")
     if status != "public":
         raise UploadError(

@@ -67,6 +67,9 @@ def auto_account_status() -> str:
     source = "（アプリ同梱のクライアントを使用）" if youtube_upload.client_source() == "bundled" else ""
     if channel is None:
         return f"**YouTube:** 未連携です。「YouTubeアカウントを連携」を押してください。{source}"
+    if channel.get("needs_relink"):
+        return ("**YouTube:** 連携中ですが、公開するには追加の許可が必要です。"
+                f"「設定」タブで「YouTubeアカウントを連携」をやり直してください。{source}")
     return f"**YouTube:** 連携中 — {html.escape(str(channel.get('title') or channel.get('id')))}{source}"
 
 
@@ -460,23 +463,15 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
     return log, gr.update(choices=choices), gr.update(choices=choices)
 
 
-def request_publish(job_id: str, video_ids):
-    """First click: remember what to publish and ask for confirmation."""
+def publish_now(job_id: str, video_ids):
+    """Publish the chosen clips right away; failures are listed instead of stopping the rest."""
     ids = [str(item) for item in (video_ids or []) if item]
     if not ids:
         raise gr.Error("公開する動画にチェックを入れてください。")
-    return ({"job_id": job_id, "video_ids": ids},
-            gr.update(value=f"**{job_id} の動画を{len(ids)}本公開します。よろしいですか？**"),
-            gr.update(visible=True))
-
-
-def confirm_publish(pending):
-    """Second click: publish each video; failures are listed instead of stopping the rest."""
-    pending = pending or {}
     done, failed = [], []
-    for video_id in pending.get("video_ids", []):
+    for video_id in ids:
         try:
-            result = _auto_pipeline().publish(pending.get("job_id", ""), video_id)
+            result = _auto_pipeline().publish(job_id, video_id)
             done.append(result["watch_url"])
         except (PipelineError, youtube_upload.UploadError) as exc:
             failed.append(f"{video_id}: {exc}")
@@ -484,12 +479,15 @@ def confirm_publish(pending):
             failed.append(f"{video_id}: {type(exc).__name__}: {exc}")
     if done:
         gr.Info(f"{len(done)}本を公開しました。")
-    message = "\n".join([f"公開しました: {url}" for url in done] + [f"公開できませんでした: {item}" for item in failed])
-    return (None, gr.update(visible=False), message, *auto_jobs_view())
-
-
-def cancel_publish():
-    return None, gr.update(visible=False)
+    lines = [f"- 公開しました: {url}" for url in done]
+    if failed:
+        # One reason is enough when every clip failed the same way (e.g. a missing permission).
+        reasons = {item.split(": ", 1)[1] for item in failed}
+        if len(reasons) == 1:
+            lines.append(f"- {len(failed)}本を公開できませんでした: {reasons.pop()}")
+        else:
+            lines += [f"- 公開できませんでした: {item}" for item in failed]
+    return ("\n".join(lines), *auto_jobs_view())
 
 
 def auto_cancel(job_id: str):
@@ -598,11 +596,6 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             gr.Markdown("### ジョブ")
             auto_jobs_md = gr.Markdown("実行中のジョブはありません。")
             auto_uploads_sig = gr.State("[]")
-            publish_pending = gr.State(None)
-            with gr.Row(visible=False) as publish_confirm_row:
-                publish_confirm_md = gr.Markdown("", scale=3)
-                publish_confirm_btn = gr.Button("公開する", variant="primary", scale=1)
-                publish_cancel_btn = gr.Button("キャンセル", scale=1)
             publish_result_md = gr.Markdown("")
 
             @gr.render(inputs=[auto_uploads_sig])
@@ -632,12 +625,14 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                             publish_picked = gr.Button("チェックした動画を公開")
                             publish_all = gr.Button("このジョブの全部を公開")
                         publish_picked.click(
-                            lambda selection, job_id=job_id: request_publish(job_id, selection),
-                            inputs=[picked], outputs=[publish_pending, publish_confirm_md, publish_confirm_row],
+                            lambda selection, job_id=job_id: publish_now(job_id, selection),
+                            inputs=[picked], outputs=[publish_result_md, *auto_job_outputs],
+                            concurrency_id="youtube-publish", concurrency_limit=1,
                         )
                         publish_all.click(
-                            lambda job_id=job_id, ids=tuple(v for _t, v in private): request_publish(job_id, ids),
-                            outputs=[publish_pending, publish_confirm_md, publish_confirm_row],
+                            lambda job_id=job_id, ids=tuple(v for _t, v in private): publish_now(job_id, ids),
+                            outputs=[publish_result_md, *auto_job_outputs],
+                            concurrency_id="youtube-publish", concurrency_limit=1,
                         )
 
             with gr.Accordion("ジョブの履歴（ログ）", open=False):
@@ -771,12 +766,6 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)
-    publish_confirm_btn.click(
-        confirm_publish, inputs=[publish_pending],
-        outputs=[publish_pending, publish_confirm_row, publish_result_md, *auto_job_outputs],
-        concurrency_id="youtube-publish", concurrency_limit=1,
-    )
-    publish_cancel_btn.click(cancel_publish, outputs=[publish_pending, publish_confirm_row])
     auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
 
 

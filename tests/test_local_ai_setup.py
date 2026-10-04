@@ -94,6 +94,39 @@ class _Provider:
         return json.dumps({"candidates": self.answers.pop(0)})
 
 
+class UsedRangesTest(unittest.TestCase):
+    def test_overlap_rule_and_prompts_mention_posted_scenes(self):
+        from moment_retrieval import agent_runner, used_ranges
+
+        used = [{"start_sec": 60.0, "end_sec": 90.0, "title": "既出"}]
+        self.assertIsNotNone(used_ranges.overlaps(70, 100, used))
+        self.assertIsNone(used_ranges.overlaps(88, 150, used))  # 2s of a 30s clip is not a repeat
+        self.assertIsNone(used_ranges.overlaps(200, 230, used))
+        prompt = agent_runner.ClipRequest("vid_x", 2, used_ranges=tuple(used)).prompt()
+        self.assertIn("0:01:00〜0:01:30「既出」", prompt)
+        self.assertNotIn("投稿済み", agent_runner.ClipRequest("vid_x", 2).prompt())
+
+    def test_upload_records_the_range_from_the_clip_metadata(self):
+        import tempfile
+        from pathlib import Path
+        from moment_retrieval import config, db, used_ranges
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DB_PATH", Path(tmp) / "index.db"):
+            clip = Path(tmp) / "clip_short.mp4"
+            clip.write_bytes(b"x")
+            self.assertFalse(used_ranges.record_from_clip(clip))  # no metadata JSON yet
+            clip.with_suffix(".metadata.json").write_text(json.dumps({
+                "title": "見どころ", "source_range": {"video_id": "vid_" + "e" * 32, "start_sec": 12.5, "end_sec": 40}
+            }), encoding="utf-8")
+            self.assertTrue(used_ranges.record_from_clip(clip))
+            conn = db.get_conn()
+            try:
+                rows = db.list_used_clip_ranges(conn, "vid_" + "e" * 32)
+            finally:
+                conn.close()
+        self.assertEqual(rows, [{"start_sec": 12.5, "end_sec": 40.0, "title": "見どころ", "origin": "upload"}])
+
+
 class LocalSelectorTest(unittest.TestCase):
     def test_best_non_overlapping_candidates_are_proposed(self):
         rows = [{"segment_id": i, "start_ms": i * 5000, "end_ms": i * 5000 + 4500, "text": f"文{i}"}
@@ -125,6 +158,20 @@ class LocalSelectorTest(unittest.TestCase):
         )
         candidate = library.proposed[1][0]
         self.assertEqual((candidate["start_segment_id"], candidate["end_segment_id"]), (1, 6))
+
+    def test_posted_scenes_are_skipped_before_choosing(self):
+        rows = [{"segment_id": i, "start_ms": i * 10000, "end_ms": i * 10000 + 9000, "text": f"文{i}"}
+                for i in range(1, 21)]
+        library = _Library(rows)
+        provider = _Provider([[
+            {"start_segment_id": 2, "end_segment_id": 4, "title": "既出と重なる", "reason": "r", "score": 10},
+            {"start_segment_id": 10, "end_segment_id": 12, "title": "新しい", "reason": "r", "score": 5},
+        ]])
+        local_selector.select_clips("vid_x", clip_count=1, min_duration_sec=20, max_duration_sec=60,
+                                    provider=provider, library=library,
+                                    used=[{"start_sec": 20.0, "end_sec": 50.0, "title": "既出"}])
+        self.assertEqual([c["title"] for c in library.proposed[1]], ["新しい"])
+        self.assertIn("投稿済み", provider.prompts[0])
 
     def test_no_candidates_is_an_error(self):
         rows = [{"segment_id": 1, "start_ms": 0, "end_ms": 4000, "text": "短い"}]

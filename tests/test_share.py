@@ -372,6 +372,51 @@ class SharePackageTest(unittest.TestCase):
                 finally:
                     conn.close()
 
+    def test_used_clip_ranges_travel_with_the_share_zip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with configured_store(root / "source"):
+                source_id, _source_path = self._seed_source(root / "source")
+                conn = db.get_conn()
+                try:
+                    db.add_used_clip_range(conn, source_id, 1.0, 2.0, "投稿済みの場面")
+                finally:
+                    conn.close()
+                archive = export_index(source_id, root / "packages", confirm_sensitive=True)
+            with zipfile.ZipFile(archive) as package:
+                manifest = json.loads(package.read("manifest.json"))
+            self.assertEqual(manifest["used_clip_ranges"],
+                             [{"start_sec": 1.0, "end_sec": 2.0, "title": "投稿済みの場面"}])
+            self.assertNotIn("youtube", json.dumps(manifest["used_clip_ranges"]))
+            with configured_store(root / "destination"):
+                list(import_index(archive))
+                conn = db.get_conn()
+                try:
+                    imported = db.list_videos(conn)[0]["video_id"]
+                    rows = db.list_used_clip_ranges(conn, imported)
+                finally:
+                    conn.close()
+            self.assertEqual(rows, [{"start_sec": 1.0, "end_sec": 2.0, "title": "投稿済みの場面", "origin": "shared"}])
+
+    def test_import_ignores_malformed_used_ranges(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _source_id, _source_path = self._export_fixture(root / "source", root / "packages")
+            with zipfile.ZipFile(archive) as package:
+                manifest = json.loads(package.read("manifest.json"))
+                vectors_raw = package.read("vectors.npy")
+            manifest["used_clip_ranges"] = [{"start_sec": 5, "end_sec": 1}, {"start_sec": "x"}, "bad",
+                                            {"start_sec": 0, "end_sec": 999999}]
+            forged = self._write_package(root / "forged.vindex.zip", manifest, vectors_raw)
+            with configured_store(root / "destination"):
+                list(import_index(forged))
+                conn = db.get_conn()
+                try:
+                    rows = conn.execute("SELECT * FROM used_clip_ranges").fetchall()
+                finally:
+                    conn.close()
+            self.assertEqual(rows, [])
+
     def test_import_drops_non_youtube_origin(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

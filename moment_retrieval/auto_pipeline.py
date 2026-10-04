@@ -429,6 +429,11 @@ class AutoPipeline:
     def _select(self, job: AutoJob) -> str:
         before = self._latest_run_id(job.video_id)
         label = agent_runner.AGENT_LABELS[job.agent]
+        from .used_ranges import for_video
+
+        used = for_video(job.video_id)
+        if used:
+            self._log(job, f"投稿済みの{len(used)}か所と重ならない場面を選ぶよう指示します。")
         detail = " / ".join(item for item in (job.model, job.effort) if item)
         self._log(job, f"{label}{f'（{detail}）' if detail else ''} に文字起こしを渡して候補を選んでもらいます。")
 
@@ -439,7 +444,7 @@ class AutoPipeline:
                 select_clips(
                     job.video_id, clip_count=job.clip_count, min_duration_sec=job.min_duration_sec,
                     max_duration_sec=job.max_duration_sec, model=job.model,
-                    log=lambda message: self._log(job, message, replace_progress=True),
+                    log=lambda message: self._log(job, message, replace_progress=True), used=used,
                 )
             except LocalSelectionError as exc:
                 raise PipelineError(str(exc)) from exc
@@ -455,7 +460,8 @@ class AutoPipeline:
 
         output = agent_runner.run_agent(
             job.agent,
-            agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec),
+            agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
+                                     used_ranges=tuple(used)),
             register_process=register,
             model=job.model,
             effort=job.effort,
@@ -506,6 +512,9 @@ class AutoPipeline:
                 receipt = result or receipt
             if receipt:
                 job.uploads.append({**receipt, "file": Path(output).name})
+                from .used_ranges import record_from_clip
+
+                record_from_clip(Path(output), receipt.get("title", ""))
         if job.uploads:
             self._log(job, "非公開でアップロードしました。ジョブ一覧の「公開する」かYouTube Studioで公開できます。")
 

@@ -61,7 +61,7 @@ from moment_retrieval.edit_domain import (
     make_effective_export_plan,
 )
 from moment_retrieval.share import ShareError, export_index, import_index, relink_video
-from moment_retrieval import source_origin, youtube_upload
+from moment_retrieval import source_origin, used_ranges, youtube_upload
 from moment_retrieval.vector_index import VectorIndex
 from moment_retrieval.application import DOCUMENTS
 from moment_retrieval.save_service import save_document
@@ -325,7 +325,9 @@ def upload_saved_highlights_to_youtube(saved_files, output_dir_text: str, confir
     yield "\n".join(log_lines)
     for path in paths:
         try:
-            for message, _receipt in youtube_upload.upload_private(path):
+            receipt = None
+            for message, result in youtube_upload.upload_private(path):
+                receipt = result or receipt
                 if (
                     message.startswith("  アップロード中")
                     and log_lines[-1].startswith("  アップロード中")
@@ -334,6 +336,9 @@ def upload_saved_highlights_to_youtube(saved_files, output_dir_text: str, confir
                 else:
                     log_lines.append(message)
                 yield "\n".join(log_lines)
+            if receipt:
+                # Later automatic runs avoid scenes that were already posted.
+                used_ranges.record_from_clip(path, receipt.get("title", ""))
         except youtube_upload.UploadError as exc:
             log_lines.append(f"失敗: {path.name}: {exc}")
             yield "\n".join(log_lines)
@@ -5768,7 +5773,16 @@ def export_highlight_candidates(
                     if metadata is not None:
                         metadata_temporary.write_text(
                             json.dumps(
-                                metadata.to_dict(), ensure_ascii=False, indent=2,
+                                {
+                                    **metadata.to_dict(),
+                                    # Source timing lets later runs avoid scenes already posted.
+                                    "source_range": {
+                                        "video_id": str(video.get("public_video_id") or video.get("video_id") or ""),
+                                        "start_sec": round(float(start), 3),
+                                        "end_sec": round(float(end), 3),
+                                    },
+                                },
+                                ensure_ascii=False, indent=2,
                             ),
                             encoding="utf-8",
                         )

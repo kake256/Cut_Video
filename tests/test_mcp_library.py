@@ -88,6 +88,32 @@ class LibraryToolsTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_already_posted_ranges_are_shown_and_overlapping_proposals_rejected(self):
+        conn = self.connect()
+        db.add_used_clip_range(conn, self.public_id, 10.0, 29.0, "投稿済み")
+        conn.close()
+        page = self.tools.read_transcript(self.public_id)
+        self.assertEqual(page["already_posted_ranges"], [{"start_ms": 10000, "end_ms": 29000, "title": "投稿済み"}])
+        result = self.tools.propose_clips(self.public_id, self.revision, [
+            {"start_segment_id": self.segment_ids[1], "end_segment_id": self.segment_ids[2],
+             "title": "重なる", "reason": "r"},
+            {"start_segment_id": self.segment_ids[4], "end_segment_id": self.segment_ids[5],
+             "title": "新しい", "reason": "r"},
+        ], min_duration_sec=15, max_duration_sec=60)
+        self.assertEqual([c["title"] for c in result["saved_candidates"]], ["新しい"])
+        self.assertIn("投稿済み", result["rejected"][0]["reason"])
+
+    def test_used_range_bookkeeping_dedupes_and_validates(self):
+        conn = self.connect()
+        try:
+            self.assertTrue(db.add_used_clip_range(conn, self.public_id, 1, 2, "a"))
+            self.assertFalse(db.add_used_clip_range(conn, self.public_id, 1, 2, "a"))
+            with self.assertRaises(ValueError):
+                db.add_used_clip_range(conn, self.public_id, 5, 5)
+            self.assertEqual(len(db.list_used_clip_ranges(conn, self.public_id)), 1)
+        finally:
+            conn.close()
+
     def test_stale_revision_and_unknown_video_are_rejected(self):
         with self.assertRaises(LibraryToolError) as ctx:
             self.tools.propose_clips(self.public_id, "tr_old", [

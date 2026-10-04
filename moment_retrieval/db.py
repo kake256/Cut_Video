@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -220,6 +220,18 @@ CREATE TABLE IF NOT EXISTS shared_source_origins (
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_shared_source_origins_url ON shared_source_origins(origin_url);
+
+-- Source ranges already turned into posted clips (uploaded here, or carried in a share zip).
+CREATE TABLE IF NOT EXISTS used_clip_ranges (
+    used_range_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_video_id TEXT NOT NULL,
+    start_sec REAL NOT NULL,
+    end_sec REAL NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL CHECK(origin IN ('upload', 'shared')),
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_used_clip_ranges_video ON used_clip_ranges(public_video_id, start_sec);
 """
 
 
@@ -1321,3 +1333,37 @@ def delete_video(conn: sqlite3.Connection, video_id: str) -> None:
     conn.execute("DELETE FROM sources WHERE public_video_id = ?", (public_id,))
     conn.execute("DELETE FROM videos WHERE video_id = ?", (storage_id,))
     conn.commit()
+
+
+def add_used_clip_range(
+    conn: sqlite3.Connection, video_id: str, start_sec: float, end_sec: float,
+    title: str = "", *, origin: str = "upload", commit: bool = True,
+) -> bool:
+    """Remember a posted clip's source range; exact duplicates are ignored."""
+    public_id = public_video_id(conn, video_id) or video_id
+    start_sec, end_sec = round(float(start_sec), 3), round(float(end_sec), 3)
+    if not (0 <= start_sec < end_sec):
+        raise ValueError("used clip range must satisfy 0 <= start < end")
+    exists = conn.execute(
+        "SELECT 1 FROM used_clip_ranges WHERE public_video_id = ? AND start_sec = ? AND end_sec = ?",
+        (public_id, start_sec, end_sec),
+    ).fetchone()
+    if exists:
+        return False
+    conn.execute(
+        "INSERT INTO used_clip_ranges(public_video_id, start_sec, end_sec, title, origin) VALUES(?, ?, ?, ?, ?)",
+        (public_id, start_sec, end_sec, str(title or "")[:120], origin),
+    )
+    if commit:
+        conn.commit()
+    return True
+
+
+def list_used_clip_ranges(conn: sqlite3.Connection, video_id: str) -> list[dict]:
+    public_id = public_video_id(conn, video_id) or video_id
+    rows = conn.execute(
+        "SELECT start_sec, end_sec, title, origin FROM used_clip_ranges "
+        "WHERE public_video_id = ? ORDER BY start_sec",
+        (public_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]

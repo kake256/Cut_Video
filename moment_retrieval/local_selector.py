@@ -13,6 +13,7 @@ from typing import Callable
 from . import config
 from .llm_analysis import OllamaProvider, ProviderError
 from .mcp_library import LibraryTools
+from .used_ranges import overlaps, prompt_lines
 
 MAX_PER_WINDOW = 4
 
@@ -57,7 +58,7 @@ def _schema(first_id: int, last_id: int) -> dict:
     }
 
 
-def _prompt(window: list[dict], min_sec: float, max_sec: float) -> str:
+def _prompt(window: list[dict], min_sec: float, max_sec: float, used: list[dict] | None = None) -> str:
     lines = "\n".join(
         f"[{row['segment_id']}] {row['start_ms'] / 1000:.1f}-{row['end_ms'] / 1000:.1f}s {row['text']}"
         for row in window
@@ -68,13 +69,17 @@ def _prompt(window: list[dict], min_sec: float, max_sec: float) -> str:
         f"ショート動画として単体で意味が通り、冒頭で引き込める場面を最大{MAX_PER_WINDOW}件選び、"
         f"それぞれ{min_sec:g}〜{max_sec:g}秒に収まる segment_id の範囲で答えてください。"
         "title は内容が分かる30文字以内の日本語、reason は選んだ理由、score は1〜10の面白さです。"
-        "良い場面がなければ空の配列にしてください。\n\n" + lines
+        "良い場面がなければ空の配列にしてください。\n"
+        + (("次の範囲はすでに投稿済みなので、重なる場面は選ばないでください:\n" + prompt_lines(used) + "\n")
+           if used else "")
+        + "\n" + lines
     )
 
 
 def select_clips(video_id: str, *, clip_count: int, min_duration_sec: float, max_duration_sec: float,
                  model: str = "", provider: object | None = None,
-                 library: LibraryTools | None = None, log: Callable[[str], None] | None = None) -> dict:
+                 library: LibraryTools | None = None, log: Callable[[str], None] | None = None,
+                 used: list[dict] | None = None) -> dict:
     library = library or LibraryTools()
     provider = provider or OllamaProvider(
         endpoint=config.LLM_ANALYSIS_ENDPOINT.rstrip("/") + "/api/generate",
@@ -95,7 +100,7 @@ def select_clips(video_id: str, *, clip_count: int, min_duration_sec: float, max
         if log:
             log(f"  ローカルAIで候補を探しています... {index}/{len(windows)}")
         try:
-            text = provider.generate(model=model, prompt=_prompt(window, min_duration_sec, max_duration_sec),
+            text = provider.generate(model=model, prompt=_prompt(window, min_duration_sec, max_duration_sec, used),
                                      output_schema=_schema(window[0]["segment_id"], window[-1]["segment_id"]))
             items = json.loads(text).get("candidates", [])
         except (ProviderError, ValueError, AttributeError) as exc:
@@ -115,6 +120,8 @@ def select_clips(video_id: str, *, clip_count: int, min_duration_sec: float, max
                 ids.pop()
             if (known[ids[-1]]["end_ms"] - known[first]["start_ms"]) / 1000 > max_duration_sec:
                 continue
+            if used and overlaps(known[first]["start_ms"] / 1000, known[ids[-1]]["end_ms"] / 1000, used):
+                continue  # already posted from this video
             candidates.append((score, first, ids[-1], title, reason))
     if not candidates:
         raise LocalSelectionError("ローカルAIが候補を見つけられませんでした。")

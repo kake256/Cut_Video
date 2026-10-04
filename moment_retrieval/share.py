@@ -219,6 +219,24 @@ def _validate_embedding_metadata(
         raise ShareError("共有データのembedding次元が一致しません。")
 
 
+def _sanitize_used_ranges(items: Any, duration: float) -> list[dict[str, Any]]:
+    """Keep only well-formed, in-bounds ranges from a package; drop anything else."""
+    result: list[dict[str, Any]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or len(result) >= 1000:
+            continue
+        try:
+            start, end = float(item["start_sec"]), float(item["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end <= duration + 1):
+            continue
+        title = item.get("title")
+        result.append({"start_sec": start, "end_sec": end,
+                       "title": title[:120] if isinstance(title, str) else ""})
+    return result
+
+
 def _read_package(zip_path: Path) -> tuple[dict[str, Any], np.ndarray]:
     try:
         if zip_path.stat().st_size > _MAX_PACKAGE_BYTES + _MAX_ZIP_OVERHEAD_BYTES:
@@ -315,6 +333,7 @@ def _read_package(zip_path: Path) -> tuple[dict[str, Any], np.ndarray]:
         source_url = None
     return {
         "source_url": source_url,
+        "used_clip_ranges": _sanitize_used_ranges(manifest.get("used_clip_ranges"), duration),
         "duration": duration,
         "segments": segments,
         "chunks": chunks,
@@ -360,6 +379,12 @@ def export_index(
             source_url = (
                 origin_url_for_video(conn, video) if include_source_url else None
             )
+            # Times and titles only (no YouTube IDs): lets recipients avoid posted scenes.
+            used_ranges = [
+                {"start_sec": item["start_sec"], "end_sec": item["end_sec"],
+                 "title": str(item.get("title") or "")[:120]}
+                for item in db.list_used_clip_ranges(conn, video_id)
+            ]
             active_revision = db.get_active_transcript_revision(conn, storage_id)
             if active_revision is None:
                 chunk_rows = conn.execute(
@@ -424,6 +449,7 @@ def export_index(
                 "source_path_included": False,
                 "source_name_included": False,
                 "source_url_included": source_url is not None,
+                "used_clip_ranges_included": bool(used_ranges),
             },
             "video": {
                 "public_video_id": public_id,
@@ -447,6 +473,7 @@ def export_index(
                 {"source_origin": {"kind": source_kind(source_url), "url": source_url}}
                 if source_url else {}
             ),
+            **({"used_clip_ranges": used_ranges} if used_ranges else {}),
             "segments": segments,
             "chunks": chunks,
         }
@@ -632,6 +659,9 @@ def _import_index_locked(zip_path: Path, conn, writer_lease) -> Iterator[str]:
         yield f"  検索用チャンクを登録しました ({len(new_chunk_ids)} 件)"
         if package.get("source_url"):
             remember_shared_origin(conn, video_id, package["source_url"], commit=False)
+        for used in package.get("used_clip_ranges") or []:
+            db.add_used_clip_range(conn, video_id, used["start_sec"], used["end_sec"], used["title"],
+                                   origin="shared", commit=False)
 
         conn.commit()
         db_committed = True

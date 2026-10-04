@@ -313,7 +313,7 @@ def refresh_library():
 
 
 _UI_SETTINGS_DEFAULTS = {"min_sec": 20, "max_sec": SHORTS_MAX_SEC, "layout": "blur",
-                         "effort": agent_runner.DEFAULT_EFFORT}
+                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True}
 
 
 def _ui_settings_path() -> Path:
@@ -337,15 +337,17 @@ def load_ui_settings() -> dict:
         settings["layout"] = saved["layout"]
     if saved.get("effort") in agent_runner.EFFORTS:
         settings["effort"] = saved["effort"]
+    if isinstance(saved.get("finish"), bool):
+        settings["finish"] = saved["finish"]
     return settings
 
 
 def apply_ui_settings():
     settings = load_ui_settings()
-    return settings["effort"], settings["min_sec"], settings["max_sec"], settings["layout"]
+    return settings["effort"], settings["min_sec"], settings["max_sec"], settings["layout"], settings["finish"]
 
 
-def save_ui_settings(effort: str, min_sec, max_sec, layout: str) -> str:
+def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = True) -> str:
     try:
         min_sec, max_sec = float(min_sec), float(max_sec)
     except (TypeError, ValueError):
@@ -356,7 +358,8 @@ def save_ui_settings(effort: str, min_sec, max_sec, layout: str) -> str:
         raise gr.Error("レイアウトと推論の強さを選んでください。")
     path = _ui_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort},
+    path.write_text(json.dumps({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort,
+                                "finish": bool(finish)},
                                ensure_ascii=False, indent=2), encoding="utf-8")
     return "保存しました。次回からこの設定で開きます。"
 
@@ -384,7 +387,7 @@ def auto_download_only(sources: str):
 
 
 def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
-                min_sec, max_sec, layout: str, upload: bool, focus: str = ""):
+                min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
     # Only the input that is shown counts; a leftover value in the hidden one is ignored.
     if mode == "library":
         lines = [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
@@ -401,6 +404,7 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
                 max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
+                finish=bool(finish),
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -422,7 +426,7 @@ def export_shared_index(video_id: str, include_url: bool):
 
 
 def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
-                        min_sec, max_sec, layout: str, upload: bool, focus: str = ""):
+                        min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
     """Import a share zip; optionally start a job that downloads, relinks and clips it."""
     from moment_retrieval import db, source_origin
     from moment_retrieval.share import ShareError, import_index
@@ -453,7 +457,7 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
                 origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
                 max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "",
-                link_only=not start_clipping, focus=focus or "",
+                link_only=not start_clipping, focus=focus or "", finish=bool(finish),
             )
         except PipelineError as exc:
             log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
@@ -574,7 +578,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 placeholder="例: 謎解きができなくてキレている箇所",
                 max_length=200,
             )
-            with gr.Accordion("長さ・レイアウト・推論の強さ・アップロード", open=False):
+            with gr.Accordion("長さ・レイアウト・仕上げ・推論の強さ・アップロード", open=False):
                 with gr.Row():
                     auto_effort = gr.Dropdown(
                         choices=list(agent_runner.EFFORTS), value=agent_runner.DEFAULT_EFFORT,
@@ -589,9 +593,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_layout = gr.Radio(
                         choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",
                     )
+                    auto_finish = gr.Checkbox(
+                        value=True, label="仕上げる（引きのタイトル・字幕のタイミング調整・効果音）",
+                    )
                     auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
                 with gr.Row():
-                    auto_settings_save = gr.Button("長さ・レイアウト・推論の強さを既定として保存", scale=1)
+                    auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さを既定として保存", scale=1)
                     auto_settings_md = gr.Markdown("", scale=2)
             with gr.Row():
                 auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg", scale=3)
@@ -751,13 +758,14 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     auto_start_btn.click(
         auto_submit,
         inputs=[auto_mode, auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
     auto_mode.change(on_mode_change, inputs=[auto_mode],
                      outputs=[auto_url_group, auto_library_group, auto_download_btn])
-    demo.load(apply_ui_settings, outputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout])
-    auto_settings_save.click(save_ui_settings, inputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout],
+    demo.load(apply_ui_settings, outputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish])
+    auto_settings_save.click(save_ui_settings,
+                             inputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish],
                              outputs=[auto_settings_md])
     auto_download_btn.click(auto_download_only, inputs=[auto_sources],
                             outputs=[auto_sources, *auto_job_outputs]).then(
@@ -769,7 +777,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     share_import_btn.click(
         import_shared_index,
         inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)

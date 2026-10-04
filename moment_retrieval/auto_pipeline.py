@@ -50,6 +50,7 @@ class AutoJob:
     # Only fetch the source and attach it to its (shared) transcript; no clipping.
     link_only: bool = False
     focus: str = ""  # optional: what kind of scene to look for
+    finish: bool = False  # hook title, word-timed captions and sound effects before upload
     model: str = ""
     effort: str = ""
     state: str = "queued"
@@ -154,7 +155,7 @@ class AutoPipeline:
         self.worker: threading.Thread | None = None
         self.steps = {
             "metadata": self._metadata, "download": self._download, "index": self._index,
-            "select": self._select, "export": self._export, "upload": self._upload,
+            "select": self._select, "export": self._export, "finish": self._finish, "upload": self._upload,
             **(steps or {}),
         }
         self._load()
@@ -204,7 +205,8 @@ class AutoPipeline:
 
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
                max_duration_sec: float = SHORTS_MAX_SEC, layout: str = "blur", upload: bool = True,
-               model: str = "", effort: str = "", link_only: bool = False, focus: str = "") -> AutoJob:
+               model: str = "", effort: str = "", link_only: bool = False, focus: str = "",
+               finish: bool = False) -> AutoJob:
         if agent not in agent_runner.AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
         try:
@@ -221,7 +223,7 @@ class AutoPipeline:
             job_id="auto_" + secrets.token_hex(6), source=validate_source(source), agent=agent,
             clip_count=int(clip_count), min_duration_sec=float(min_duration_sec),
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
-            model=model, effort=effort, link_only=bool(link_only), focus=clean_focus(focus),
+            model=model, effort=effort, link_only=bool(link_only), focus=clean_focus(focus), finish=bool(finish),
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -293,6 +295,9 @@ class AutoPipeline:
             job.step = STEPS[3]
             job.outputs = self.steps["export"](job)
             self._check_cancel(job)
+            if job.finish:
+                self.steps["finish"](job)
+                self._check_cancel(job)
             job.step = STEPS[4]
             if job.upload:
                 self.steps["upload"](job)
@@ -523,6 +528,23 @@ class AutoPipeline:
         outputs = [str(item) for item in status.get("outputs") or []]
         self._log(job, f"{len(outputs)}本を書き出しました。")
         return outputs
+
+    def _finish(self, job: AutoJob) -> None:
+        """Give each exported Short a hook title, word-timed captions and sound effects."""
+        from . import finishing
+
+        self._log(job, "仕上げ（引きのタイトル・字幕のタイミング調整・効果音）を行います。")
+        for index, output in enumerate(job.outputs, start=1):
+            self._check_cancel(job)
+            try:
+                plan = finishing.finish_exported_clip(
+                    Path(output), agent=job.agent, model=job.model, focus=job.focus,
+                    log=lambda message: self._log(job, message),
+                )
+            except Exception as exc:  # an unfinished clip is still a valid Short
+                self._log(job, f"  {index}本目の仕上げを省略しました（{type(exc).__name__}）")
+                continue
+            self._log(job, f"  {index}本目: 引き「{plan.hook_text}」・効果音{len(plan.sound_effects)}か所")
 
     def _upload(self, job: AutoJob) -> None:
         from . import youtube_upload

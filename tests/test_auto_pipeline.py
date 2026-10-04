@@ -216,6 +216,20 @@ class PipelineTest(_Isolated):
         relink.assert_called_once_with(ids["shared"], downloaded)
         self.assertEqual(video_id, ids["shared"])
 
+    def test_finishing_runs_between_export_and_upload_only_when_requested(self):
+        calls = []
+        pipeline = self._pipeline(calls)
+        pipeline.steps["finish"] = lambda job: calls.append("finish")
+        for finish, expected in ((False, []), (True, ["finish"])):
+            calls.clear()
+            job = auto_pipeline.AutoJob(job_id=f"auto_fin_{finish}", source="x", agent="codex", finish=finish)
+            pipeline.jobs[job.job_id] = job
+            pipeline.run(job)
+            self.assertEqual([c for c in calls if c == "finish"], expected)
+            if finish:
+                self.assertLess(calls.index("export"), calls.index("finish"))
+                self.assertLess(calls.index("finish"), calls.index("upload"))
+
     def test_link_only_job_downloads_and_links_without_clipping(self):
         calls = []
         pipeline = self._pipeline(calls)

@@ -511,7 +511,7 @@ _QUIT_JS = """() => {
         document.body.innerHTML =
             '<div style="display:flex;align-items:center;justify-content:center;'
             + 'height:100vh;font-family:sans-serif;font-size:1.4rem;color:#888;">'
-            + 'アプリを終了しました。このタブは閉じてください。</div>';
+            + 'アプリを終了しました。ブラウザで開いている場合は、このタブを閉じてください。</div>';
     }, 200);
 }"""
 
@@ -524,7 +524,7 @@ def shutdown_app():
             pipeline.cancel(job.job_id)
     # Let this response reach the browser before the process exits.
     threading.Timer(3.0, lambda: os._exit(0)).start()
-    return gr.update(visible=True, value="**アプリを終了しました。このタブは閉じてください。**")
+    return gr.update(visible=True, value="**アプリを終了しました。ブラウザで開いている場合は、このタブを閉じてください。**")
 
 
 with gr.Blocks(title="CUT 自動投稿") as demo:
@@ -808,10 +808,68 @@ def _disable_console_quick_edit() -> None:
         pass
 
 
-if __name__ == "__main__":
+def _running_jobs() -> int:
+    return sum(1 for job in _auto_pipeline().list_jobs() if job.state in {"queued", "running"})
+
+
+def _open_window(url: str, *, on_close=None) -> bool:
+    """Show the UI in its own window (pywebview).  False when that is not possible."""
+    try:
+        import webview
+    except ImportError:
+        return False
+    webview.settings["ALLOW_DOWNLOADS"] = True  # share zips and exported files
+    window = webview.create_window("CUT 自動投稿", url, width=1280, height=920, min_size=(900, 600),
+                                   text_select=True)
+
+    def closing():
+        if on_close is None or not _running_jobs():
+            return True
+        return window.create_confirmation_dialog(
+            "CUT 自動投稿", "実行中のジョブがあります。止めて終了しますか？")
+
+    window.events.closing += closing
+    try:
+        webview.start()
+    except Exception as exc:  # e.g. the WebView2 runtime is missing
+        print(f"専用ウィンドウを開けなかったため、ブラウザで開きます: {exc}")
+        return False
+    if on_close is not None:
+        on_close()
+    return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CUT 自動投稿")
+    parser.add_argument("--browser", action="store_true", help="専用ウィンドウではなくブラウザで開く")
+    args = parser.parse_args(argv)
+    url = f"http://127.0.0.1:{APP_PORT}"
     _disable_console_quick_edit()
     if _port_in_use(APP_PORT):
-        print(f"自動投稿アプリは既に起動しています: http://127.0.0.1:{APP_PORT}")
-        webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
+        print(f"自動投稿アプリは既に起動しています: {url}")
+        # A second window onto the running app; closing it leaves that app running.
+        if args.browser or not _open_window(url):
+            webbrowser.open(url)
         raise SystemExit(0)
-    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True, css=APP_CSS)
+    if args.browser:
+        demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True, css=APP_CSS)
+        return
+    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=False, css=APP_CSS,
+                prevent_thread_lock=True)
+
+    def stop():
+        pipeline = _auto_pipeline()
+        for job in pipeline.list_jobs():
+            if job.state in {"queued", "running"}:
+                pipeline.cancel(job.job_id)
+        os._exit(0)
+
+    if not _open_window(url, on_close=stop):
+        webbrowser.open(url)
+        demo.block_thread()
+
+
+if __name__ == "__main__":
+    main()

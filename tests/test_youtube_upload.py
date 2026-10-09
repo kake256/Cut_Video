@@ -220,7 +220,7 @@ class AutoPublishAppTest(unittest.TestCase):
         import auto_publish_app
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
-            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "private"))
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "unlisted"))
             auto_publish_app.save_ui_settings("max", 15, 45, "crop", False, "unlisted")
             self.assertEqual(auto_publish_app.apply_ui_settings(), ("max", 15.0, 45.0, "crop", False, "unlisted"))
             self.assertEqual(auto_publish_app._upload_args("unlisted"), {"upload": True, "privacy": "unlisted"})
@@ -229,7 +229,7 @@ class AutoPublishAppTest(unittest.TestCase):
                 auto_publish_app.save_ui_settings("high", 50, 20, "blur")
             (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x", "upload": "public"}',
                                                             encoding="utf-8")
-            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "private"))
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "unlisted"))
 
     def test_publish_buttons_publish_right_away_and_summarise_failures(self):
         import auto_publish_app

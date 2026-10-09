@@ -313,7 +313,7 @@ def refresh_library():
 
 
 _UI_SETTINGS_DEFAULTS = {"min_sec": 20, "max_sec": SHORTS_MAX_SEC, "layout": "blur",
-                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True, "upload": "private"}
+                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True, "upload": "unlisted"}
 UPLOAD_CHOICES = [("非公開でアップロード", "private"), ("限定公開でアップロード", "unlisted"), ("アップロードしない", "none")]
 
 
@@ -610,7 +610,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_finish = gr.Checkbox(
                         value=True, label="仕上げる（引きのタイトル・字幕のタイミング調整・効果音）",
                     )
-                    auto_upload = gr.Radio(choices=UPLOAD_CHOICES, value="private", label="YouTube")
+                    auto_upload = gr.Radio(choices=UPLOAD_CHOICES, value="unlisted", label="YouTube")
                 with gr.Row():
                     auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さ・YouTubeを既定として保存", scale=1)
                     auto_settings_md = gr.Markdown("", scale=2)

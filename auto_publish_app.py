@@ -8,6 +8,7 @@ Publishing stays a one-click action limited to allow-listed channels.
 from __future__ import annotations
 
 import html
+import json
 import os
 import socket
 import threading
@@ -24,6 +25,20 @@ from moment_retrieval.auto_pipeline import (  # noqa: E402
 )
 
 APP_PORT = int(os.environ.get("CUT_AUTO_PUBLISH_PORT", "7870"))
+# Operable panels get a light gray fill; fields inside stay white so they read as inputs.
+APP_CSS = """
+.gradio-container {
+    --body-background-fill: #ffffff;
+    --block-background-fill: #f1f3f5;
+    --block-border-color: #dde1e6;
+    --input-background-fill: #ffffff;
+}
+.dark .gradio-container {
+    --body-background-fill: #0f1115;
+    --block-background-fill: #1d2026;
+    --input-background-fill: #121418;
+}
+"""
 
 
 
@@ -52,6 +67,9 @@ def auto_account_status() -> str:
     source = "（アプリ同梱のクライアントを使用）" if youtube_upload.client_source() == "bundled" else ""
     if channel is None:
         return f"**YouTube:** 未連携です。「YouTubeアカウントを連携」を押してください。{source}"
+    if channel.get("needs_relink"):
+        return ("**YouTube:** 連携中ですが、公開するには追加の許可が必要です。"
+                f"「設定」タブで「YouTubeアカウントを連携」をやり直してください。{source}")
     return f"**YouTube:** 連携中 — {html.escape(str(channel.get('title') or channel.get('id')))}{source}"
 
 
@@ -176,37 +194,51 @@ _AUTO_STATE_LABELS = {
 }
 
 
-def auto_jobs_view():
-    jobs = _auto_pipeline().list_jobs()[:10]
-    if not jobs:
-        return "まだジョブはありません。", gr.update(choices=[], value=None), gr.update(choices=[], value=None)
-    parts = []
-    publishable: list[tuple[str, str]] = []
+def uploads_signature(jobs) -> str:
+    """Changes only when uploads or their public/private state change, so the publish
+    cards (and any ticked checkboxes) are not rebuilt on every progress refresh."""
+    return json.dumps([
+        [job.job_id, [[u.get("video_id"), u.get("privacy_status")] for u in job.uploads]]
+        for job in jobs if job.uploads
+    ])
+
+
+def _job_history_markdown(jobs) -> str:
+    lines = []
     for job in jobs:
         state = _AUTO_STATE_LABELS.get(job.state, job.state)
-        step = f" / {job.step}" if job.state == "running" and job.step else ""
-        parts.append(f"### {html.escape(job.job_id)} — {state}{html.escape(step)}")
-        parts.append(f"- 元動画: {html.escape(job.source)}")
-        if job.source_channel:
-            parts.append(f"- チャンネル: {html.escape(job.source_channel)}")
-        if job.source_video_key:
-            parts.append(f"- 動画ID: {html.escape(job.source_video_key)}")
-        for upload in job.uploads:
-            status = "公開中" if upload.get("privacy_status") == "public" else "非公開"
-            link = upload.get("watch_url") or upload.get("studio_url")
-            parts.append(f"- [{status}] {html.escape(str(upload.get('title', '')))} — {link}")
-            if status == "非公開":
-                publishable.append(
-                    (f"{upload.get('title')}（{job.job_id}）", f"{job.job_id}|{upload.get('video_id')}")
-                )
+        uploads = f"・アップロード {len(job.uploads)}本" if job.uploads else ""
+        if getattr(job, "focus", ""):
+            uploads += f"・探した場面: {html.escape(job.focus)}"
         recent = "\n".join(job.log[-8:])
-        # Blank lines around the HTML block keep the next job's heading rendered as Markdown.
-        parts.append(f"\n<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n")
-    running = [(job.job_id, job.job_id) for job in jobs if job.state in {"queued", "running"}]
+        lines.append(
+            f"**{html.escape(job.job_id)}** — {state}{uploads}　{html.escape(job.source)}\n\n"
+            f"<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n"
+        )
+    return "\n".join(lines) or "まだジョブはありません。"
+
+
+def auto_jobs_view():
+    """Running jobs stay visible; finished ones go to the collapsed history."""
+    jobs = _auto_pipeline().list_jobs()[:10]
+    active = [job for job in jobs if job.state in {"queued", "running"}]
+    if active:
+        parts = []
+        for job in active:
+            state = _AUTO_STATE_LABELS.get(job.state, job.state)
+            step = f"（{job.step}）" if job.step else ""
+            last = job.log[-1] if job.log else ""
+            parts.append(f"- **{html.escape(job.job_id)}** {state}{html.escape(step)} — "
+                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>")
+        running_md = "\n".join(parts)
+    else:
+        running_md = "実行中のジョブはありません。"
+    running = [(job.job_id, job.job_id) for job in active]
     return (
-        "\n".join(parts),
-        gr.update(choices=publishable, value=publishable[0][1] if publishable else None),
+        running_md,
+        uploads_signature(jobs),
         gr.update(choices=running, value=running[0][1] if running else None),
+        _job_history_markdown(jobs),
     )
 
 
@@ -258,7 +290,7 @@ def summary_status() -> str:
     if youtube.startswith("連携中"):
         youtube_part = f"YouTube: {youtube}"
     else:
-        youtube_part = "YouTube: 未連携（「設定」タブで連携すると非公開アップロードまで自動。未連携なら書き出しまで）"
+        youtube_part = "YouTube: 未連携（「設定」タブで連携するとアップロードまで自動。未連携なら書き出しまで）"
     return f"{youtube_part}　|　AI: {auto_agent_status()}"
 
 
@@ -280,19 +312,113 @@ def refresh_library():
     return gr.update(choices=choices), gr.update(choices=choices)
 
 
-def auto_submit(sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
-                min_sec, max_sec, layout: str, upload: bool):
+_UI_SETTINGS_DEFAULTS = {"min_sec": 20, "max_sec": SHORTS_MAX_SEC, "layout": "blur",
+                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True, "upload": "unlisted"}
+UPLOAD_CHOICES = [("非公開でアップロード", "private"), ("限定公開でアップロード", "unlisted"), ("アップロードしない", "none")]
+
+
+def _upload_args(upload) -> dict:
+    """The upload control's value as submit() arguments (a bare bool is the old checkbox)."""
+    if upload is True or upload in (None, "private"):
+        return {"upload": True, "privacy": "private"}
+    if upload == "unlisted":
+        return {"upload": True, "privacy": "unlisted"}
+    return {"upload": False, "privacy": "private"}
+
+
+def _ui_settings_path() -> Path:
+    return config.LIBRARY_ROOT / "auto_publish_ui.json"
+
+
+def load_ui_settings() -> dict:
+    """Saved defaults for length, layout and reasoning effort (invalid values fall back)."""
+    try:
+        saved = json.loads(_ui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    settings = dict(_UI_SETTINGS_DEFAULTS)
+    try:
+        min_sec, max_sec = float(saved.get("min_sec", settings["min_sec"])), float(saved.get("max_sec", settings["max_sec"]))
+        if 5 <= min_sec <= max_sec <= SHORTS_MAX_SEC:
+            settings.update(min_sec=min_sec, max_sec=max_sec)
+    except (TypeError, ValueError):
+        pass
+    if saved.get("layout") in {"blur", "crop"}:
+        settings["layout"] = saved["layout"]
+    if saved.get("effort") in agent_runner.EFFORTS:
+        settings["effort"] = saved["effort"]
+    if isinstance(saved.get("finish"), bool):
+        settings["finish"] = saved["finish"]
+    if saved.get("upload") in {"private", "unlisted", "none"}:
+        settings["upload"] = saved["upload"]
+    return settings
+
+
+def apply_ui_settings():
+    settings = load_ui_settings()
+    return (settings["effort"], settings["min_sec"], settings["max_sec"], settings["layout"], settings["finish"],
+            settings["upload"])
+
+
+def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = True, upload: str = "private") -> str:
+    try:
+        min_sec, max_sec = float(min_sec), float(max_sec)
+    except (TypeError, ValueError):
+        raise gr.Error("長さは数値で入力してください。")
+    if not 5 <= min_sec <= max_sec <= SHORTS_MAX_SEC:
+        raise gr.Error(f"長さは 5秒 <= 最短 <= 最長 <= {SHORTS_MAX_SEC}秒 で指定してください。")
+    if layout not in {"blur", "crop"} or effort not in agent_runner.EFFORTS:
+        raise gr.Error("レイアウトと推論の強さを選んでください。")
+    path = _ui_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort,
+                                "finish": bool(finish),
+                                "upload": upload if upload in {"private", "unlisted", "none"} else "private"},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+    return "保存しました。次回からこの設定で開きます。"
+
+
+def on_mode_change(mode: str):
+    url = mode == "url"
+    return gr.update(visible=url), gr.update(visible=not url), gr.update(visible=url)
+
+
+def auto_download_only(sources: str):
+    """Download and transcribe URLs (or index local files) without clipping or uploading."""
     lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
-    lines += [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
     if not lines:
-        raise gr.Error("動画のURLを入力するか、文字起こし済みの動画を選んでください。")
+        raise gr.Error("ダウンロードしたい動画のURLを入力してください。")
+    submitted = []
+    for line in lines[:10]:
+        try:
+            # The AI is not called in link-only jobs; any valid agent satisfies validation.
+            job = _auto_pipeline().submit(line, "codex", link_only=True)
+        except PipelineError as exc:
+            raise gr.Error(f"{line}: {exc}") from exc
+        submitted.append(job.job_id)
+    gr.Info(f"{len(submitted)}件のダウンロードと文字起こしを開始しました。")
+    return ("", *auto_jobs_view())
+
+
+def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
+                min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
+    # Only the input that is shown counts; a leftover value in the hidden one is ignored.
+    if mode == "library":
+        lines = [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
+        if not lines:
+            raise gr.Error("文字起こし済みの動画を選んでください。")
+    else:
+        lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
+        if not lines:
+            raise gr.Error("動画のURLを入力してください。")
     submitted = []
     for line in lines[:10]:
         try:
             job = _auto_pipeline().submit(
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
-                model=model or "", effort=(effort or "") if agent == "codex" else "",
+                max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
+                model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
+                finish=bool(finish),
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -314,7 +440,7 @@ def export_shared_index(video_id: str, include_url: bool):
 
 
 def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
-                        min_sec, max_sec, layout: str, upload: bool):
+                        min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
     """Import a share zip; optionally start a job that downloads, relinks and clips it."""
     from moment_retrieval import db, source_origin
     from moment_retrieval.share import ShareError, import_index
@@ -343,9 +469,9 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
         try:
             job = _auto_pipeline().submit(
                 origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "",
-                link_only=not start_clipping,
+                link_only=not start_clipping, focus=focus or "", finish=bool(finish),
             )
         except PipelineError as exc:
             log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
@@ -357,18 +483,31 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
     return log, gr.update(choices=choices), gr.update(choices=choices)
 
 
-def auto_publish(selection: str):
-    if not selection or "|" not in selection:
-        raise gr.Error("公開する動画を選択してください。")
-    job_id, video_id = selection.split("|", 1)
-    try:
-        result = _auto_pipeline().publish(job_id, video_id)
-    except (PipelineError, youtube_upload.UploadError) as exc:
-        raise gr.Error(str(exc)) from exc
-    except Exception as exc:
-        raise gr.Error(f"公開に失敗しました: {exc}") from exc
-    gr.Info(f"公開しました: {result['watch_url']}")
-    return auto_jobs_view()
+def publish_now(job_id: str, video_ids):
+    """Publish the chosen clips right away; failures are listed instead of stopping the rest."""
+    ids = [str(item) for item in (video_ids or []) if item]
+    if not ids:
+        raise gr.Error("公開する動画にチェックを入れてください。")
+    done, failed = [], []
+    for video_id in ids:
+        try:
+            result = _auto_pipeline().publish(job_id, video_id)
+            done.append(result["watch_url"])
+        except (PipelineError, youtube_upload.UploadError) as exc:
+            failed.append(f"{video_id}: {exc}")
+        except Exception as exc:
+            failed.append(f"{video_id}: {type(exc).__name__}: {exc}")
+    if done:
+        gr.Info(f"{len(done)}本を公開しました。")
+    lines = [f"- 公開しました: {url}" for url in done]
+    if failed:
+        # One reason is enough when every clip failed the same way (e.g. a missing permission).
+        reasons = {item.split(": ", 1)[1] for item in failed}
+        if len(reasons) == 1:
+            lines.append(f"- {len(failed)}本を公開できませんでした: {reasons.pop()}")
+        else:
+            lines += [f"- 公開できませんでした: {item}" for item in failed]
+    return ("\n".join(lines), *auto_jobs_view())
 
 
 def auto_cancel(job_id: str):
@@ -386,7 +525,7 @@ _QUIT_JS = """() => {
         document.body.innerHTML =
             '<div style="display:flex;align-items:center;justify-content:center;'
             + 'height:100vh;font-family:sans-serif;font-size:1.4rem;color:#888;">'
-            + 'アプリを終了しました。このタブは閉じてください。</div>';
+            + 'アプリを終了しました。ブラウザで開いている場合は、このタブを閉じてください。</div>';
     }, 200);
 }"""
 
@@ -399,7 +538,7 @@ def shutdown_app():
             pipeline.cancel(job.job_id)
     # Let this response reach the browser before the process exits.
     threading.Timer(3.0, lambda: os._exit(0)).start()
-    return gr.update(visible=True, value="**アプリを終了しました。このタブは閉じてください。**")
+    return gr.update(visible=True, value="**アプリを終了しました。ブラウザで開いている場合は、このタブを閉じてください。**")
 
 
 with gr.Blocks(title="CUT 自動投稿") as demo:
@@ -422,16 +561,22 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     status_md = gr.Markdown("")
     with gr.Tabs():
         with gr.Tab("切り抜き"):
-            auto_sources = gr.Textbox(
-                label="動画のURL（YouTube / Twitch）またはファイルのパス　※1行に1つ",
-                lines=2, placeholder="https://www.youtube.com/watch?v=...",
+            auto_mode = gr.Radio(
+                choices=[("新しい動画（URL）", "url"), ("文字起こし済みの動画", "library")],
+                value="url", label="切り抜く動画",
             )
-            with gr.Row():
-                auto_library = gr.Dropdown(
-                    choices=[], multiselect=True, scale=5,
-                    label="または文字起こし済みの動画から選ぶ（編集用CUTで処理した動画も含む）",
+            with gr.Group(visible=True) as auto_url_group:
+                auto_sources = gr.Textbox(
+                    label="動画のURL（YouTube / Twitch）またはファイルのパス　※1行に1つ",
+                    lines=2, placeholder="https://www.youtube.com/watch?v=...",
                 )
-                auto_library_refresh = gr.Button("一覧を更新", scale=1)
+            with gr.Group(visible=False) as auto_library_group:
+                with gr.Row():
+                    auto_library = gr.Dropdown(
+                        choices=[], multiselect=True, scale=5,
+                        label="文字起こし済みの動画（複数選択可・編集用CUTで処理した動画も含む）",
+                    )
+                    auto_library_refresh = gr.Button("一覧を更新", scale=1)
             with gr.Row():
                 auto_agent = gr.Radio(
                     choices=[("Codex", "codex"), ("Claude Code", "claude"), ("ローカルAI", "local")], value="codex",
@@ -442,7 +587,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     label="モデル", scale=2,
                 )
                 auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="本数", scale=2)
-            with gr.Accordion("長さ・レイアウト・アップロード・推論の強さ", open=False):
+            auto_focus = gr.Textbox(
+                label="探したい場面（任意）　空欄なら見どころ全般から選びます",
+                placeholder="例: 謎解きができなくてキレている箇所",
+                max_length=200,
+            )
+            with gr.Accordion("長さ・レイアウト・仕上げ・推論の強さ・アップロード", open=False):
                 with gr.Row():
                     auto_effort = gr.Dropdown(
                         choices=list(agent_runner.EFFORTS), value=agent_runner.DEFAULT_EFFORT,
@@ -457,17 +607,67 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_layout = gr.Radio(
                         choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",
                     )
-                    auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
-            auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg")
+                    auto_finish = gr.Checkbox(
+                        value=True, label="仕上げる（引きのタイトル・字幕のタイミング調整・効果音）",
+                    )
+                    auto_upload = gr.Radio(choices=UPLOAD_CHOICES, value="unlisted", label="YouTube")
+                with gr.Row():
+                    auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さ・YouTubeを既定として保存", scale=1)
+                    auto_settings_md = gr.Markdown("", scale=2)
+            with gr.Row():
+                auto_start_btn = gr.Button("切り抜いてアップロード", variant="primary", size="lg", scale=3)
+                auto_download_btn = gr.Button("ダウンロードと文字起こしだけ", size="lg", scale=1)
             gr.Markdown(
                 "<small>権利者から切り抜きの許可を得た動画だけに使ってください。文字起こしは選んだAIへ送られます。"
-                "アップロードは常に**非公開**で、公開は下の「公開する」かYouTube Studioで行います。</small>"
+                "アップロードは**非公開**か**限定公開**（リンクを知っている人だけが見られる）で、"
+                "公開は下のジョブの一覧かYouTube Studioで行います。</small>"
             )
             gr.Markdown("### ジョブ")
-            with gr.Row():
-                auto_publish_select = gr.Dropdown(choices=[], label="公開する動画", scale=4)
-                auto_publish_btn = gr.Button("公開する", scale=1)
-            auto_jobs_md = gr.Markdown("まだジョブはありません。")
+            auto_jobs_md = gr.Markdown("実行中のジョブはありません。")
+            auto_uploads_sig = gr.State("[]")
+            publish_result_md = gr.Markdown("")
+
+            @gr.render(inputs=[auto_uploads_sig])
+            def render_publish_cards(signature):
+                entries = json.loads(signature or "[]")
+                if not entries:
+                    return
+                gr.Markdown("**アップロードした動画**（リンクから確認し、チェックして公開できます）")
+                for job_id, _uploads in entries:
+                    job = _auto_pipeline().jobs.get(job_id)
+                    if job is None:
+                        continue
+                    with gr.Group():
+                        lines = [f"**{html.escape(job_id)}** — 元動画: {html.escape(job.source)}"]
+                        for upload in job.uploads:
+                            video_id = str(upload.get("video_id") or "")
+                            status = youtube_upload.PRIVACY_LABELS.get(str(upload.get("privacy_status")), "非公開")
+                            watch = f"https://www.youtube.com/watch?v={video_id}"
+                            studio = f"https://studio.youtube.com/video/{video_id}/edit"
+                            lines.append(f"- [{status}] {html.escape(str(upload.get('title', '')))} — "
+                                         f"[YouTubeで見る]({watch})・[Studioで編集]({studio})")
+                        gr.Markdown("\n".join(lines), padding=True)
+                        private = [(str(u.get("title", "")), str(u.get("video_id")))
+                                   for u in job.uploads if u.get("privacy_status") != "public"]
+                        if not private:
+                            continue
+                        picked = gr.CheckboxGroup(choices=private, label="公開する動画")
+                        with gr.Row():
+                            publish_picked = gr.Button("チェックした動画を公開")
+                            publish_all = gr.Button("このジョブの全部を公開")
+                        publish_picked.click(
+                            lambda selection, job_id=job_id: publish_now(job_id, selection),
+                            inputs=[picked], outputs=[publish_result_md, *auto_job_outputs],
+                            concurrency_id="youtube-publish", concurrency_limit=1,
+                        )
+                        publish_all.click(
+                            lambda job_id=job_id, ids=tuple(v for _t, v in private): publish_now(job_id, ids),
+                            outputs=[publish_result_md, *auto_job_outputs],
+                            concurrency_id="youtube-publish", concurrency_limit=1,
+                        )
+
+            with gr.Accordion("ジョブの履歴（ログ）", open=False):
+                auto_history_md = gr.Markdown("まだジョブはありません。")
             with gr.Accordion("実行中のジョブを停止", open=False):
                 with gr.Row():
                     auto_cancel_select = gr.Dropdown(choices=[], label="実行中のジョブ", scale=4)
@@ -546,7 +746,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 bundle_btn = gr.Button("このクライアントをアプリに同梱する")
                 bundle_md = gr.Markdown("")
 
-    auto_job_outputs = [auto_jobs_md, auto_publish_select, auto_cancel_select]
+    auto_job_outputs = [auto_jobs_md, auto_uploads_sig, auto_cancel_select, auto_history_md]
     demo.load(summary_status, outputs=[status_md])
     demo.load(auto_account_status, outputs=[auto_account_md])
     demo.load(auto_agent_status, outputs=[auto_agents_md])
@@ -574,10 +774,20 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         summary_status, outputs=[status_md])
     auto_start_btn.click(
         auto_submit,
-        inputs=[auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+        inputs=[auto_mode, auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
+    auto_mode.change(on_mode_change, inputs=[auto_mode],
+                     outputs=[auto_url_group, auto_library_group, auto_download_btn])
+    demo.load(apply_ui_settings,
+              outputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish, auto_upload])
+    auto_settings_save.click(save_ui_settings,
+                             inputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish, auto_upload],
+                             outputs=[auto_settings_md])
+    auto_download_btn.click(auto_download_only, inputs=[auto_sources],
+                            outputs=[auto_sources, *auto_job_outputs]).then(
+        refresh_library, outputs=[auto_library, share_export_video])
     demo.load(refresh_library, outputs=[auto_library, share_export_video])
     auto_library_refresh.click(refresh_library, outputs=[auto_library, share_export_video])
     share_export_btn.click(export_shared_index, inputs=[share_export_video, share_include_url],
@@ -585,12 +795,10 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     share_import_btn.click(
         import_shared_index,
         inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)
-    auto_publish_btn.click(auto_publish, inputs=[auto_publish_select], outputs=auto_job_outputs,
-                           concurrency_id="youtube-publish", concurrency_limit=1)
     auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
 
 
@@ -618,10 +826,68 @@ def _disable_console_quick_edit() -> None:
         pass
 
 
-if __name__ == "__main__":
+def _running_jobs() -> int:
+    return sum(1 for job in _auto_pipeline().list_jobs() if job.state in {"queued", "running"})
+
+
+def _open_window(url: str, *, on_close=None) -> bool:
+    """Show the UI in its own window (pywebview).  False when that is not possible."""
+    try:
+        import webview
+    except ImportError:
+        return False
+    webview.settings["ALLOW_DOWNLOADS"] = True  # share zips and exported files
+    window = webview.create_window("CUT 自動投稿", url, width=1280, height=920, min_size=(900, 600),
+                                   text_select=True)
+
+    def closing():
+        if on_close is None or not _running_jobs():
+            return True
+        return window.create_confirmation_dialog(
+            "CUT 自動投稿", "実行中のジョブがあります。止めて終了しますか？")
+
+    window.events.closing += closing
+    try:
+        webview.start()
+    except Exception as exc:  # e.g. the WebView2 runtime is missing
+        print(f"専用ウィンドウを開けなかったため、ブラウザで開きます: {exc}")
+        return False
+    if on_close is not None:
+        on_close()
+    return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CUT 自動投稿")
+    parser.add_argument("--browser", action="store_true", help="専用ウィンドウではなくブラウザで開く")
+    args = parser.parse_args(argv)
+    url = f"http://127.0.0.1:{APP_PORT}"
     _disable_console_quick_edit()
     if _port_in_use(APP_PORT):
-        print(f"自動投稿アプリは既に起動しています: http://127.0.0.1:{APP_PORT}")
-        webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
+        print(f"自動投稿アプリは既に起動しています: {url}")
+        # A second window onto the running app; closing it leaves that app running.
+        if args.browser or not _open_window(url):
+            webbrowser.open(url)
         raise SystemExit(0)
-    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True)
+    if args.browser:
+        demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True, css=APP_CSS)
+        return
+    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=False, css=APP_CSS,
+                prevent_thread_lock=True)
+
+    def stop():
+        pipeline = _auto_pipeline()
+        for job in pipeline.list_jobs():
+            if job.state in {"queued", "running"}:
+                pipeline.cancel(job.job_id)
+        os._exit(0)
+
+    if not _open_window(url, on_close=stop):
+        webbrowser.open(url)
+        demo.block_thread()
+
+
+if __name__ == "__main__":
+    main()

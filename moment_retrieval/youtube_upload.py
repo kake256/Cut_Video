@@ -1,8 +1,8 @@
 """Upload saved clips to the user's own YouTube channel.
 
-Uploads are always ``private``.  A video becomes public only through
-``publish``, which the GUI calls when the user presses "公開する" on a clip
-whose source channel is allow-listed (see ``channel_policy``).  Credentials
+Uploads are ``private`` (default) or ``unlisted`` when the user picks it, so a
+clip can be checked by link first.  A video becomes public only through
+``publish``, which the GUI calls when the user presses "公開する".  Credentials
 live under the private library directory (git-ignored) and are created by the
 user's own OAuth flow.
 """
@@ -21,8 +21,27 @@ SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     # Read-only access shows which channel is linked in the GUI.
     "https://www.googleapis.com/auth/youtube.readonly",
+    # Changing a video's privacy (the "publish" button) needs the full YouTube scope;
+    # youtube.upload alone only allows inserting new videos.
+    "https://www.googleapis.com/auth/youtube",
 ]
+
+
+def _token_scopes() -> set[str]:
+    try:
+        return set(json.loads(token_path().read_text(encoding="utf-8")).get("scopes") or [])
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def missing_scopes() -> list[str]:
+    """Scopes the saved token lacks (e.g. linked before publishing was supported)."""
+    if not token_path().is_file():
+        return []
+    return [scope for scope in SCOPES if scope not in _token_scopes()]
 PRIVACY_STATUS = "private"
+PRIVACY_LABELS = {"private": "非公開", "unlisted": "限定公開", "public": "公開"}
+UPLOAD_PRIVACY = ("private", "unlisted")  # choices for new uploads; public only via publish()
 CATEGORY_PEOPLE_AND_BLOGS = "22"
 MAX_TITLE = 100
 MAX_DESCRIPTION = 5000
@@ -95,8 +114,10 @@ class UploadMetadata:
     description: str
     tags: tuple[str, ...]
 
-    def request_body(self) -> dict:
-        status = {"privacyStatus": PRIVACY_STATUS, "selfDeclaredMadeForKids": False}
+    def request_body(self, privacy: str = PRIVACY_STATUS) -> dict:
+        if privacy not in UPLOAD_PRIVACY:
+            raise UploadError("アップロード時の公開範囲は「非公開」か「限定公開」です。")
+        status = {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}
         return {
             "snippet": {
                 "title": self.title,
@@ -144,7 +165,11 @@ def load_credentials(*, interactive: bool = True):
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     creds = None
-    if token_path().is_file():
+    if token_path().is_file() and missing_scopes():
+        # An older token without the newer scopes: ask once in the browser to add them.
+        if not interactive:
+            raise UploadError("追加の許可が必要です。「YouTubeアカウントを連携」をやり直してください。")
+    elif token_path().is_file():
         creds = Credentials.from_authorized_user_file(str(token_path()), SCOPES)
     if creds and creds.valid:
         return creds
@@ -183,7 +208,7 @@ def connected_channel(*, service_factory: Callable | None = None) -> dict | None
         service = _service(service_factory, interactive=False)
         response = service.channels().list(part="snippet", mine=True).execute()
     except UploadError:
-        return None
+        return {"id": "", "title": "", "needs_relink": True} if missing_scopes() else None
     items = response.get("items") or []
     if not items:
         return None
@@ -240,9 +265,10 @@ def disconnect_account() -> bool:
 def upload_private(
     video_path: Path,
     *,
+    privacy: str = PRIVACY_STATUS,
     service_factory: Callable | None = None,
 ) -> Iterator[tuple[str, dict | None]]:
-    """Yield progress messages, then a final receipt for one private upload."""
+    """Yield progress messages, then a final receipt for one private (or unlisted) upload."""
     video_path = Path(video_path)
     if not video_path.is_file() or video_path.suffix.lower() != ".mp4":
         raise UploadError(f"アップロードできるmp4が見つかりません: {video_path.name}")
@@ -257,9 +283,10 @@ def upload_private(
 
     media = MediaFileUpload(str(video_path), mimetype="video/mp4", chunksize=CHUNK_BYTES, resumable=True)
     request = service.videos().insert(
-        part="snippet,status", body=metadata.request_body(), media_body=media,
+        part="snippet,status", body=metadata.request_body(privacy), media_body=media,
     )
-    yield f"アップロード開始（非公開）: {metadata.title}", None
+    label = PRIVACY_LABELS[privacy]
+    yield f"アップロード開始（{label}）: {metadata.title}", None
     response = None
     while response is None:
         status, response = request.next_chunk()
@@ -270,21 +297,30 @@ def upload_private(
         raise UploadError("YouTubeから動画IDが返りませんでした。")
     result = {
         "video_id": video_id,
-        "privacy_status": (response.get("status") or {}).get("privacyStatus", PRIVACY_STATUS),
+        "privacy_status": (response.get("status") or {}).get("privacyStatus", privacy),
         "title": metadata.title,
+        "watch_url": f"https://www.youtube.com/watch?v={video_id}",
         "studio_url": f"https://studio.youtube.com/video/{video_id}/edit",
     }
     receipt.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    yield f"アップロード完了（非公開）: {result['studio_url']}", result
+    yield f"アップロード完了（{PRIVACY_LABELS.get(result['privacy_status'], label)}）: {result['watch_url']}", result
 
 
 def publish(video_id: str, *, service_factory: Callable | None = None) -> dict:
     """Make one uploaded video public; callers check channel_policy first."""
     service = _service(service_factory)
-    response = service.videos().update(
-        part="status",
-        body={"id": video_id, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}},
-    ).execute()
+    try:
+        response = service.videos().update(
+            part="status",
+            body={"id": video_id, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}},
+        ).execute()
+    except Exception as exc:
+        if "insufficientPermissions" in str(exc) or "insufficient authentication scopes" in str(exc):
+            raise UploadError(
+                "公開する許可がありません。「設定」タブで「YouTubeアカウントを連携」をやり直し、"
+                "「YouTubeアカウントの管理」を許可してください。"
+            ) from exc
+        raise
     status = (response.get("status") or {}).get("privacyStatus")
     if status != "public":
         raise UploadError(

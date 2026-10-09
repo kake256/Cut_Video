@@ -62,6 +62,7 @@ class AutoJob:
     highlight_run_id: str = ""
     outputs: list[str] = field(default_factory=list)
     uploads: list[dict] = field(default_factory=list)
+    privacy: str = "private"  # upload as "private" or "unlisted"; public only by the publish button
     source_channel_key: str = ""
     source_video_key: str = ""
 
@@ -206,7 +207,7 @@ class AutoPipeline:
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
                max_duration_sec: float = SHORTS_MAX_SEC, layout: str = "blur", upload: bool = True,
                model: str = "", effort: str = "", link_only: bool = False, focus: str = "",
-               finish: bool = False) -> AutoJob:
+               finish: bool = False, privacy: str = "private") -> AutoJob:
         if agent not in agent_runner.AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
         try:
@@ -219,11 +220,14 @@ class AutoPipeline:
             raise PipelineError(f"長さは 5秒 <= 最短 <= 最長 <= {SHORTS_MAX_SEC}秒（ショートの上限）で指定してください。")
         if layout not in {"blur", "crop"}:
             raise PipelineError("レイアウトを選択してください。")
+        if privacy not in ("private", "unlisted"):
+            raise PipelineError("アップロード時の公開範囲は「非公開」か「限定公開」を選んでください。")
         job = AutoJob(
             job_id="auto_" + secrets.token_hex(6), source=validate_source(source), agent=agent,
             clip_count=int(clip_count), min_duration_sec=float(min_duration_sec),
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
             model=model, effort=effort, link_only=bool(link_only), focus=clean_focus(focus), finish=bool(finish),
+            privacy=privacy,
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -650,7 +654,7 @@ class AutoPipeline:
         for output in job.outputs:
             self._check_cancel(job)
             receipt = None
-            for message, result in youtube_upload.upload_private(Path(output)):
+            for message, result in youtube_upload.upload_private(Path(output), privacy=job.privacy):
                 self._log(job, message, replace_progress=message.startswith("  アップロード中"))
                 receipt = result or receipt
             if receipt:
@@ -659,7 +663,8 @@ class AutoPipeline:
 
                 record_from_clip(Path(output), receipt.get("title", ""))
         if job.uploads:
-            self._log(job, "非公開でアップロードしました。ジョブ一覧の「公開する」かYouTube Studioで公開できます。")
+            label = youtube_upload.PRIVACY_LABELS.get(job.privacy, "非公開")
+            self._log(job, f"{label}でアップロードしました。ジョブ一覧のリンクから確認し、「公開する」で公開できます。")
 
     def publish(self, job_id: str, youtube_video_id: str) -> dict:
         """One-click publish from the GUI.

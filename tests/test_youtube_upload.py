@@ -96,6 +96,16 @@ class YouTubeUploadTest(unittest.TestCase):
         self.assertLessEqual(len(body["snippet"]["title"]), youtube_upload.MAX_TITLE)
         self.assertEqual(body["snippet"]["tags"], ["株", "決算"])
 
+    def test_unlisted_can_be_chosen_but_public_cannot(self):
+        metadata = youtube_upload.metadata_for(self.video)
+        self.assertEqual(metadata.request_body("unlisted")["status"]["privacyStatus"], "unlisted")
+        with self.assertRaises(youtube_upload.UploadError):
+            metadata.request_body("public")
+        service = _Service()
+        messages = list(youtube_upload.upload_private(self.video, privacy="unlisted", service_factory=lambda: service))
+        self.assertIn("限定公開", messages[0][0])
+        self.assertEqual(messages[-1][1]["watch_url"], "https://www.youtube.com/watch?v=abcDEF12345")
+
     def test_filename_is_the_fallback_title(self):
         self.assertEqual(youtube_upload.metadata_for(self.video).title, "clip_見どころ")
 
@@ -210,13 +220,16 @@ class AutoPublishAppTest(unittest.TestCase):
         import auto_publish_app
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
-            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True))
-            auto_publish_app.save_ui_settings("max", 15, 45, "crop", False)
-            self.assertEqual(auto_publish_app.apply_ui_settings(), ("max", 15.0, 45.0, "crop", False))
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "private"))
+            auto_publish_app.save_ui_settings("max", 15, 45, "crop", False, "unlisted")
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("max", 15.0, 45.0, "crop", False, "unlisted"))
+            self.assertEqual(auto_publish_app._upload_args("unlisted"), {"upload": True, "privacy": "unlisted"})
+            self.assertEqual(auto_publish_app._upload_args("none"), {"upload": False, "privacy": "private"})
             with self.assertRaises(auto_publish_app.gr.Error):
                 auto_publish_app.save_ui_settings("high", 50, 20, "blur")
-            (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x"}', encoding="utf-8")
-            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True))
+            (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x", "upload": "public"}',
+                                                            encoding="utf-8")
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "private"))
 
     def test_publish_buttons_publish_right_away_and_summarise_failures(self):
         import auto_publish_app

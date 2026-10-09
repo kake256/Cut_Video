@@ -290,7 +290,7 @@ def summary_status() -> str:
     if youtube.startswith("連携中"):
         youtube_part = f"YouTube: {youtube}"
     else:
-        youtube_part = "YouTube: 未連携（「設定」タブで連携すると非公開アップロードまで自動。未連携なら書き出しまで）"
+        youtube_part = "YouTube: 未連携（「設定」タブで連携するとアップロードまで自動。未連携なら書き出しまで）"
     return f"{youtube_part}　|　AI: {auto_agent_status()}"
 
 
@@ -313,7 +313,17 @@ def refresh_library():
 
 
 _UI_SETTINGS_DEFAULTS = {"min_sec": 20, "max_sec": SHORTS_MAX_SEC, "layout": "blur",
-                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True}
+                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True, "upload": "private"}
+UPLOAD_CHOICES = [("非公開でアップロード", "private"), ("限定公開でアップロード", "unlisted"), ("アップロードしない", "none")]
+
+
+def _upload_args(upload) -> dict:
+    """The upload control's value as submit() arguments (a bare bool is the old checkbox)."""
+    if upload is True or upload in (None, "private"):
+        return {"upload": True, "privacy": "private"}
+    if upload == "unlisted":
+        return {"upload": True, "privacy": "unlisted"}
+    return {"upload": False, "privacy": "private"}
 
 
 def _ui_settings_path() -> Path:
@@ -339,15 +349,18 @@ def load_ui_settings() -> dict:
         settings["effort"] = saved["effort"]
     if isinstance(saved.get("finish"), bool):
         settings["finish"] = saved["finish"]
+    if saved.get("upload") in {"private", "unlisted", "none"}:
+        settings["upload"] = saved["upload"]
     return settings
 
 
 def apply_ui_settings():
     settings = load_ui_settings()
-    return settings["effort"], settings["min_sec"], settings["max_sec"], settings["layout"], settings["finish"]
+    return (settings["effort"], settings["min_sec"], settings["max_sec"], settings["layout"], settings["finish"],
+            settings["upload"])
 
 
-def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = True) -> str:
+def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = True, upload: str = "private") -> str:
     try:
         min_sec, max_sec = float(min_sec), float(max_sec)
     except (TypeError, ValueError):
@@ -359,7 +372,8 @@ def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = 
     path = _ui_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort,
-                                "finish": bool(finish)},
+                                "finish": bool(finish),
+                                "upload": upload if upload in {"private", "unlisted", "none"} else "private"},
                                ensure_ascii=False, indent=2), encoding="utf-8")
     return "保存しました。次回からこの設定で開きます。"
 
@@ -402,7 +416,7 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
         try:
             job = _auto_pipeline().submit(
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
                 finish=bool(finish),
             )
@@ -455,7 +469,7 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
         try:
             job = _auto_pipeline().submit(
                 origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "",
                 link_only=not start_clipping, focus=focus or "", finish=bool(finish),
             )
@@ -596,16 +610,17 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_finish = gr.Checkbox(
                         value=True, label="仕上げる（引きのタイトル・字幕のタイミング調整・効果音）",
                     )
-                    auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
+                    auto_upload = gr.Radio(choices=UPLOAD_CHOICES, value="private", label="YouTube")
                 with gr.Row():
-                    auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さを既定として保存", scale=1)
+                    auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さ・YouTubeを既定として保存", scale=1)
                     auto_settings_md = gr.Markdown("", scale=2)
             with gr.Row():
-                auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg", scale=3)
+                auto_start_btn = gr.Button("切り抜いてアップロード", variant="primary", size="lg", scale=3)
                 auto_download_btn = gr.Button("ダウンロードと文字起こしだけ", size="lg", scale=1)
             gr.Markdown(
                 "<small>権利者から切り抜きの許可を得た動画だけに使ってください。文字起こしは選んだAIへ送られます。"
-                "アップロードは常に**非公開**で、公開は下のジョブの一覧かYouTube Studioで行います。</small>"
+                "アップロードは**非公開**か**限定公開**（リンクを知っている人だけが見られる）で、"
+                "公開は下のジョブの一覧かYouTube Studioで行います。</small>"
             )
             gr.Markdown("### ジョブ")
             auto_jobs_md = gr.Markdown("実行中のジョブはありません。")
@@ -617,7 +632,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 entries = json.loads(signature or "[]")
                 if not entries:
                     return
-                gr.Markdown("**アップロードした動画**（チェックして公開できます）")
+                gr.Markdown("**アップロードした動画**（リンクから確認し、チェックして公開できます）")
                 for job_id, _uploads in entries:
                     job = _auto_pipeline().jobs.get(job_id)
                     if job is None:
@@ -625,10 +640,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     with gr.Group():
                         lines = [f"**{html.escape(job_id)}** — 元動画: {html.escape(job.source)}"]
                         for upload in job.uploads:
-                            public = upload.get("privacy_status") == "public"
-                            link = upload.get("watch_url") or upload.get("studio_url")
-                            lines.append(f"- [{'公開中' if public else '非公開'}] "
-                                         f"{html.escape(str(upload.get('title', '')))} — {link}")
+                            video_id = str(upload.get("video_id") or "")
+                            status = youtube_upload.PRIVACY_LABELS.get(str(upload.get("privacy_status")), "非公開")
+                            watch = f"https://www.youtube.com/watch?v={video_id}"
+                            studio = f"https://studio.youtube.com/video/{video_id}/edit"
+                            lines.append(f"- [{status}] {html.escape(str(upload.get('title', '')))} — "
+                                         f"[YouTubeで見る]({watch})・[Studioで編集]({studio})")
                         gr.Markdown("\n".join(lines), padding=True)
                         private = [(str(u.get("title", "")), str(u.get("video_id")))
                                    for u in job.uploads if u.get("privacy_status") != "public"]
@@ -763,9 +780,10 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     )
     auto_mode.change(on_mode_change, inputs=[auto_mode],
                      outputs=[auto_url_group, auto_library_group, auto_download_btn])
-    demo.load(apply_ui_settings, outputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish])
+    demo.load(apply_ui_settings,
+              outputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish, auto_upload])
     auto_settings_save.click(save_ui_settings,
-                             inputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish],
+                             inputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish, auto_upload],
                              outputs=[auto_settings_md])
     auto_download_btn.click(auto_download_only, inputs=[auto_sources],
                             outputs=[auto_sources, *auto_job_outputs]).then(

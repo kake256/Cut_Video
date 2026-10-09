@@ -439,15 +439,51 @@ class AutoPipeline:
         self._check_cancel(job)
         return code
 
-    def _latest_run_id(self, video_id: str) -> str | None:
+    def _ready_run_ids(self, video_id: str) -> list[str]:
+        """Ready highlight runs of the active transcript, oldest first."""
         conn = db.get_conn()
         try:
             db.init_db(conn)
             revision = db.get_active_transcript_revision(conn, video_id)
-            run = db.get_latest_ready_highlight_run(conn, video_id, revision) if revision else None
-            return run["highlight_run_id"] if run else None
+            runs = db.list_highlight_runs(conn, video_id, revision) if revision else []
+            return [run["highlight_run_id"] for run in reversed(runs) if run and run["status"] == "ready"]
         finally:
             conn.close()
+
+    def _collect_runs(self, job: AutoJob, before: set[str]) -> str | None:
+        """The run to export: an AI may save its picks over several calls (e.g. adding a
+        replacement after one was rejected); combine them so no pick is dropped."""
+        new = [run_id for run_id in self._ready_run_ids(job.video_id) if run_id not in before]
+        if len(new) <= 1:
+            return new[0] if new else None
+        from .mcp_library import LibraryToolError, LibraryTools
+
+        conn = db.get_conn()
+        try:
+            revision = db.get_highlight_run(conn, new[-1])["transcript_revision"]
+            picks, seen = [], set()
+            for run_id in new:
+                for candidate in db.get_highlight_candidates(conn, run_id):
+                    key = (candidate["start_segment_id"], candidate["end_segment_id"])
+                    if key not in seen:
+                        seen.add(key)
+                        picks.append({"start_segment_id": int(candidate["start_segment_id"]),
+                                      "end_segment_id": int(candidate["end_segment_id"]),
+                                      "title": str(candidate["title"]), "reason": str(candidate["reason"] or "-"),
+                                      "summary": str(candidate.get("summary") or "")})
+        finally:
+            conn.close()
+        try:
+            merged = LibraryTools().propose_clips(
+                job.video_id, revision, picks[:max(job.clip_count, 1)],
+                min_duration_sec=job.min_duration_sec, max_duration_sec=job.max_duration_sec,
+                note="自動投稿パイプライン（AIの複数回の提案をまとめたもの）",
+            )
+        except LibraryToolError as exc:
+            self._log(job, f"分けて保存された候補をまとめられなかったため、最後の提案を使います: {exc}")
+            return new[-1]
+        self._log(job, f"AIが候補を{len(new)}回に分けて保存したため、まとめて{len(merged['saved_candidates'])}件にしました。")
+        return merged["highlight_run_id"]
 
     def _signals(self, job: AutoJob) -> list:
         """Excitement cues for the AI: audio profile (built once per video) and stream chat."""
@@ -505,7 +541,7 @@ class AutoPipeline:
         self._log(job, f"コメント履歴を{len(chat['messages'])}件取得しました。")
 
     def _select(self, job: AutoJob) -> str:
-        before = self._latest_run_id(job.video_id)
+        before = set(self._ready_run_ids(job.video_id))
         from .signals import prompt_section
 
         hints = self._signals(job)
@@ -533,8 +569,8 @@ class AutoPipeline:
             except LocalSelectionError as exc:
                 raise PipelineError(str(exc)) from exc
             self._check_cancel(job)
-            after = self._latest_run_id(job.video_id)
-            if not after or after == before:
+            after = self._collect_runs(job, before)
+            if not after:
                 raise PipelineError(
                 f"「{job.focus}」に当てはまる場面が見つかりませんでした。" if job.focus
                 else f"{label} が候補を保存しませんでした。"
@@ -554,8 +590,8 @@ class AutoPipeline:
             effort=job.effort,
         )
         self._check_cancel(job)
-        after = self._latest_run_id(job.video_id)
-        if not after or after == before:
+        after = self._collect_runs(job, before)
+        if not after:
             raise PipelineError(
                 f"「{job.focus}」に当てはまる場面が見つかりませんでした。" if job.focus
                 else f"{label} が候補を保存しませんでした。"

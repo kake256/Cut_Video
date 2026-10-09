@@ -103,6 +103,35 @@ class LibraryToolsTest(unittest.TestCase):
         self.assertEqual([c["title"] for c in result["saved_candidates"]], ["新しい"])
         self.assertIn("投稿済み", result["rejected"][0]["reason"])
 
+    def test_pipeline_combines_picks_the_ai_saved_in_several_calls(self):
+        from moment_retrieval import auto_pipeline
+
+        pipeline = auto_pipeline.AutoPipeline.__new__(auto_pipeline.AutoPipeline)
+        logs = []
+        pipeline._log = lambda job, message, **kw: logs.append(message)
+        job = SimpleNamespace(video_id=self.public_id, clip_count=10, min_duration_sec=15, max_duration_sec=60)
+        ids = self.segment_ids
+        with patch.object(db, "get_conn", self.connect), \
+                patch("moment_retrieval.mcp_library.LibraryTools", lambda: LibraryTools(self.connect)):
+            before = set(pipeline._ready_run_ids(self.public_id))
+            self.tools.propose_clips(self.public_id, self.revision, [
+                {"start_segment_id": ids[0], "end_segment_id": ids[1], "title": "最初", "reason": "r"},
+                {"start_segment_id": ids[2], "end_segment_id": ids[3], "title": "二つ目", "reason": "r"},
+            ], min_duration_sec=15, max_duration_sec=60)
+            single = pipeline._ready_run_ids(self.public_id)[-1]
+            self.assertEqual(pipeline._collect_runs(job, before), single)  # one call: used as is
+            self.tools.propose_clips(self.public_id, self.revision, [
+                {"start_segment_id": ids[4], "end_segment_id": ids[5], "title": "追加", "reason": "r"},
+            ], min_duration_sec=15, max_duration_sec=60)
+            merged = pipeline._collect_runs(job, before)
+            conn = self.connect()
+            try:
+                titles = [c["title"] for c in db.get_highlight_candidates(conn, merged)]
+            finally:
+                conn.close()
+        self.assertEqual(titles, ["最初", "二つ目", "追加"])
+        self.assertIn("2回に分けて", logs[-1])
+
     def test_used_range_bookkeeping_dedupes_and_validates(self):
         conn = self.connect()
         try:

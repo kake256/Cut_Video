@@ -67,6 +67,7 @@ class ClipRequest:
                f"2. 単体で意味が通り、冒頭で引き込める場面を{self.clip_count}件選ぶ。\n") + avoid + self.hints +
             f"3. cut_propose_clips で提案する（min_duration_sec={self.min_duration_sec:g}, "
             f"max_duration_sec={self.max_duration_sec:g}, note='{self.note}'）。"
+            "候補はまとめて1回で保存する（却下された候補の代わりを足すときは、残す候補も含めて全件で呼び直す）。"
             "タイトルは30文字以内で内容が分かるものにし、reasonに選んだ理由を書く。\n"
             "4. 最後に、保存された候補の時刻とタイトルを日本語で短く報告する。文字起こし本文は引用しない。"
         )

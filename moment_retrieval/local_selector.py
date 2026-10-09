@@ -59,7 +59,7 @@ def _schema(first_id: int, last_id: int) -> dict:
 
 
 def _prompt(window: list[dict], min_sec: float, max_sec: float, used: list[dict] | None = None,
-            focus: str = "") -> str:
+            focus: str = "", hints: str = "") -> str:
     lines = "\n".join(
         f"[{row['segment_id']}] {row['start_ms'] / 1000:.1f}-{row['end_ms'] / 1000:.1f}s {row['text']}"
         for row in window
@@ -75,6 +75,7 @@ def _prompt(window: list[dict], min_sec: float, max_sec: float, used: list[dict]
         "良い場面がなければ空の配列にしてください。\n"
         + (("次の範囲はすでに投稿済みなので、重なる場面は選ばないでください:\n" + prompt_lines(used) + "\n")
            if used else "")
+        + hints
         + "\n" + lines
     )
 
@@ -82,7 +83,10 @@ def _prompt(window: list[dict], min_sec: float, max_sec: float, used: list[dict]
 def select_clips(video_id: str, *, clip_count: int, min_duration_sec: float, max_duration_sec: float,
                  model: str = "", provider: object | None = None,
                  library: LibraryTools | None = None, log: Callable[[str], None] | None = None,
-                 used: list[dict] | None = None, focus: str = "") -> dict:
+                 used: list[dict] | None = None, focus: str = "", hints: list | None = None) -> dict:
+    """``hints`` are ``signals.Hint`` excitement cues; each window gets the ones inside it."""
+    from .signals import prompt_section
+
     library = library or LibraryTools()
     provider = provider or OllamaProvider(
         endpoint=config.LLM_ANALYSIS_ENDPOINT.rstrip("/") + "/api/generate",
@@ -103,7 +107,9 @@ def select_clips(video_id: str, *, clip_count: int, min_duration_sec: float, max
         if log:
             log(f"  ローカルAIで候補を探しています... {index}/{len(windows)}")
         try:
-            text = provider.generate(model=model, prompt=_prompt(window, min_duration_sec, max_duration_sec, used, focus),
+            section = prompt_section(hints or [], window[0]["start_ms"] / 1000, window[-1]["end_ms"] / 1000)
+            text = provider.generate(model=model,
+                                     prompt=_prompt(window, min_duration_sec, max_duration_sec, used, focus, section),
                                      output_schema=_schema(window[0]["segment_id"], window[-1]["segment_id"]))
             items = json.loads(text).get("candidates", [])
         except (ProviderError, ValueError, AttributeError) as exc:

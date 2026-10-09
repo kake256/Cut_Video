@@ -449,8 +449,66 @@ class AutoPipeline:
         finally:
             conn.close()
 
+    def _signals(self, job: AutoJob) -> list:
+        """Excitement cues for the AI: audio profile (built once per video) and stream chat."""
+        from . import signals
+
+        conn = db.get_conn()
+        try:
+            db.init_db(conn)
+            video = db.get_video(conn, job.video_id)
+        finally:
+            conn.close()
+        if not video or not Path(str(video["path"])).is_file():
+            return []
+        source, storage_id = Path(str(video["path"])), str(video["video_id"])
+        try:
+            signals.ensure_audio(storage_id, source, log=lambda message: self._log(job, message))
+        except Exception as exc:  # selection still works from the transcript alone
+            self._log(job, f"音声の波形を解析できなかったため、文字起こしだけで選びます（{type(exc).__name__}）")
+        self._check_cancel(job)
+        if signals.load_chat(storage_id) is None:
+            self._fetch_chat(job, video, storage_id)
+            self._check_cancel(job)
+        hints = signals.hints_for(storage_id, source)
+        loud = sum(1 for hint in hints if hint.kind == "loud")
+        chat = sum(1 for hint in hints if hint.kind == "chat")
+        if hints:
+            self._log(job, f"盛り上がりの手がかり: 音量の急上昇{loud}か所" + (f"、コメントの急増{chat}か所" if chat else "")
+                      + "をAIに伝えます。")
+        return hints
+
+    def _fetch_chat(self, job: AutoJob, video: dict, storage_id: str) -> None:
+        """Store the original stream's chat once (an empty record when it has none)."""
+        from . import chat_history, signals, source_origin
+
+        url = job.source if job.source.lower().startswith(("http://", "https://")) else None
+        if url is None:
+            conn = db.get_conn()
+            try:
+                db.init_db(conn)
+                url = source_origin.origin_url_for_video(conn, video)
+            finally:
+                conn.close()
+        if not url:
+            return
+        try:
+            chat = chat_history.fetch(url, log=lambda message: self._log(job, message, replace_progress=True))
+        except chat_history.ChatUnavailable as exc:
+            self._log(job, f"コメント履歴は使いません: {exc}")
+            signals.save_chat(storage_id, {"url": url, "messages": [], "unavailable": str(exc)})
+            return
+        except Exception as exc:  # network trouble: try again next time
+            self._log(job, f"コメント履歴を取得できなかったため、今回は使いません（{type(exc).__name__}）")
+            return
+        signals.save_chat(storage_id, chat)
+        self._log(job, f"コメント履歴を{len(chat['messages'])}件取得しました。")
+
     def _select(self, job: AutoJob) -> str:
         before = self._latest_run_id(job.video_id)
+        from .signals import prompt_section
+
+        hints = self._signals(job)
         label = agent_runner.AGENT_LABELS[job.agent]
         from .used_ranges import for_video
 
@@ -470,7 +528,7 @@ class AutoPipeline:
                     job.video_id, clip_count=job.clip_count, min_duration_sec=job.min_duration_sec,
                     max_duration_sec=job.max_duration_sec, model=job.model,
                     log=lambda message: self._log(job, message, replace_progress=True), used=used,
-                    focus=job.focus,
+                    focus=job.focus, hints=hints,
                 )
             except LocalSelectionError as exc:
                 raise PipelineError(str(exc)) from exc
@@ -490,7 +548,7 @@ class AutoPipeline:
         output = agent_runner.run_agent(
             job.agent,
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
-                                     used_ranges=tuple(used), focus=job.focus),
+                                     used_ranges=tuple(used), focus=job.focus, hints=prompt_section(hints)),
             register_process=register,
             model=job.model,
             effort=job.effort,

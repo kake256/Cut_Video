@@ -489,9 +489,11 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
         raw = {"hook_text": title}
     plan = snap_sound_effects(validate_plan(raw, end - start), words)
     try:
-        from .speech_regions import detect
+        from . import signals
 
-        speech = detect(Path(video["path"]), start, end)
+        # The whole video's speech regions are stored once; this clip reads its part.
+        profile = signals.ensure_audio(str(video["video_id"]), Path(video["path"]))
+        speech = signals.speech_between(profile, start, end)
     except Exception as exc:  # timing falls back to Whisper's word times
         speech = []
         if log:

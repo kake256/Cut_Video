@@ -43,6 +43,7 @@ class ClipRequest:
     note: str = "自動投稿パイプライン"
     used_ranges: tuple = ()  # source ranges already posted; the AI must avoid them
     focus: str = ""  # optional user request, e.g. "謎解きができなくてキレている箇所"
+    hints: str = ""  # excitement cues (loudness jumps, chat bursts) from signals.prompt_section
 
     def prompt(self) -> str:
         avoid = ""
@@ -63,7 +64,7 @@ class ClipRequest:
                f"冒頭で引き込めるものから最大{self.clip_count}件選ぶ。当てはまる場面が少なければ件数未満でよく、"
                "当てはまらない場面で数を埋めない。cut_search_transcript で関連語を探してもよい。\n"
                if self.focus else
-               f"2. 単体で意味が通り、冒頭で引き込める場面を{self.clip_count}件選ぶ。\n") + avoid +
+               f"2. 単体で意味が通り、冒頭で引き込める場面を{self.clip_count}件選ぶ。\n") + avoid + self.hints +
             f"3. cut_propose_clips で提案する（min_duration_sec={self.min_duration_sec:g}, "
             f"max_duration_sec={self.max_duration_sec:g}, note='{self.note}'）。"
             "タイトルは30文字以内で内容が分かるものにし、reasonに選んだ理由を書く。\n"

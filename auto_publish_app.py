@@ -13,13 +13,16 @@ import os
 import socket
 import threading
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 os.chdir(Path(__file__).resolve().parent)
 
 import gradio as gr  # noqa: E402
 
-from moment_retrieval import agent_runner, ai_setup, config, gcloud_setup, youtube_upload  # noqa: E402
+from moment_retrieval import (  # noqa: E402
+    agent_runner, ai_setup, config, gcloud_setup, youtube_auto_reply, youtube_gas, youtube_upload,
+)
 from moment_retrieval.auto_pipeline import (  # noqa: E402
     LIBRARY_PREFIX, SHORTS_MAX_SEC, AutoPipeline, PipelineError, library_videos,
 )
@@ -179,6 +182,181 @@ def auto_connect_account() -> str:
 def auto_disconnect_account() -> str:
     youtube_upload.disconnect_account()
     return auto_account_status()
+
+
+_AUTO_REPLIER = youtube_auto_reply.BackgroundReplier()
+_REPLY_STATUS_LABELS = {"replied": "返信済み", "error": "失敗"}
+
+
+def reply_status() -> str:
+    settings = youtube_auto_reply.load_settings()
+    state = "有効" if settings.enabled else "無効"
+    if settings.run_on == "gas":
+        gas = youtube_gas.load_state()
+        lines = [
+            f"**コメント返信:** {state} / 実行場所: GAS（パソコンが起動していなくても返信します） / "
+            f"{settings.interval_minutes}分ごとに確認 / 1日{settings.daily_limit}件まで",
+            f"[スクリプトを開く（初回は「実行」で許可）]({gas.get('setup_url') or gas.get('editor_url', '')}) / "
+            f"[状態の確認ページ（返信ログのスプレッドシートもここから）]({gas.get('web_url', '')})",
+        ]
+        return "\n\n".join(lines)
+    login = "連携中" if youtube_auto_reply.is_connected() else "未連携（「返信用に連携」を押してください）"
+    lines = [
+        f"**コメント返信:** {state} / 実行場所: このパソコン（アプリを開いている間だけ） / ログイン: {login} / "
+        f"今日 {youtube_auto_reply.replies_today()}/{settings.daily_limit}件 / "
+        f"{settings.interval_minutes}分ごとに確認",
+    ]
+    if _AUTO_REPLIER.last_message:
+        lines.append(f"前回の自動実行: {html.escape(_AUTO_REPLIER.last_message)}")
+    return "\n\n".join(lines)
+
+
+def _push_to_gas() -> str:
+    """Send changed settings to GAS when it is the one replying; '' when nothing to report."""
+    settings = youtube_auto_reply.load_settings()
+    if settings.run_on != "gas":
+        return ""
+    try:
+        youtube_gas.sync(settings)
+    except (youtube_gas.GasError, youtube_auto_reply.AutoReplyError) as exc:
+        return f"\n\n**GASへの反映に失敗しました:** {html.escape(str(exc))}"
+    except Exception as exc:
+        return f"\n\n**GASへの反映に失敗しました:** {type(exc).__name__}"
+    return "\n\nGASにも反映しました。"
+
+
+def reply_gas_enable() -> str:
+    """Create/update the GAS project and open its consent page; the browser opens on this PC."""
+    problems = youtube_upload.setup_problems()
+    if problems:
+        return "**GAS:** " + " ".join(problems)
+    settings = youtube_auto_reply.load_settings()
+    previous = settings.run_on
+
+    def restore():
+        youtube_auto_reply.save_settings(settings.enabled, settings.templates, settings.daily_limit,
+                                         settings.interval_minutes, run_on=previous)
+
+    try:
+        settings = youtube_auto_reply.save_settings(
+            settings.enabled, settings.templates, settings.daily_limit, settings.interval_minutes, run_on="gas")
+        state = youtube_gas.deploy(settings)
+    except youtube_gas.GasError as exc:
+        restore()
+        if exc.url:
+            webbrowser.open(exc.url)
+        return f"**GAS:** {html.escape(str(exc))}"
+    except Exception as exc:
+        restore()
+        return f"**GAS:** 準備に失敗しました（{type(exc).__name__}: {html.escape(str(exc))[:200]}）。"
+    setup_link = state.get("setup_url") or state.get("editor_url", "")
+    webbrowser.open(setup_link)
+    owner = html.escape(state.get("owner_email") or "スクリプトを作った個人のGoogleアカウント")
+    return (
+        f"**GAS:** スクリプトを用意し、ブラウザで開きました（{owner} で開きます。アカウントを聞かれたらこれを選択）。"
+        "上部の「実行」を押してください（関数は最初から「setup」が選ばれています）。"
+        "「承認が必要です」→「権限を確認」→ アカウントを選択 →「詳細」→「CUT コメント自動返信（安全ではないページ）に移動」→"
+        "「許可」と進み、下の実行ログに「準備完了: （チャンネル名）として…」と出れば完了です。"
+        f"\n\nブラウザが開かない場合は[こちら]({setup_link})。"
+        "\n\n" + reply_status()
+    )
+
+
+def reply_gas_stop() -> str:
+    settings = youtube_auto_reply.load_settings()
+    youtube_auto_reply.save_settings(settings.enabled, settings.templates, settings.daily_limit,
+                                     settings.interval_minutes, run_on="pc")
+    try:  # tell GAS to stop replying; its trigger then finds nothing to do
+        youtube_gas.sync(youtube_auto_reply.load_settings())
+        note = "GAS側の返信は止めました。"
+    except Exception as exc:
+        note = (f"GAS側を止められませんでした（{type(exc).__name__}）。"
+                "スクリプトを開き、左の「トリガー」から autoReply を削除してください。")
+    return f"**GAS:** このパソコンで返信する設定に戻しました。{note}\n\n" + reply_status()
+
+
+def reply_log_markdown() -> str:
+    rows = youtube_auto_reply.recent_log()
+    if not rows:
+        return "まだ返信していません。"
+    lines = ["| 日時 | 状態 | 相手 | コメント | 返信 |", "|---|---|---|---|---|"]
+    for row in rows:
+        when = (youtube_auto_reply.parse_time(row["created_at"]) or datetime.now()).astimezone()
+        cells = [when.strftime("%m/%d %H:%M"), _REPLY_STATUS_LABELS.get(row["status"], row["status"]),
+                 row["author"], row["comment_text"][:60], row["reply_text"][:60] or row["error"][:60]]
+        lines.append("| " + " | ".join(
+            html.escape(str(cell)).replace("|", "／").replace("\n", " ") for cell in cells) + " |")
+    return "\n".join(lines)
+
+
+def reply_templates_view():
+    """The registered replies (line breaks shown as-is) and the choices for deletion."""
+    templates = youtube_auto_reply.load_settings().templates
+    if not templates:
+        return "まだ定型文がありません。下の欄に入力して「追加」を押してください。", gr.update(choices=[], value=None)
+    blocks = []
+    for number, text in enumerate(templates, start=1):
+        quoted = "<br>".join(html.escape(line) for line in text.split("\n"))
+        blocks.append(f"**{number}.**<br>{quoted}")
+    choices = [(f"{number}. {text.splitlines()[0][:40]}", str(number - 1))
+               for number, text in enumerate(templates, start=1)]
+    return "\n\n".join(blocks), gr.update(choices=choices, value=None)
+
+
+def reply_load_settings():
+    settings = youtube_auto_reply.load_settings()
+    return settings.enabled, settings.include_past, settings.daily_limit, settings.interval_minutes
+
+
+def reply_save_settings(enabled: bool, include_past: bool, daily_limit, interval_minutes) -> str:
+    templates = youtube_auto_reply.load_settings().templates
+    try:
+        youtube_auto_reply.save_settings(enabled, templates, daily_limit, interval_minutes,
+                                         include_past=include_past)
+    except youtube_auto_reply.AutoReplyError as exc:
+        return f"**コメント返信:** {exc}"
+    return reply_status() + _push_to_gas()
+
+
+def reply_add_template(text: str):
+    try:
+        youtube_auto_reply.add_template(text)
+    except youtube_auto_reply.AutoReplyError as exc:
+        return (f"**コメント返信:** {exc}", gr.update(), *reply_templates_view())
+    return (reply_status() + _push_to_gas(), "", *reply_templates_view())
+
+
+def reply_remove_template(index):
+    try:
+        youtube_auto_reply.remove_template(index)
+    except youtube_auto_reply.AutoReplyError as exc:
+        return (f"**コメント返信:** {exc}", gr.update(), *reply_templates_view())
+    return (reply_status() + _push_to_gas(), youtube_auto_reply.load_settings().enabled,
+            *reply_templates_view())
+
+
+def reply_connect() -> str:
+    problems = youtube_upload.setup_problems()
+    if problems:
+        return "**コメント返信:** " + " ".join(problems)
+    try:
+        youtube_auto_reply.connect_account()
+    except Exception as exc:
+        return f"**コメント返信:** 連携に失敗しました（{type(exc).__name__}: {html.escape(str(exc))[:200]}）。"
+    return reply_status() + _push_to_gas()  # GAS replies with this login too
+
+
+def reply_disconnect() -> str:
+    youtube_auto_reply.disconnect_account()
+    return reply_status()
+
+
+def reply_run_now():
+    try:
+        message = youtube_auto_reply.run_once(manual=True).message
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"[:300]
+    return f"**手動実行:** {html.escape(message)}\n\n" + reply_status(), reply_log_markdown()
 
 
 def auto_agent_status() -> str:
@@ -696,6 +874,69 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             share_import_btn = gr.Button("読み込む", variant="primary")
             share_import_log = gr.Textbox(label="読み込みログ", interactive=False, lines=6)
 
+        with gr.Tab("コメント返信"):
+            gr.Markdown(
+                "自分のチャンネルの動画に付いた未返信のコメントへ、登録した定型文で自動返信します（承認なし）。"
+                "自分のコメントや、自分が既に返信したコメントには返信しません。"
+                "YouTubeのAPIにハートを付ける機能はないため、ハートはYouTube Studioで付けてください。"
+                f"1回の確認で返信するのは1件まで、返信どうしの間隔は{youtube_auto_reply.MIN_GAP_MINUTES}分以上あけ、"
+                "1日の上限を超えては返信しません。このパソコンで動かす場合はアプリを開いている間だけ動きます"
+                "（パソコンを起動していなくても返信したい場合は、下の「GASで動かす」を使います）。"
+            )
+            reply_status_md = gr.Markdown("")
+            with gr.Row():
+                reply_connect_btn = gr.Button("返信用に連携", variant="primary")
+                reply_disconnect_btn = gr.Button("返信用の連携を解除")
+            gr.Markdown(
+                "<small>返信にはコメント管理の許可（youtube.force-ssl）が必要なため、アップロード用とは別に連携します。"
+                "OAuthクライアントは「設定」タブで読み込んだものを使います。</small>"
+            )
+            gr.Markdown("### 定型文")
+            gr.Markdown(
+                "<small>登録した中から毎回ランダムに選びます（直前と同じ文は避けます）。"
+                "改行を含む文もそのまま返信します。{name} は相手の名前に置き換わります。</small>"
+            )
+            reply_templates_md = gr.Markdown("")
+            reply_new_template = gr.Textbox(label="追加する定型文（改行できます）", lines=3,
+                                            placeholder="コメントありがとうございます！")
+            reply_add_btn = gr.Button("追加", variant="primary")
+            with gr.Row():
+                reply_remove_select = gr.Dropdown(choices=[], label="削除する定型文", scale=4)
+                reply_remove_btn = gr.Button("削除", variant="stop", scale=1)
+            gr.Markdown("### 返信の設定")
+            reply_enabled = gr.Checkbox(value=False, label="自動返信を有効にする")
+            reply_include_past = gr.Checkbox(
+                value=True,
+                label="過去の未返信コメントも対象にする（古いものから順に。オフにすると設定を初めて保存した後のコメントだけ）",
+            )
+            with gr.Row():
+                reply_daily_limit = gr.Number(value=youtube_auto_reply.DEFAULT_DAILY_LIMIT, precision=0,
+                                              minimum=1, maximum=youtube_auto_reply.MAX_DAILY_LIMIT,
+                                              label="1日の返信上限（件）")
+                reply_interval = gr.Number(value=youtube_auto_reply.DEFAULT_INTERVAL_MINUTES, precision=0,
+                                           minimum=youtube_auto_reply.MIN_INTERVAL_MINUTES,
+                                           label="確認の間隔（分）")
+            with gr.Row():
+                reply_save_btn = gr.Button("設定を保存", variant="primary")
+                reply_run_btn = gr.Button("今すぐ1回実行")
+                reply_refresh_btn = gr.Button("状態を更新")
+            gr.Markdown("### パソコンを起動していなくても返信する（GAS）")
+            gr.Markdown(
+                "「GASで動かす」を押すと、あなたのGoogleアカウントに返信用のスクリプト（Google Apps Script）を作り、"
+                "Googleのサーバー上で上と同じ設定のまま返信を続けます。返信には「返信用に連携」で選んだチャンネルの"
+                "ログインを使うため、ブランドアカウントのチャンネルでも動きます（先に「返信用に連携」を済ませてください）。"
+                "初回だけ、ブラウザでGoogleへのログインと許可を求められます（2回とも、ブランドアカウントではなく"
+                "管理している個人のGoogleアカウントを選びます）。"
+                "「Apps Script APIがオフ」と表示されたら、開いたページのスイッチを1回オンにしてから、もう一度押してください。"
+                "定型文や設定を変えると、GASにも自動で反映します。"
+            )
+            with gr.Row():
+                reply_gas_btn = gr.Button("GASで動かす（作成・更新）", variant="primary")
+                reply_gas_stop_btn = gr.Button("このパソコンで動かすに戻す")
+            reply_gas_md = gr.Markdown("")
+            gr.Markdown("### 直近の返信ログ（このパソコンで返信した分）")
+            reply_log_md = gr.Markdown("")
+
         with gr.Tab("設定"):
             gr.Markdown("### 見どころを選ぶAI")
             ai_status_md = gr.Markdown("")
@@ -800,6 +1041,25 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)
     auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
+    demo.load(reply_load_settings, outputs=[reply_enabled, reply_include_past, reply_daily_limit, reply_interval])
+    demo.load(reply_templates_view, outputs=[reply_templates_md, reply_remove_select])
+    demo.load(reply_status, outputs=[reply_status_md])
+    demo.load(reply_log_markdown, outputs=[reply_log_md])
+    reply_save_btn.click(reply_save_settings,
+                         inputs=[reply_enabled, reply_include_past, reply_daily_limit, reply_interval],
+                         outputs=[reply_status_md])
+    reply_add_btn.click(reply_add_template, inputs=[reply_new_template],
+                        outputs=[reply_status_md, reply_new_template, reply_templates_md, reply_remove_select])
+    reply_remove_btn.click(reply_remove_template, inputs=[reply_remove_select],
+                           outputs=[reply_status_md, reply_enabled, reply_templates_md, reply_remove_select])
+    reply_connect_btn.click(reply_connect, outputs=[reply_status_md], concurrency_id="youtube-account")
+    reply_disconnect_btn.click(reply_disconnect, outputs=[reply_status_md])
+    reply_gas_btn.click(reply_gas_enable, outputs=[reply_gas_md], concurrency_id="youtube-account").then(
+        reply_status, outputs=[reply_status_md])
+    reply_gas_stop_btn.click(reply_gas_stop, outputs=[reply_gas_md]).then(reply_status, outputs=[reply_status_md])
+    reply_run_btn.click(reply_run_now, outputs=[reply_status_md, reply_log_md], concurrency_id="youtube-reply")
+    reply_refresh_btn.click(lambda: (reply_status(), reply_log_markdown()),
+                            outputs=[reply_status_md, reply_log_md])
 
 
 def _port_in_use(port: int) -> bool:
@@ -871,6 +1131,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.browser or not _open_window(url):
             webbrowser.open(url)
         raise SystemExit(0)
+    _AUTO_REPLIER.start()
     if args.browser:
         demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True, css=APP_CSS)
         return

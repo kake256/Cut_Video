@@ -9,7 +9,7 @@ from unittest import mock
 
 from moment_retrieval import db, excitement, signals
 from moment_retrieval.highlight_analysis import (
-    _anchor_prompt, _boundary_label_prompt, _metadata_prompt, run_highlight_analysis,
+    _anchor_prompt, _boundary_label_prompt, _metadata_prompt, rank_by_excitement, run_highlight_analysis,
 )
 
 
@@ -187,6 +187,25 @@ class PromptTest(unittest.TestCase):
         self.assertEqual([row["excitement"] for row in rows], [1, 9])
 
 
+class RankTest(unittest.TestCase):
+    def test_sorted_by_peak_then_average_keeping_llm_order_on_ties(self):
+        profile = _level_profile([1, 1, 5, 2, 5, 5, 0, 0, 3, 3])
+        a = {"title": "a", "start_sec": 0.0, "end_sec": 20.0}    # peak 1
+        b = {"title": "b", "start_sec": 20.0, "end_sec": 30.0}   # peak 5, mean 5
+        c = {"title": "c", "start_sec": 80.0, "end_sec": 100.0}  # peak 3
+        d = {"title": "d", "start_sec": 30.0, "end_sec": 50.0}   # peak 5, mean 3.5
+        e = {"title": "e", "start_sec": 60.0, "end_sec": 80.0}   # peak 0
+        f = {"title": "f", "start_sec": 0.0, "end_sec": 20.0}    # same as a
+        ranked, order = rank_by_excitement([a, b, c, d, e, f], profile)
+        self.assertEqual([item["title"] for item in ranked], ["b", "d", "c", "a", "f", "e"])
+        self.assertEqual(order, [1, 3, 2, 0, 5, 4])
+
+    def test_without_profile_llm_order_is_kept(self):
+        items = [{"start_sec": 0.0, "end_sec": 1.0}, {"start_sec": 5.0, "end_sec": 6.0}]
+        self.assertEqual(rank_by_excitement(items, None), (items, [0, 1]))
+        self.assertEqual(rank_by_excitement(items, {"sources": [], "bins": []}), (items, [0, 1]))
+
+
 class _Provider:
     name = "synthetic-local"
 
@@ -243,6 +262,8 @@ class RunWithExcitementTest(unittest.TestCase):
         self.assertEqual(run["result"]["excitement"]["sources"], ["audio", "chat"])
         self.assertEqual(len(run["result"]["excitement"]["candidates"]), result["candidate_count"])
         self.assertTrue(run["result"]["excitement"]["candidates"][0].startswith("盛り上がり: 最大9/10"))
+        self.assertTrue(run["result"]["excitement"]["ranked_by_excitement"])
+        self.assertEqual(run["result"]["excitement"]["llm_rank"], [1])
         self.assertEqual(before, [tuple(r) for r in self.conn.execute(
             "SELECT segment_id, start_sec, end_sec, text FROM asr_segments")])
 

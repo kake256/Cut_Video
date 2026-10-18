@@ -184,7 +184,8 @@ def chapter_summary(profile: dict | None, start: float, end: float) -> dict | No
     chosen = _overlapping(profile, float(start), float(end))
     if not chosen:
         return None
-    summary = {"max_level": max(int(item["level"]) for item in chosen)}
+    summary = {"max_level": max(int(item["level"]) for item in chosen),
+               "mean_level": round(sum(int(item["level"]) for item in chosen) / len(chosen), 2)}
     if "chat" in profile["sources"]:
         window = float(profile.get("chat_window_bins") or 1.0)
         per_window = window * sum(int(item["chat"]) for item in chosen) / len(chosen)

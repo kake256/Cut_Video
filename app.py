@@ -4697,6 +4697,7 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             )
         excitement_info = result.get("excitement") or {}
         excitement_lines = list(excitement_info.get("candidates") or [])
+        llm_ranks = list(excitement_info.get("llm_rank") or [])
         if excitement_info:
             used = "と".join(
                 {"audio": "音量", "chat": "コメント"}.get(str(name), str(name))
@@ -4706,6 +4707,8 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 f"文字起こしに加えて、{html.escape(used)}から計算した盛り上がりを"
                 "AIに参考として渡した候補です。映像だけの出来事や表情は評価していません。"
             )
+            if excitement_info.get("ranked_by_excitement"):
+                basis += "候補は盛り上がりが高い順に並べています（同じ程度ならAIの順位のまま）。"
         else:
             basis = (
                 "文字起こしだけを使った候補です。映像だけの出来事、表情、"
@@ -4773,8 +4776,12 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
             if reason:
                 parts.append(f"<li>選定理由: {reason}</li>")
             if ordinal <= len(excitement_lines) and excitement_lines[ordinal - 1]:
+                llm_rank = (
+                    f"（AIの順位: {int(llm_ranks[ordinal - 1])}位）"
+                    if ordinal <= len(llm_ranks) else ""
+                )
                 parts.append(
-                    f"<li>{html.escape(str(excitement_lines[ordinal - 1]))}</li>"
+                    f"<li>{html.escape(str(excitement_lines[ordinal - 1]))}{llm_rank}</li>"
                 )
             if tags:
                 parts.append(f"<li>タグ: {tags}</li>")

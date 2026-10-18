@@ -618,6 +618,26 @@ def suppress_overlaps(candidates: Sequence[dict], *, threshold: float = OVERLAP_
     return kept, suppressed
 
 
+def rank_by_excitement(candidates: Sequence[dict], excitement: dict | None) -> tuple[list[dict], list[int]]:
+    """Order candidates by excitement (peak level, then average level).
+
+    The sort is stable, so candidates with the same excitement keep the LLM's
+    order.  Returns the new list and, for each new position, its LLM index.
+    Without excitement data the LLM order is kept.
+    """
+    indexed = list(enumerate(candidates))
+    if not excitement or not excitement.get("sources"):
+        return [c for _i, c in indexed], [i for i, _c in indexed]
+
+    def key(item: tuple[int, dict]) -> tuple[int, float]:
+        summary = excitement_scores.chapter_summary(
+            excitement, float(item[1]["start_sec"]), float(item[1]["end_sec"])) or {}
+        return (-int(summary.get("max_level", 0)), -round(float(summary.get("mean_level", 0.0)), 1))
+
+    ranked = sorted(indexed, key=key)
+    return [c for _i, c in ranked], [i for i, _c in ranked]
+
+
 def build_query_highlight_candidates(
     segments: Sequence[dict],
     chapters: Sequence[dict],
@@ -853,6 +873,9 @@ def run_highlight_analysis(conn, video_id: str, revision: str, analysis_run_id: 
             })
         candidates, suppressed = suppress_overlaps(candidates)
         candidates = candidates[:requested_count]
+        llm_order = list(range(len(candidates)))
+        if excitement:
+            candidates, llm_order = rank_by_excitement(candidates, excitement)
         durations = [c["end_sec"] - c["start_sec"] for c in candidates]
         result = {"requested_count": requested_count, "candidate_count": len(candidates), "source_chapter_count": len(chapters),
                   "invalid_segment_count": len(source_segments) - len(segments),
@@ -873,6 +896,8 @@ def run_highlight_analysis(conn, video_id: str, revision: str, analysis_run_id: 
             result["excitement"] = {
                 "sources": list(excitement["sources"]),
                 "candidates": [_chapter_excitement(excitement, c) for c in candidates],
+                "ranked_by_excitement": True,
+                "llm_rank": [index + 1 for index in llm_order],
             }
         db.replace_highlight_candidates(conn, run_id, candidates, commit=False)
         db.update_highlight_run(conn, run_id, status="ready", result=result, commit=False)

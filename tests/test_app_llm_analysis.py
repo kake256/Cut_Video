@@ -780,6 +780,8 @@ class AppLlmAnalysisTest(unittest.TestCase):
                 "excitement": {
                     "sources": ["audio", "chat"],
                     "candidates": ["盛り上がり: 最大8/10, コメント2.5倍, 笑い多め"],
+                    "ranked_by_excitement": True,
+                    "llm_rank": [3],
                 },
             },
         }
@@ -808,7 +810,8 @@ class AppLlmAnalysisTest(unittest.TestCase):
         ):
             rendered, _choices = app._latest_highlight_view("synthetic")
 
-        self.assertIn("<li>盛り上がり: 最大8/10, コメント2.5倍, 笑い多め</li>", rendered)
+        self.assertIn("<li>盛り上がり: 最大8/10, コメント2.5倍, 笑い多め（AIの順位: 3位）</li>", rendered)
+        self.assertIn("盛り上がりが高い順に並べています", rendered)
         self.assertIn("音量とコメントから計算した盛り上がり", rendered)
         self.assertNotIn("文字起こしだけを使った候補です", rendered)
 

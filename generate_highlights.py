@@ -65,6 +65,20 @@ def main() -> None:
         print(f"見どころ候補の生成に失敗しました: {exc}", file=sys.stderr)
         raise SystemExit(1)
     print(f"見どころ候補を生成しました: candidates={result['candidate_count']} requested={result['requested_count']}")
+    excitement_info = result.get("excitement") or {}
+    lines = excitement_info.get("candidates") or []
+    llm_ranks = excitement_info.get("llm_rank") or []
+    if excitement_info.get("ranked_by_excitement"):
+        print("盛り上がりが高い順に並べています（同じ程度ならAIの順位のまま）:")
+    for index, candidate in enumerate(result.get("candidates") or []):
+        start, end = int(candidate["start_sec"]), int(candidate["end_sec"])
+        detail = " | ".join(item for item in (
+            lines[index] if index < len(lines) else "",
+            f"AIの順位: {llm_ranks[index]}位" if index < len(llm_ranks) else "",
+        ) if item)
+        print(f"  {index + 1}. {start // 3600:02d}:{start % 3600 // 60:02d}:{start % 60:02d}-"
+              f"{end // 3600:02d}:{end % 3600 // 60:02d}:{end % 60:02d} {candidate['title']}"
+              + (f" | {detail}" if detail else ""))
 
 
 if __name__ == "__main__":

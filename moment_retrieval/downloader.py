@@ -19,6 +19,8 @@ class DownloadError(Exception):
 
 # 進捗メッセージをyieldする最短間隔 (秒)。フックは毎秒何回も発火するため間引く。
 PROGRESS_INTERVAL_SEC = 2.0
+# HLS/DASHの断片を同時に取得する数 (yt-dlpの -N)。
+CONCURRENT_FRAGMENTS = 8
 
 
 def _progress_message(d: dict) -> Optional[str]:
@@ -117,6 +119,9 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
         "outtmpl": str(save_dir / f"{basename}.%(ext)s"),
         "noplaylist": True,
         "retries": 21,
+        # Twitch VODs and many streams are HLS fragments; fetching several at
+        # once is much faster than one by one.
+        "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
         "progress_hooks": [_hook],
     }
 

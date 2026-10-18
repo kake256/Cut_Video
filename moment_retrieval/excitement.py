@@ -25,18 +25,23 @@ from typing import Callable, Sequence
 
 from . import db, signals
 
-VERSION = 1
+VERSION = 2
 BIN_SEC = 10.0
 CHAT_LAG_SEC = 5.0  # chat reacts a few seconds after what happened on stream
 ACTIVE_DB = -50.0  # bins quieter than this are silence, not part of the baseline
 AUDIO_FULL_Z = 4.0  # robust z-score that counts as maximum audio excitement
 CHAT_FULL_RATIO = 4.0  # chat at 4x the usual rate counts as maximum
 LAUGH_FULL_RATIO = 4.0
+# Chat is counted over a bin plus half of each neighbour (about 20 s), and the
+# usual rate has a floor, so 3-4 messages on a quiet chat are not a "burst".
+CHAT_WINDOW_BINS = 2.0
+CHAT_MIN_BASELINE = 3.0  # messages per window
+LAUGH_MIN_BASELINE = 1.0
 CHAT_NOTE_RATIO = 1.3  # chapter lines mention chat only from this multiple up
 LAUGH_NOTE_RATIO = 1.5
 
 _LAUGH = re.compile(
-    r"(?:^|[^a-zA-Zａ-ｚＡ-Ｚ])[wWｗＷ]{1,}(?:$|[^a-zA-Zａ-ｚＡ-Ｚ])|草|笑|lol|lmao|kekw|lul|omegalul|ｗ",
+    r"(?:^|[^a-zA-Zａ-ｚＡ-Ｚ])[wWｗＷ]{1,}(?:$|[^a-zA-Zａ-ｚＡ-Ｚ])|草|笑|lol|lmao|kekw|lul|omegalul|ｗ|ハハハ|ははは|ﾊﾊﾊ|ワロ|わろ|ﾜﾛ|^くさ+$",
     re.IGNORECASE,
 )
 
@@ -65,6 +70,12 @@ def _audio_scores(peaks: Sequence[float]) -> list[float]:
     spread = 1.4826 * statistics.median(abs(value - median) for value in active)
     spread = max(spread, 1.5)  # flat audio must not turn 1 dB wiggles into excitement
     return [(value - median) / spread if value > ACTIVE_DB else 0.0 for value in peaks]
+
+
+def _windowed(counts: Sequence[int]) -> list[float]:
+    """Each bin plus half of each neighbour (``CHAT_WINDOW_BINS`` bins' worth)."""
+    return [counts[i] + 0.5 * ((counts[i - 1] if i else 0) + (counts[i + 1] if i + 1 < len(counts) else 0))
+            for i in range(len(counts))]
 
 
 def compute_profile(audio: dict | None, chat: dict | None, *, duration_sec: float | None = None,
@@ -98,14 +109,17 @@ def compute_profile(audio: dict | None, chat: dict | None, *, duration_sec: floa
             laugh_counts[index] += is_laugh(text)
     has_chat = bool(shifted)
     audio_z = _audio_scores(peaks) + [0.0] * (count - len(peaks))
-    chat_baseline = max(statistics.median(chat_counts), 1.0) if has_chat and count else 1.0
-    laugh_baseline = max(sum(laugh_counts) / count, 0.5) if has_chat and count else 0.5
+    chat_window = _windowed(chat_counts)
+    laugh_window = _windowed(laugh_counts)
+    chat_baseline = max(statistics.median(chat_window), CHAT_MIN_BASELINE) if has_chat and count else CHAT_MIN_BASELINE
+    laugh_baseline = (max(sum(laugh_window) / count, LAUGH_MIN_BASELINE) if has_chat and count
+                      else LAUGH_MIN_BASELINE)
     bins = []
     for index in range(count):
         parts = [_clamp(audio_z[index] / AUDIO_FULL_Z)] if peaks else []
         if has_chat:
-            chat_ratio = chat_counts[index] / chat_baseline
-            laugh_ratio = laugh_counts[index] / laugh_baseline
+            chat_ratio = chat_window[index] / chat_baseline
+            laugh_ratio = laugh_window[index] / laugh_baseline
             chat_part = _clamp(math.log2(max(chat_ratio, 1.0)) / math.log2(CHAT_FULL_RATIO))
             laugh_part = _clamp(math.log2(max(laugh_ratio, 1.0)) / math.log2(LAUGH_FULL_RATIO))
             parts += [chat_part, laugh_part]
@@ -121,7 +135,7 @@ def compute_profile(audio: dict | None, chat: dict | None, *, duration_sec: floa
         bins.append({"t": round(index * bin_sec, 1), "level": int(round(10 * combined)),
                      "audio_z": round(audio_z[index], 2), "chat": chat_counts[index],
                      "laugh": laugh_counts[index]})
-    return {"bin_sec": bin_sec, "chat_lag_sec": chat_lag_sec,
+    return {"bin_sec": bin_sec, "chat_lag_sec": chat_lag_sec, "chat_window_bins": CHAT_WINDOW_BINS,
             "sources": (["audio"] if peaks else []) + (["chat"] if has_chat else []),
             "chat_baseline": chat_baseline, "laugh_baseline": laugh_baseline, "bins": bins}
 
@@ -148,10 +162,11 @@ def chapter_summary(profile: dict | None, start: float, end: float) -> dict | No
         return None
     summary = {"max_level": max(int(item["level"]) for item in chosen)}
     if "chat" in profile["sources"]:
-        per_bin = sum(int(item["chat"]) for item in chosen) / len(chosen)
-        laughs = sum(int(item["laugh"]) for item in chosen) / len(chosen)
-        summary["chat_ratio"] = round(per_bin / float(profile.get("chat_baseline") or 1.0), 1)
-        summary["laugh_ratio"] = round(laughs / float(profile.get("laugh_baseline") or 0.5), 1)
+        window = float(profile.get("chat_window_bins") or 1.0)
+        per_window = window * sum(int(item["chat"]) for item in chosen) / len(chosen)
+        laughs = window * sum(int(item["laugh"]) for item in chosen) / len(chosen)
+        summary["chat_ratio"] = round(per_window / float(profile.get("chat_baseline") or 1.0), 1)
+        summary["laugh_ratio"] = round(laughs / float(profile.get("laugh_baseline") or 1.0), 1)
     return summary
 
 

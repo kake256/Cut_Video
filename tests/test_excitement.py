@@ -40,7 +40,7 @@ class ProfileTest(unittest.TestCase):
         messages += [[305.0 + i * 0.1, "ｗｗｗ"] for i in range(20)]  # reaction to ~300 s
         profile = excitement.compute_profile(None, {"messages": messages}, duration_sec=600)
         self.assertEqual(profile["sources"], ["chat"])
-        top = max(profile["bins"], key=lambda item: item["level"])
+        top = max(profile["bins"], key=lambda item: (item["level"], item["chat"]))
         self.assertEqual(top["t"], 300.0)  # 305 s minus the 5 s lag
         self.assertGreaterEqual(top["level"], 9)
         self.assertEqual(top["laugh"], 20)
@@ -50,16 +50,22 @@ class ProfileTest(unittest.TestCase):
         self.assertIn("コメント", line)
         self.assertIn("笑い多め", line)
 
+    def test_a_few_messages_on_a_quiet_chat_are_not_a_burst(self):
+        messages = [[float(t), "こん"] for t in range(0, 3600, 120)]  # sparse chat
+        messages += [[1005.0, "は？"], [1006.0, "どゆこと"], [1007.0, "えぇ"]]
+        profile = excitement.compute_profile(None, {"messages": messages}, duration_sec=3600)
+        self.assertLessEqual(max(item["level"] for item in profile["bins"]), 3)
+
     def test_chat_offset_is_respected(self):
         messages = [[t + 100.0, "x"] for t in range(0, 600, 10)] + [[405.0, "草"]] * 10
         profile = excitement.compute_profile(None, {"messages": messages, "offset_sec": 100.0}, duration_sec=600)
-        top = max(profile["bins"], key=lambda item: item["level"])
+        top = max(profile["bins"], key=lambda item: (item["level"], item["chat"]))
         self.assertEqual(top["t"], 300.0)
 
     def test_laugh_detection(self):
-        for text in ("www", "ｗｗｗ", "草", "笑った", "lol", "それはw"):
+        for text in ("www", "ｗｗｗ", "草", "笑った", "lol", "それはw", "ハハハハ", "ワロタ", "くさ"):
             self.assertTrue(excitement.is_laugh(text), text)
-        for text in ("wow", "おはよう", "new"):
+        for text in ("wow", "おはよう", "new", "くさい"):
             self.assertFalse(excitement.is_laugh(text), text)
 
     def test_no_signals_means_no_levels(self):

@@ -25,10 +25,11 @@ from typing import Callable, Sequence
 
 from . import db, signals
 
-VERSION = 2
+VERSION = 3
 BIN_SEC = 10.0
 CHAT_LAG_SEC = 5.0  # chat reacts a few seconds after what happened on stream
 ACTIVE_DB = -50.0  # bins quieter than this are silence, not part of the baseline
+AUDIO_DEADZONE_Z = 1.0  # ordinary ups and downs of the talk score 0
 AUDIO_FULL_Z = 4.0  # robust z-score that counts as maximum audio excitement
 CHAT_FULL_RATIO = 4.0  # chat at 4x the usual rate counts as maximum
 LAUGH_FULL_RATIO = 4.0
@@ -44,6 +45,27 @@ _LAUGH = re.compile(
     r"(?:^|[^a-zA-Zａ-ｚＡ-Ｚ])[wWｗＷ]{1,}(?:$|[^a-zA-Zａ-ｚＡ-Ｚ])|草|笑|lol|lmao|kekw|lul|omegalul|ｗ|ハハハ|ははは|ﾊﾊﾊ|ワロ|わろ|ﾜﾛ|^くさ+$",
     re.IGNORECASE,
 )
+
+
+# Greetings and farewells ("こん", "わこつ", "おつ") are habits, not reactions.
+_GREETING = re.compile(
+    r"^\W*(?:こん(?:ばん|にち|ちゃ|ち)?(?:は|わ|です)?|こんばん|こんにちは|おは(?:よう)?|わこつ|初見|はじめまして"
+    r"|hi|hello|hey|yo|おつ(?:かれ)?|乙|お疲れ(?:様|さま)?(?:です)?|おやすみ|ばいばい|またね|ノシ)"
+    r"[\W_ー〜~！!。.wｗ]*$",
+    re.IGNORECASE,
+)
+
+
+# "きた" means "I'm here" at the start of a stream but can be hype later on.
+_ARRIVAL = re.compile(r"^\W*(?:きた+|来た+|キタ+)[\W_ー〜~！!。.wｗあぁアァ]*$")
+OPENING_SEC = 300.0
+
+
+def is_greeting(text: str, at: float | None = None) -> bool:
+    text = " ".join(str(text or "").split())
+    if _GREETING.match(text):
+        return True
+    return at is not None and at < OPENING_SEC and bool(_ARRIVAL.match(text))
 
 
 def is_laugh(text: str) -> bool:
@@ -93,8 +115,9 @@ def compute_profile(audio: dict | None, chat: dict | None, *, duration_sec: floa
             at = float(item[0]) - offset - chat_lag_sec
         except (TypeError, ValueError):
             continue
-        if at >= -chat_lag_sec:
-            shifted.append((max(0.0, at), str(item[1]) if len(item) > 1 else ""))
+        text = str(item[1]) if len(item) > 1 else ""
+        if at >= -chat_lag_sec and not is_greeting(text, at):
+            shifted.append((max(0.0, at), text))
     count = len(peaks)
     if duration_sec:
         count = max(count, int(math.ceil(float(duration_sec) / bin_sec)))
@@ -116,7 +139,8 @@ def compute_profile(audio: dict | None, chat: dict | None, *, duration_sec: floa
                       else LAUGH_MIN_BASELINE)
     bins = []
     for index in range(count):
-        parts = [_clamp(audio_z[index] / AUDIO_FULL_Z)] if peaks else []
+        parts = ([_clamp((audio_z[index] - AUDIO_DEADZONE_Z) / (AUDIO_FULL_Z - AUDIO_DEADZONE_Z))]
+                 if peaks else [])
         if has_chat:
             chat_ratio = chat_window[index] / chat_baseline
             laugh_ratio = laugh_window[index] / laugh_baseline

@@ -62,6 +62,25 @@ class ProfileTest(unittest.TestCase):
         top = max(profile["bins"], key=lambda item: (item["level"], item["chat"]))
         self.assertEqual(top["t"], 300.0)
 
+    def test_ordinary_loudness_changes_score_zero(self):
+        # talk that drifts by a few dB (z around 1) must not give 1-2 point noise
+        levels = [-30 + (second // 10 % 4) for second in range(600)]
+        profile = excitement.compute_profile(_profile(levels), None)
+        self.assertEqual(max(item["level"] for item in profile["bins"]), 0)
+
+    def test_greetings_are_not_excitement(self):
+        messages = [[float(t), "なるほど"] for t in range(0, 900, 30)]
+        messages += [[20.0 + i, "こんばんは"] for i in range(15)]  # stream opening
+        messages += [[25.0 + i * 0.3, "きた"] for i in range(10)]
+        messages += [[600.0 + i * 0.3, "おつ"] for i in range(10)]
+        profile = excitement.compute_profile(None, {"messages": messages}, duration_sec=900)
+        self.assertLessEqual(max(item["level"] for item in profile["bins"]), 1)
+        self.assertTrue(excitement.is_greeting("こん！"))
+        self.assertTrue(excitement.is_greeting("わこつ"))
+        self.assertTrue(excitement.is_greeting("きたあああ", 30))
+        self.assertFalse(excitement.is_greeting("きたあああ", 3000))  # hype later in the stream
+        self.assertFalse(excitement.is_greeting("こんなのありえない"))
+
     def test_laugh_detection(self):
         for text in ("www", "ｗｗｗ", "草", "笑った", "lol", "それはw", "ハハハハ", "ワロタ", "くさ"):
             self.assertTrue(excitement.is_laugh(text), text)

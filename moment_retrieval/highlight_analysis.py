@@ -25,6 +25,7 @@ CONTEXT_BACK_SEC = 8.0
 CONTEXT_FORWARD_SEC = 12.0
 NATURAL_GAP_SEC = 1.0
 OVERLAP_THRESHOLD = 0.30
+MAX_OVERLAP_SEC = 20.0  # sharing this much of the same scene is a duplicate whatever the ratio
 QUERY_PROMPT_VERSION = "query-highlights-v1"
 EXCITEMENT_PROMPT_SUFFIX = "+excitement-v1"
 EXCITEMENT_NOTE = (
@@ -588,17 +589,29 @@ def fit_boundary(segments: Sequence[dict], anchor_start_segment_id: int, anchor_
     return fitted
 
 
-def suppress_overlaps(candidates: Sequence[dict], *, threshold: float = OVERLAP_THRESHOLD) -> tuple[list[dict], int]:
+def suppress_overlaps(candidates: Sequence[dict], *, threshold: float = OVERLAP_THRESHOLD,
+                      max_overlap_sec: float = MAX_OVERLAP_SEC) -> tuple[list[dict], int]:
+    """Drop later candidates that repeat an earlier (higher-ranked) one.
+
+    A candidate is a duplicate when the shared part is ``threshold`` of the
+    shorter one, or at least ``max_overlap_sec`` long (two long clips can share
+    the same scene while staying under the ratio).
+    """
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("overlap threshold must be between 0 and 1")
     kept: list[dict] = []
     suppressed = 0
+
+    def duplicate(start: float, end: float, other: dict) -> bool:
+        other_start, other_end = float(other["start_sec"]), float(other["end_sec"])
+        shared = max(0.0, min(end, other_end) - max(start, other_start))
+        return shared >= max_overlap_sec or shared / min(end - start, other_end - other_start) >= threshold
+
     for candidate in candidates:
         start, end = float(candidate["start_sec"]), float(candidate["end_sec"])
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             raise AnalysisValidationError("candidate has an invalid time range")
-        if any(max(0.0, min(end, float(k["end_sec"])) - max(start, float(k["start_sec"]))) /
-               min(end - start, float(k["end_sec"]) - float(k["start_sec"])) >= threshold for k in kept):
+        if any(duplicate(start, end, k) for k in kept):
             suppressed += 1
         else:
             kept.append(candidate)

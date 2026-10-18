@@ -34,6 +34,12 @@ class AgentError(RuntimeError):
     pass
 
 
+_LOGIN_PROBLEM = re.compile(
+    r"not logged in|please run /login|failed to authenticate|session expired|invalid api key|log ?in again",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class ClipRequest:
     video_id: str
@@ -207,5 +213,10 @@ def run_agent(
     if code != 0:
         # The CLI's own last words (e.g. an expired login) tell the user what to fix.
         detail = " / ".join(lines[-3:])[-300:]
+        if _LOGIN_PROBLEM.search(detail):
+            raise AgentError(
+                f"{AGENT_LABELS.get(agent, agent)} のログインが切れています。設定タブのボタンでログインし直してください"
+                f"（{detail}）"
+            )
         raise AgentError(f"{AGENT_LABELS.get(agent, agent)} が異常終了しました（exit {code}）: {detail}")
     return "\n".join(lines)

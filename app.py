@@ -4695,13 +4695,28 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 "<li>Codexのメモ: "
                 f"{html.escape(str(result['note']))}</li>"
             )
+        excitement_info = result.get("excitement") or {}
+        excitement_lines = list(excitement_info.get("candidates") or [])
+        if excitement_info:
+            used = "と".join(
+                {"audio": "音量", "chat": "コメント"}.get(str(name), str(name))
+                for name in excitement_info.get("sources") or []
+            )
+            basis = (
+                f"文字起こしに加えて、{html.escape(used)}から計算した盛り上がりを"
+                "AIに参考として渡した候補です。映像だけの出来事や表情は評価していません。"
+            )
+        else:
+            basis = (
+                "文字起こしだけを使った候補です。映像だけの出来事、表情、"
+                "音の盛り上がりは評価していません。"
+            )
         parts = [
             '<div class="highlight-candidate-view">',
             *notices,
             '<section class="highlight-candidate-quality">',
             "<h3>見どころ候補</h3>",
-            "<p>文字起こしだけを使った候補です。映像だけの出来事、表情、"
-            "音の盛り上がりは評価していません。必ずプレビューで確認してください。</p>",
+            f"<p>{basis}必ずプレビューで確認してください。</p>",
             "<details><summary>生成品質を表示</summary><ul>",
             f"<li>生成方式: <strong>{generation_description}</strong></li>",
             query_html,
@@ -4757,6 +4772,10 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 parts.append(f"<li>内容: {summary}</li>")
             if reason:
                 parts.append(f"<li>選定理由: {reason}</li>")
+            if ordinal <= len(excitement_lines) and excitement_lines[ordinal - 1]:
+                parts.append(
+                    f"<li>{html.escape(str(excitement_lines[ordinal - 1]))}</li>"
+                )
             if tags:
                 parts.append(f"<li>タグ: {tags}</li>")
             if candidate.get("boundary_warning"):

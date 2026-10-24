@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -205,6 +205,17 @@ CREATE TABLE IF NOT EXISTS highlight_candidates (
 );
 CREATE INDEX IF NOT EXISTS idx_highlight_candidates_run
 ON highlight_candidates(highlight_run_id, ordinal);
+
+-- Per-time-bin excitement levels (0-10) computed by the app from the audio
+-- loudness profile and stream chat.  Derived, recomputable data keyed by the
+-- inputs it was built from.  It never touches ASR rows or the search index.
+CREATE TABLE IF NOT EXISTS excitement_profiles (
+    video_id TEXT PRIMARY KEY REFERENCES videos(video_id),
+    version INTEGER NOT NULL,
+    inputs_json TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
 
 -- Canonical public YouTube URL of a file CUT downloaded (sender side).
 CREATE TABLE IF NOT EXISTS downloaded_sources (
@@ -1167,6 +1178,32 @@ def replace_highlight_candidates(
         conn.commit()
 
 
+def get_excitement_profile(conn: sqlite3.Connection, video_id: str) -> dict | None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    row = conn.execute(
+        "SELECT version, inputs_json, profile_json FROM excitement_profiles WHERE video_id = ?",
+        (storage_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"version": int(row[0]), "inputs": json.loads(row[1]), "profile": json.loads(row[2])}
+
+
+def save_excitement_profile(
+    conn: sqlite3.Connection, video_id: str, *, version: int, inputs: dict, profile: dict,
+    commit: bool = True,
+) -> None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    conn.execute(
+        "INSERT OR REPLACE INTO excitement_profiles(video_id, version, inputs_json, profile_json, updated_at) "
+        "VALUES(?, ?, ?, ?, datetime('now'))",
+        (storage_id, int(version), json.dumps(inputs, ensure_ascii=False, sort_keys=True),
+         json.dumps(profile, ensure_ascii=False, separators=(",", ":"))),
+    )
+    if commit:
+        conn.commit()
+
+
 def get_highlight_run(conn: sqlite3.Connection, highlight_run_id: str) -> dict | None:
     row = conn.execute("SELECT * FROM highlight_runs WHERE highlight_run_id = ?", (highlight_run_id,)).fetchone()
     if row is None:
@@ -1328,6 +1365,7 @@ def delete_video(conn: sqlite3.Connection, video_id: str) -> None:
     public_id = public_video_id(conn, storage_id)
     conn.execute("DELETE FROM text_chunks WHERE video_id = ?", (storage_id,))
     conn.execute("DELETE FROM asr_segments WHERE video_id = ?", (storage_id,))
+    conn.execute("DELETE FROM excitement_profiles WHERE video_id = ?", (storage_id,))
     conn.execute("DELETE FROM legacy_video_aliases WHERE public_video_id = ?", (public_id,))
     conn.execute("DELETE FROM active_transcripts WHERE public_video_id = ?", (public_id,))
     conn.execute("DELETE FROM sources WHERE public_video_id = ?", (public_id,))

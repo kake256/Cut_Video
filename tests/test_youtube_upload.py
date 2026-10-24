@@ -205,7 +205,7 @@ class AutoPublishAppTest(unittest.TestCase):
 
         pipeline = SimpleNamespace(submit=Mock(return_value=SimpleNamespace(job_id="auto_x")))
         common = ("codex", "gpt-6-luna", 1, "high", 20, 60, "blur", False)
-        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline),                 patch.object(auto_publish_app, "_require_agent_ready"), \
                 patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", None, None)), \
                 patch.object(auto_publish_app.gr, "Info"):
             auto_publish_app.auto_submit("library", "https://youtu.be/abcDEF12345", ["vid_a"], *common)

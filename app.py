@@ -4251,6 +4251,7 @@ def do_index(
         raise gr.Error("別のインデックス処理が実行中です。完了までお待ちください。")
 
     log_lines = ["インデックス処理を開始します。ASRモデルの初回ロードには数分かかることがあります。"]
+    video_download = None  # full video fetched in the background while the audio is indexed
     try:
         yield "\n".join(log_lines), gr.update()
 
@@ -4259,19 +4260,33 @@ def do_index(
             yield "\n".join(log_lines), gr.update()
             try:
                 local_path = None
-                for msg, path in download_video(video_path):
-                    # 進捗行(ダウンロード中...)は追記せず最終行を置き換える
-                    if (
-                        msg.startswith("  ダウンロード中")
-                        and log_lines
-                        and log_lines[-1].startswith("  ダウンロード中")
-                    ):
-                        log_lines[-1] = msg
-                    else:
-                        log_lines.append(msg)
-                    yield "\n".join(log_lines), gr.update()
-                    if path is not None:
-                        local_path = path
+                from moment_retrieval import audio_first
+
+                if audio_first.should_use(video_path):
+                    # 音声だけを先に取得して文字起こしを始め、動画は並行してダウンロードする
+                    try:
+                        for text, path in _follow_download(
+                            download_video(video_path, audio_only=True), log_lines
+                        ):
+                            yield text, gr.update()
+                            local_path = path or local_path
+                    except DownloadError as audio_error:
+                        log_lines.append(
+                            f"音声だけの先行取得はできませんでした（{audio_error}）。動画をダウンロードします。"
+                        )
+                        yield "\n".join(log_lines), gr.update()
+                    if local_path is not None and audio_first.is_audio_proxy(local_path):
+                        video_download = audio_first.VideoDownload(
+                            video_path, Path(local_path).parent
+                        ).start()
+                        log_lines.append(
+                            "音声を先に取得しました。文字起こしと並行して、動画をダウンロードします。"
+                        )
+                        yield "\n".join(log_lines), gr.update()
+                if local_path is None:
+                    for text, path in _follow_download(download_video(video_path), log_lines):
+                        yield text, gr.update()
+                        local_path = path or local_path
                 if local_path is None:
                     log_lines.append("エラー: ダウンロードに失敗しました(ファイルパスを取得できませんでした)。")
                     yield "\n".join(log_lines), gr.update()
@@ -4347,6 +4362,25 @@ def do_index(
             yield "\n".join(log_lines), gr.update()
         code = proc.wait()
         INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+        if code == 0 and video_download is not None:
+            log_lines.append("文字起こしが終わりました。動画のダウンロードを待っています（切り抜きには映像が必要です）。")
+            log_lines.append("  動画: ダウンロードを準備しています。")
+            yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+            try:
+                for message in _wait_video_download(video_download):
+                    if _index_state["stopped"]:
+                        video_download.cancel()
+                    log_lines[-1] = f"  動画: {message.strip()}"
+                    yield "\n".join(log_lines), gr.update()
+                swapped = _swap_audio_to_video(Path(str(video_path)), video_download.path)
+                log_lines[-1] = f"  動画のダウンロードが完了し、音声から動画に差し替えました: {swapped}"
+            except Exception as exc:
+                code = 1
+                log_lines.append(
+                    f"エラー: 動画のダウンロード・差し替えに失敗しました（{exc}）。文字起こしは保存済みです。"
+                    "同じURLでもう一度追加すると、動画だけ取得して差し替えます。"
+                )
+            video_download = None
         if code == 0:
             gr.Info("インデックス作成が完了しました。")
             yield "\n".join(log_lines), gr.update(choices=list_video_choices())
@@ -4360,8 +4394,49 @@ def do_index(
             log_lines.append(f"エラー: インデックス処理が異常終了しました (exit code {code})")
             yield "\n".join(log_lines), gr.update()
     finally:
+        if video_download is not None:  # stopped or failed: do not leave it running
+            video_download.cancel()
         _index_state["proc"] = None
         _index_lock.release()
+
+
+def _follow_download(downloads, log_lines: list[str]):
+    """Mirror download progress into the log: yields (log text, finished path or None)."""
+    for msg, path in downloads:
+        # 進捗行(ダウンロード中...)は追記せず最終行を置き換える
+        if msg.startswith("  ダウンロード中") and log_lines and log_lines[-1].startswith("  ダウンロード中"):
+            log_lines[-1] = msg
+        else:
+            log_lines.append(msg)
+        yield "\n".join(log_lines), path
+
+
+def _wait_video_download(download, interval: float = 2.0):
+    """Yield the progress of a background video download until it ends (errors re-raised)."""
+    import time
+
+    last = None
+    while not download.done:
+        if download.message != last:
+            last = download.message
+            yield last
+        time.sleep(interval)
+    download.wait()
+
+
+def _swap_audio_to_video(audio_path: Path, video_file) -> str:
+    from moment_retrieval import audio_first
+
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        video = db.find_video_by_path(conn, str(Path(audio_path).resolve()))
+    finally:
+        conn.close()
+    if video is None:
+        raise RuntimeError("音声で登録した動画がライブラリに見つかりません")
+    audio_first.swap_to_video(str(video["video_id"]), Path(video_file))
+    return Path(video_file).name
 
 
 def format_latest_llm_analysis(video_choice: str) -> str:
@@ -4695,13 +4770,31 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 "<li>Codexのメモ: "
                 f"{html.escape(str(result['note']))}</li>"
             )
+        excitement_info = result.get("excitement") or {}
+        excitement_lines = list(excitement_info.get("candidates") or [])
+        llm_ranks = list(excitement_info.get("llm_rank") or [])
+        if excitement_info:
+            used = "と".join(
+                {"audio": "音量", "chat": "コメント"}.get(str(name), str(name))
+                for name in excitement_info.get("sources") or []
+            )
+            basis = (
+                f"文字起こしに加えて、{html.escape(used)}から計算した盛り上がりを"
+                "AIに参考として渡した候補です。映像だけの出来事や表情は評価していません。"
+            )
+            if excitement_info.get("ranked_by_excitement"):
+                basis += "候補は盛り上がりが高い順に並べています（同じ程度ならAIの順位のまま）。"
+        else:
+            basis = (
+                "文字起こしだけを使った候補です。映像だけの出来事、表情、"
+                "音の盛り上がりは評価していません。"
+            )
         parts = [
             '<div class="highlight-candidate-view">',
             *notices,
             '<section class="highlight-candidate-quality">',
             "<h3>見どころ候補</h3>",
-            "<p>文字起こしだけを使った候補です。映像だけの出来事、表情、"
-            "音の盛り上がりは評価していません。必ずプレビューで確認してください。</p>",
+            f"<p>{basis}必ずプレビューで確認してください。</p>",
             "<details><summary>生成品質を表示</summary><ul>",
             f"<li>生成方式: <strong>{generation_description}</strong></li>",
             query_html,
@@ -4757,6 +4850,14 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 parts.append(f"<li>内容: {summary}</li>")
             if reason:
                 parts.append(f"<li>選定理由: {reason}</li>")
+            if ordinal <= len(excitement_lines) and excitement_lines[ordinal - 1]:
+                llm_rank = (
+                    f"（AIの順位: {int(llm_ranks[ordinal - 1])}位）"
+                    if ordinal <= len(llm_ranks) else ""
+                )
+                parts.append(
+                    f"<li>{html.escape(str(excitement_lines[ordinal - 1]))}{llm_rank}</li>"
+                )
             if tags:
                 parts.append(f"<li>タグ: {tags}</li>")
             if candidate.get("boundary_warning"):

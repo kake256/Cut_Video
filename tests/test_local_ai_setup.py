@@ -8,6 +8,22 @@ from unittest.mock import patch
 from moment_retrieval import ai_setup, local_selector
 
 
+def _inner(command_line):
+    """The command a console was started with (``cmd /s /k "<command>"``)."""
+    prefix = 'cmd /s /k "'
+    assert isinstance(command_line, str), command_line
+    assert command_line.startswith(prefix) and command_line.endswith('"'), command_line
+    return command_line[len(prefix):-1]
+
+
+class ConsoleQuotingTest(unittest.TestCase):
+    def test_quoted_paths_reach_cmd_unescaped(self):
+        # A list argument made Python write \"...\" which cmd.exe rejects.
+        line = ai_setup.console_command_line(r'"C:\Users\a b\AppData\Roaming\npm\claude.CMD" auth login')
+        self.assertEqual(line, r'cmd /s /k ""C:\Users\a b\AppData\Roaming\npm\claude.CMD" auth login"')
+        self.assertNotIn('\\"', line)
+
+
 class AiSetupTest(unittest.TestCase):
     def test_status_reads_cli_login_state(self):
         with patch.object(ai_setup.agent_runner, "find_executable", return_value="codex.exe"):
@@ -35,20 +51,19 @@ class AiSetupTest(unittest.TestCase):
 
     def test_install_and_login_run_fixed_commands_in_a_visible_window(self):
         started = []
-        popen = lambda command, **kwargs: started.append(command)
+        popen = lambda command, **kwargs: started.append(_inner(command))
         with patch.object(ai_setup.shutil, "which", return_value=None):
             message = ai_setup.install("codex", popen=popen)
         self.assertIn("Node.js", message)
-        self.assertEqual(started[-1][:2], ["cmd", "/k"])
-        self.assertIn("winget install --id OpenJS.NodeJS.LTS", started[-1][2])
+        self.assertIn("winget install --id OpenJS.NodeJS.LTS", started[-1])
         with patch.object(ai_setup.shutil, "which", return_value="npm"):
             ai_setup.install("claude", popen=popen)
-        self.assertIn("@anthropic-ai/claude-code", started[-1][2])
+        self.assertIn("@anthropic-ai/claude-code", started[-1])
         ai_setup.install("local", popen=popen)
-        self.assertIn("setup_ollama.bat", started[-1][2])
+        self.assertIn("setup_ollama.bat", started[-1])
         with patch.object(ai_setup.agent_runner, "find_executable", return_value=r"C:\x\codex.exe"):
             ai_setup.login("codex", popen=popen)
-        self.assertEqual(started[-1][2], '"C:\\x\\codex.exe" login')
+        self.assertEqual(started[-1], '"C:\\x\\codex.exe" login')
         with self.assertRaises(ValueError):
             ai_setup.install("unknown", popen=popen)
 
@@ -56,7 +71,7 @@ class AiSetupTest(unittest.TestCase):
 class PrepareTest(unittest.TestCase):
     def test_one_button_installs_logs_in_or_reports_ready(self):
         started = []
-        popen = lambda command, **kwargs: started.append(command[2])
+        popen = lambda command, **kwargs: started.append(_inner(command))
         ready = {"installed": True, "ready": True, "detail": ""}
         self.assertIn("準備済み", ai_setup.prepare("codex", status=ready, popen=popen))
         self.assertEqual(started, [])

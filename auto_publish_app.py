@@ -406,8 +406,10 @@ def auto_jobs_view():
             state = _AUTO_STATE_LABELS.get(job.state, job.state)
             step = f"（{job.step}）" if job.step else ""
             last = job.log[-1] if job.log else ""
+            video = _auto_pipeline().video_download_status(job.job_id)
+            video_line = f"<br><small>並行中の動画ダウンロード: {html.escape(video)}</small>" if video else ""
             parts.append(f"- **{html.escape(job.job_id)}** {state}{html.escape(step)} — "
-                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>")
+                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>{video_line}")
         running_md = "\n".join(parts)
     else:
         running_md = "実行中のジョブはありません。"
@@ -578,6 +580,23 @@ def auto_download_only(sources: str):
     return ("", *auto_jobs_view())
 
 
+def _require_agent_ready(agent: str) -> None:
+    """Stop before queueing when the chosen CLI is missing or signed out (its jobs would fail later)."""
+    checks = {"codex": ai_setup.codex_status, "claude": ai_setup.claude_status}
+    if agent not in checks:
+        return
+    status = checks[agent]()
+    if status["ready"]:
+        return
+    label, button = {"codex": ("Codex", "Codex"), "claude": ("Claude Code", "Claude")}[agent]
+    if not status["installed"]:
+        raise gr.Error(f"{label} がインストールされていません。「設定」タブの「{button}」ボタンで準備してください。")
+    raise gr.Error(
+        f"{label} にログインしていません（ログインの期限切れを含む）。「設定」タブの「{button}」ボタンを押し、"
+        "開いたウィンドウとブラウザでログインし直してから、もう一度開始してください。"
+    )
+
+
 def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
                 min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
     # Only the input that is shown counts; a leftover value in the hidden one is ignored.
@@ -589,6 +608,7 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
         lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
         if not lines:
             raise gr.Error("動画のURLを入力してください。")
+    _require_agent_ready(agent)
     submitted = []
     for line in lines[:10]:
         try:

@@ -406,8 +406,10 @@ def auto_jobs_view():
             state = _AUTO_STATE_LABELS.get(job.state, job.state)
             step = f"（{job.step}）" if job.step else ""
             last = job.log[-1] if job.log else ""
+            video = _auto_pipeline().video_download_status(job.job_id)
+            video_line = f"<br><small>並行中の動画ダウンロード: {html.escape(video)}</small>" if video else ""
             parts.append(f"- **{html.escape(job.job_id)}** {state}{html.escape(step)} — "
-                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>")
+                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>{video_line}")
         running_md = "\n".join(parts)
     else:
         running_md = "実行中のジョブはありません。"

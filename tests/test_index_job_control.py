@@ -272,7 +272,7 @@ class IndexJobControlCharacterizationTests(unittest.TestCase):
         outputs = []
         errors = []
 
-        def controlled_download(_url):
+        def controlled_download(_url, **_options):
             entered_download.set()
             yield "synthetic download started", None
             release_download.wait(timeout=3)

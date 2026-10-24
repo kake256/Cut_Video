@@ -152,11 +152,13 @@ class AutoPipeline:
         self.queue: "queue.Queue[str]" = queue.Queue()
         self.cancelled: set[str] = set()
         self.processes: dict[str, object] = {}
+        self.video_downloads: dict[str, object] = {}  # job_id -> audio_first.VideoDownload
         self.lock = threading.RLock()
         self.worker: threading.Thread | None = None
         self.steps = {
             "metadata": self._metadata, "download": self._download, "index": self._index,
             "select": self._select, "export": self._export, "finish": self._finish, "upload": self._upload,
+            "await_video": self._await_video,
             **(steps or {}),
         }
         self._load()
@@ -199,6 +201,16 @@ class AutoPipeline:
             else:
                 job.log.append(message)
             self._save(job)
+
+    def video_download_status(self, job_id: str) -> str:
+        """Progress of the job's background video download ("" when there is none)."""
+        with self.lock:
+            download = self.video_downloads.get(job_id)
+        if download is None:
+            return ""
+        if download.done:
+            return "ダウンロード完了" if download.error is None else "失敗しました"
+        return " ".join(str(download.message).split())
 
     def _check_cancel(self, job: AutoJob) -> None:
         if job.job_id in self.cancelled:
@@ -243,6 +255,9 @@ class AutoPipeline:
                 return False
             self.cancelled.add(job_id)
             process = self.processes.get(job_id)
+            download = self.video_downloads.get(job_id)
+        if download is not None:
+            download.cancel()
         if process is not None:
             try:
                 process.kill()
@@ -288,6 +303,7 @@ class AutoPipeline:
             job.step = STEPS[1]
             job.video_id = self.steps["index"](job, Path(local_path))
             if job.link_only:
+                self.steps["await_video"](job)
                 job.state = "done"
                 self._log(job, "ダウンロードと文字起こしが完了しました（切り抜きはしていません）。"
                                "「文字起こし済みの動画から選ぶ」から切り抜けます。")
@@ -297,6 +313,8 @@ class AutoPipeline:
             job.highlight_run_id = self.steps["select"](job)
             self._check_cancel(job)
             job.step = STEPS[3]
+            self.steps["await_video"](job)
+            self._check_cancel(job)
             job.outputs = self.steps["export"](job)
             self._check_cancel(job)
             if job.finish:
@@ -319,6 +337,9 @@ class AutoPipeline:
             with self.lock:
                 self.processes.pop(job.job_id, None)
                 self.cancelled.discard(job.job_id)
+                download = self.video_downloads.pop(job.job_id, None)
+            if download is not None:  # stopped or failed before the video was needed
+                download.cancel()
                 self._save(job)
 
     def _metadata(self, job: AutoJob):
@@ -347,10 +368,32 @@ class AutoPipeline:
         return info, channel, None
 
     def _download(self, job: AutoJob) -> str:
+        """Fetch the audio first and the video in the background; else the whole video now."""
+        from . import audio_first, source_origin
+
+        save_dir = Path(config.SOURCE_ROOTS[0]) if config.SOURCE_ROOTS else Path("video")
+        if audio_first.should_use(job.source):
+            audio = audio_first.fetch_audio(
+                job.source, save_dir, log=lambda message: self._log(job, message, replace_progress=True))
+            self._check_cancel(job)
+            if audio is not None:
+                conn = db.get_conn()
+                try:
+                    db.init_db(conn)
+                    source_origin.record_download(conn, audio, job.source)
+                finally:
+                    conn.close()
+                if audio_first.is_audio_proxy(audio):
+                    with self.lock:
+                        self.video_downloads[job.job_id] = audio_first.VideoDownload(job.source, save_dir).start()
+                    self._log(job, "音声を先に取得しました。文字起こし・候補選びと並行して、動画をダウンロードします。")
+                return str(Path(audio).resolve())
+        return self._download_video(job, save_dir)
+
+    def _download_video(self, job: AutoJob, save_dir: Path) -> str:
         from .downloader import download_video
         from . import source_origin
 
-        save_dir = Path(config.SOURCE_ROOTS[0]) if config.SOURCE_ROOTS else Path("video")
         path = None
         for message, result in download_video(job.source, save_dir=save_dir):
             self._log(job, message if not message.startswith("  ") else message, replace_progress=True)
@@ -366,6 +409,59 @@ class AutoPipeline:
         finally:
             conn.close()
         return str(path.resolve())
+
+    def _await_video(self, job: AutoJob) -> None:
+        """Make sure the library entry points at the video (not its audio) before clipping."""
+        from . import audio_first
+
+        with self.lock:
+            download = self.video_downloads.get(job.job_id)
+        if not job.video_id:
+            return
+        conn = db.get_conn()
+        try:
+            db.init_db(conn)
+            video = db.get_video(conn, job.video_id)
+            source_origin_url = None
+            if video is not None and download is None and audio_first.pending_video_path(video):
+                from . import source_origin
+
+                source_origin_url = source_origin.origin_url_for_video(conn, video)
+        finally:
+            conn.close()
+        if video is None or not audio_first.pending_video_path(video):
+            return
+        if download is None:
+            # An earlier run registered the audio but its video download did not finish.
+            url = job.source if job.source.lower().startswith(("http://", "https://")) else source_origin_url
+            if not url:
+                raise PipelineError("動画が音声だけで登録されていて、元のURLが分からないため切り抜けません。")
+            self._log(job, "音声だけで登録済みの動画です。動画をダウンロードします。")
+            download = audio_first.VideoDownload(url, Path(str(video["path"])).parent).start()
+            with self.lock:
+                self.video_downloads[job.job_id] = download
+        if not download.done:
+            self._log(job, "動画のダウンロードが終わるのを待っています（切り抜きには映像が必要です）。")
+
+        def progress(message: str) -> None:
+            self._check_cancel(job)
+            self._log(job, f"  動画: {message.strip()}", replace_progress=True)
+
+        try:
+            path = download.wait(poll=progress)
+        except Cancelled:
+            download.cancel()
+            raise
+        except Exception as exc:
+            raise PipelineError(
+                f"動画のダウンロードに失敗しました（{exc}）。文字起こしと候補は保存済みです。"
+                "同じURLでもう一度実行すると、動画だけ取得して続けます。"
+            ) from exc
+        finally:
+            with self.lock:
+                self.video_downloads.pop(job.job_id, None)
+        audio_first.swap_to_video(job.video_id, path)
+        self._log(job, "動画のダウンロードが完了し、音声から動画に差し替えました（文字起こしはそのまま使います）。")
 
     def _indexed_video_id(self, path: Path) -> str | None:
         conn = db.get_conn()

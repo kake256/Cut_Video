@@ -53,6 +53,38 @@ class PublishTest(unittest.TestCase):
             with self.assertRaises(youtube_upload.UploadError):
                 youtube_upload.load_credentials(interactive=False)
 
+    def test_network_errors_while_renewing_are_retried_not_treated_as_signed_out(self):
+        from google.auth.exceptions import RefreshError, TransportError
+
+        class _Creds:
+            def __init__(self, failures):
+                self.failures = list(failures)
+                self.calls = 0
+
+            def refresh(self, request):
+                self.calls += 1
+                if self.failures:
+                    raise self.failures.pop(0)
+
+        flaky = _Creds([TransportError("timed out")])
+        self.assertIs(youtube_upload._refresh(flaky, object, sleep=lambda s: None), flaky)
+        self.assertEqual(flaky.calls, 2)
+        down = _Creds([TransportError("x")] * 3)
+        with self.assertRaisesRegex(youtube_upload.UploadError, "接続できませんでした"):
+            youtube_upload._refresh(down, object, sleep=lambda s: None)
+        revoked = _Creds([RefreshError("invalid_grant")])
+        self.assertIsNone(youtube_upload._refresh(revoked, object, sleep=lambda s: None))
+        self.assertEqual(revoked.calls, 1)
+
+    def test_background_upload_never_opens_the_browser_sign_in(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"x")
+            with patch("google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file") as flow:
+                with self.assertRaises(youtube_upload.UploadError):
+                    list(youtube_upload.upload_private(video, interactive=False))
+            flow.assert_not_called()
+
     def test_missing_permission_error_is_explained(self):
         class _Denied:
             def videos(self):

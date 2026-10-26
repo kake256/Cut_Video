@@ -750,7 +750,7 @@ class AutoPipeline:
         for output in job.outputs:
             self._check_cancel(job)
             receipt = None
-            for message, result in youtube_upload.upload_private(Path(output), privacy=job.privacy):
+            for message, result in youtube_upload.upload_private(Path(output), privacy=job.privacy, interactive=False):
                 self._log(job, message, replace_progress=message.startswith("  アップロード中"))
                 receipt = result or receipt
             if receipt:

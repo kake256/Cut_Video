@@ -151,6 +151,7 @@ class SwapTest(unittest.TestCase):
         try:
             video = db.get_video(conn, self.video_id)
             self.assertEqual(Path(video["path"]), self.video_file.resolve())
+            self.assertEqual(video["display_name"], self.video_file.name)
             self.assertEqual(len(db.get_segments(conn, self.video_id)), 1)
             self.assertEqual(source_origin.origin_url_for_video(conn, video), "https://www.twitch.tv/videos/123456")
             self.assertEqual(db.find_video_by_path(conn, str(self.video_file.resolve()))["video_id"], storage_id)

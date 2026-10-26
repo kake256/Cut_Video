@@ -151,6 +151,9 @@ def swap_to_video(video_id: str, video_path: Path, *, remove_audio: bool = True)
             )
             conn.execute("UPDATE videos SET path = ?, source_state = 'available' WHERE video_id = ?",
                          (resolved, video["video_id"]))
+            # The name shown in lists (and used for clip folders) followed the audio file.
+            conn.execute("UPDATE videos SET display_name = ? WHERE video_id = ? AND display_name = ?",
+                         (video_path.name, video["video_id"], audio_path.name))
             origin = conn.execute("SELECT origin_url FROM downloaded_sources WHERE path = ?",
                                   (source_origin._path_key(audio_path),)).fetchone()
             conn.commit()

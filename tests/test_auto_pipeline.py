@@ -1,7 +1,10 @@
 """Auto clip -> private upload -> one-click publish, with every external step faked."""
 import json
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -276,6 +279,43 @@ class PipelineTest(_Isolated):
         pipeline = auto_pipeline.AutoPipeline(steps={})
         self.assertEqual(pipeline.jobs["auto_old"].state, "failed")
         self.assertEqual(pipeline.jobs["auto_old"].source_video_key, "")
+
+
+class KillProcessTreeTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "taskkill is Windows-only")
+    def test_cancel_stops_grandchildren_such_as_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+            # Parent starts a long-running grandchild (stands in for ffmpeg) and waits.
+            parent_code = (
+                "import subprocess, sys, time;"
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
+                f"open({str(pid_file)!r}, 'w').write(str(p.pid));"
+                "time.sleep(120)"
+            )
+            parent = subprocess.Popen([sys.executable, "-c", parent_code])
+            try:
+                deadline = time.time() + 20
+                while not pid_file.exists() or not pid_file.read_text():
+                    self.assertLess(time.time(), deadline, "grandchild did not start")
+                    time.sleep(0.1)
+                grandchild = int(pid_file.read_text())
+                auto_pipeline.kill_process_tree(parent)
+                parent.wait(timeout=10)
+                deadline = time.time() + 10
+                while _pid_running(grandchild) and time.time() < deadline:
+                    time.sleep(0.2)
+                self.assertFalse(_pid_running(grandchild))
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+
+
+def _pid_running(pid: int) -> bool:
+    listing = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True
+    ).stdout
+    return str(pid) in listing
 
 
 if __name__ == "__main__":

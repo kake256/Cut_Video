@@ -190,6 +190,30 @@ class LocalSelectorTest(unittest.TestCase):
         candidate = library.proposed[1][0]
         self.assertEqual((candidate["start_segment_id"], candidate["end_segment_id"]), (1, 6))
 
+    def test_trimmed_candidates_pass_the_app_boundary_check(self):
+        from moment_retrieval.highlight_analysis import fit_boundary
+
+        # Seg 2..7 is 60.0008s in seconds but exactly 60000ms after rounding,
+        # and the ids do not follow time order.
+        times = [(0.0, 4.0), (5.0, 9.0), (9.9996, 15.0), (20.0, 30.0), (31.0, 40.0),
+                 (41.0, 50.0), (51.0, 60.0), (61.0, 70.0004), (71.0, 80.0)]
+        ids = [10, 31, 12, 33, 14, 35, 16, 37, 18]
+        segments = [{"segment_id": seg_id, "start_sec": start, "end_sec": end, "text": "x"}
+                    for seg_id, (start, end) in zip(ids, times)]
+        rows = [{"segment_id": s["segment_id"], "start_ms": round(s["start_sec"] * 1000),
+                 "end_ms": round(s["end_sec"] * 1000), "text": "x"} for s in segments]
+        library = _Library(rows)
+        local_selector.select_clips(
+            "vid_x", clip_count=1, min_duration_sec=20, max_duration_sec=60, library=library,
+            provider=_Provider([[{"start_segment_id": 12, "end_segment_id": 37, "title": "長い",
+                                  "reason": "r", "score": 9}]]),
+        )
+        candidate = library.proposed[1][0]
+        self.assertEqual((candidate["start_segment_id"], candidate["end_segment_id"]), (12, 16))
+        fit_boundary(segments, candidate["start_segment_id"], candidate["end_segment_id"],
+                     min_duration_sec=20, max_duration_sec=60,
+                     context_back_sec=0.0, context_forward_sec=0.0)
+
     def test_posted_scenes_are_skipped_before_choosing(self):
         rows = [{"segment_id": i, "start_ms": i * 10000, "end_ms": i * 10000 + 9000, "text": f"文{i}"}
                 for i in range(1, 21)]

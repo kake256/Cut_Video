@@ -32,7 +32,7 @@ unittest.addModuleCleanup(_restore_data_dir_environment)
 import gradio as gr
 
 import app as app_module
-from moment_retrieval.downloader import DownloadError
+from moment_retrieval.downloader import DownloadCancelled, DownloadError
 
 
 class _QueueStdout:
@@ -259,22 +259,27 @@ class IndexJobControlCharacterizationTests(unittest.TestCase):
         self.assertIsNone(app_module._index_state["proc"])
         self._assert_index_lock_released()
 
-    def test_url_download_phase_has_no_registered_index_process_yet(self):
-        """Temporary migration characterization, not the desired stop contract.
+    def test_stop_during_url_download_cancels_only_the_download(self):
+        """The stop button reaches the download before any index process exists.
 
-        URL download currently happens before the index Popen is registered.
-        A future cancellable downloader should replace this observation with a
-        cancellation/partial-file cleanup assertion.
+        Spec 4.4: stopping a download is its own operation; nothing is indexed
+        and the log says how to resume (yt-dlp keeps its partial file).
         """
 
         entered_download = threading.Event()
         release_download = threading.Event()
         outputs = []
         errors = []
+        seen_cancel = []
 
-        def controlled_download(_url, **_options):
+        def controlled_download(_url, **options):
+            cancel_event = options.get("cancel_event")
             entered_download.set()
             yield "synthetic download started", None
+            # Like yt-dlp's progress hook: stop at the next progress report.
+            if cancel_event is not None and cancel_event.wait(timeout=3):
+                seen_cancel.append(True)
+                raise DownloadCancelled("ダウンロードを中断しました")
             release_download.wait(timeout=3)
             raise DownloadError("synthetic download interruption")
 
@@ -298,18 +303,35 @@ class IndexJobControlCharacterizationTests(unittest.TestCase):
             worker.start()
             self.assertTrue(entered_download.wait(timeout=3))
             self.assertIsNone(app_module._index_state["proc"])
-            try:
-                with self.assertRaises(gr.Error):
+            with patch.object(app_module.gr, "Info"):
+                try:
                     app_module.stop_indexing()
-            finally:
-                release_download.set()
-            worker.join(timeout=3)
+                finally:
+                    release_download.set()
+            worker.join(timeout=5)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
-        self.assertTrue(any("エラー" in item[0] for item in outputs))
+        self.assertEqual(seen_cancel, [True])
+        self.assertTrue(any("ダウンロードを停止しました" in item[0] for item in outputs))
+        self.assertFalse(any("エラー" in item[0] for item in outputs))
         self.assertIsNone(app_module._index_state["proc"])
+        self.assertIsNone(app_module._index_state["download_cancel"])
         self._assert_index_lock_released()
+        # With nothing running, the button still reports that plainly.
+        with self.assertRaises(gr.Error):
+            app_module.stop_indexing()
+
+    def test_stop_after_transcription_cancels_the_background_video_download(self):
+        cancelled = []
+        download = SimpleNamespace(done=False, cancel=lambda: cancelled.append(True))
+        finished = SimpleNamespace(poll=lambda: 0, pid=1)
+        state = {"proc": finished, "stopped": False,
+                 "download_cancel": threading.Event(), "video_download": download}
+        with patch.dict(app_module._index_state, state), patch.object(app_module.gr, "Info"):
+            app_module.stop_indexing()
+            self.assertTrue(app_module._index_state["stopped"])
+        self.assertEqual(cancelled, [True])
 
 
 if __name__ == "__main__":

@@ -805,27 +805,45 @@ def publish_text_snapshot(
     return snapshot
 
 
-def cleanup_orphan_generations(conn: sqlite3.Connection, grace_sec: float = 3600.0) -> list[Path]:
+def cleanup_orphan_generations(
+    conn: sqlite3.Connection, grace_sec: float = 3600.0, *, dry_run: bool = False
+) -> list[Path]:
+    """Remove generation directories no search can reach any more.
+
+    Every publication row is kept for history, so "referenced by any
+    publication" would keep every generation forever.  Only the generation of
+    the current publication and generations held by live reader leases are
+    reachable; superseded ones are removed once older than ``grace_sec``.
+    A directory that cannot be removed (for example a file still open on
+    Windows) is skipped and retried on the next cleanup.
+    """
     root = config.search_generations_dir()
     if not root.exists():
         return []
-    referenced = {str(row[0]) for row in conn.execute(
-        "SELECT generation_id FROM search_publications WHERE generation_id IS NOT NULL"
-    )}
-    leased = {str(row[0]) for row in conn.execute(
+    current = conn.execute(
+        "SELECT p.generation_id FROM library_state s "
+        "JOIN search_publications p ON p.publication_id = s.current_publication_id "
+        "WHERE s.singleton = 1 AND p.generation_id IS NOT NULL"
+    ).fetchone()
+    keep = {str(current[0])} if current else set()
+    keep |= {str(row[0]) for row in conn.execute(
         "SELECT generation_id FROM publication_leases WHERE expires_at >= ? AND generation_id IS NOT NULL",
         (time.time(),),
     )}
     removed = []
     for child in root.iterdir():
         generation_id = child.name.removeprefix(".").removesuffix(".staging")
-        if generation_id in referenced or generation_id in leased:
+        if generation_id in keep:
             continue
-        if time.time() - child.stat().st_mtime < grace_sec:
+        try:
+            if time.time() - child.stat().st_mtime < grace_sec:
+                continue
+            if not dry_run:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        except OSError:
             continue
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
         removed.append(child)
     return removed

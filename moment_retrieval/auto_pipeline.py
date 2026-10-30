@@ -143,6 +143,28 @@ def validate_source(source: str) -> str:
     return str(resolved)
 
 
+def kill_process_tree(process) -> None:
+    """Stop a child process together with everything it started.
+
+    ``export_shorts.py`` runs ffmpeg and the AI CLIs start their own helpers;
+    ``Popen.kill`` would stop only the direct child and leave those running.
+    """
+    if process is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        process.kill()  # no-op after taskkill; the only step elsewhere
+    except OSError:
+        pass
+
+
 class AutoPipeline:
     """In-process queue with one worker thread; jobs persist as JSON files."""
 
@@ -259,10 +281,7 @@ class AutoPipeline:
         if download is not None:
             download.cancel()
         if process is not None:
-            try:
-                process.kill()
-            except OSError:
-                pass
+            kill_process_tree(process)
         return True
 
     def list_jobs(self) -> list[AutoJob]:

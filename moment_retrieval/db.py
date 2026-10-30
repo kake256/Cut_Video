@@ -305,6 +305,30 @@ def _database_path(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+MIGRATION_BACKUPS_KEPT = 2
+
+
+def _prune_migration_backups(backup_dir: Path, source_name: str, keep: int) -> list[Path]:
+    """Keep the newest ``keep`` pre-migration backups of one database.
+
+    Each backup is a full copy of the database, so keeping every schema
+    version's copy grows the data folder by the whole library on each update.
+    """
+    backups = sorted(
+        backup_dir.glob(f"{source_name}.v*.bak"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    removed = []
+    for path in backups[max(1, keep):]:
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
 def _backup_before_migration(conn: sqlite3.Connection, from_version: int) -> Path | None:
     source = _database_path(conn)
     if source is None or not source.exists() or source.stat().st_size == 0:
@@ -320,6 +344,7 @@ def _backup_before_migration(conn: sqlite3.Connection, from_version: int) -> Pat
     finally:
         backup.close()
     os.replace(temporary, target)
+    _prune_migration_backups(backup_dir, source.name, MIGRATION_BACKUPS_KEPT)
     return target
 
 

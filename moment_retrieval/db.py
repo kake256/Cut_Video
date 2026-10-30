@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -206,6 +206,17 @@ CREATE TABLE IF NOT EXISTS highlight_candidates (
 CREATE INDEX IF NOT EXISTS idx_highlight_candidates_run
 ON highlight_candidates(highlight_run_id, ordinal);
 
+-- Per-time-bin excitement levels (0-10) computed by the app from the audio
+-- loudness profile and stream chat.  Derived, recomputable data keyed by the
+-- inputs it was built from.  It never touches ASR rows or the search index.
+CREATE TABLE IF NOT EXISTS excitement_profiles (
+    video_id TEXT PRIMARY KEY REFERENCES videos(video_id),
+    version INTEGER NOT NULL,
+    inputs_json TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Canonical public YouTube URL of a file CUT downloaded (sender side).
 CREATE TABLE IF NOT EXISTS downloaded_sources (
     path TEXT PRIMARY KEY,
@@ -232,6 +243,17 @@ CREATE TABLE IF NOT EXISTS used_clip_ranges (
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_used_clip_ranges_video ON used_clip_ranges(public_video_id, start_sec);
+
+-- Captions proofread from re-listened audio, keyed by source range (candidates are re-saved per run).
+CREATE TABLE IF NOT EXISTS confirmed_captions (
+    public_video_id TEXT NOT NULL,
+    transcript_revision TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    captions_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (public_video_id, transcript_revision, start_ms, end_ms)
+);
 """
 
 
@@ -294,6 +316,30 @@ def _database_path(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+MIGRATION_BACKUPS_KEPT = 2
+
+
+def _prune_migration_backups(backup_dir: Path, source_name: str, keep: int) -> list[Path]:
+    """Keep the newest ``keep`` pre-migration backups of one database.
+
+    Each backup is a full copy of the database, so keeping every schema
+    version's copy grows the data folder by the whole library on each update.
+    """
+    backups = sorted(
+        backup_dir.glob(f"{source_name}.v*.bak"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    removed = []
+    for path in backups[max(1, keep):]:
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
 def _backup_before_migration(conn: sqlite3.Connection, from_version: int) -> Path | None:
     source = _database_path(conn)
     if source is None or not source.exists() or source.stat().st_size == 0:
@@ -309,6 +355,7 @@ def _backup_before_migration(conn: sqlite3.Connection, from_version: int) -> Pat
     finally:
         backup.close()
     os.replace(temporary, target)
+    _prune_migration_backups(backup_dir, source.name, MIGRATION_BACKUPS_KEPT)
     return target
 
 
@@ -628,6 +675,47 @@ def insert_video(conn: sqlite3.Connection, video_id: str, path: str, duration: f
         "VALUES(?, ?, ?, ?, ?)",
         (source_generation, public_id, path, source_fingerprint, source_status),
     )
+
+
+def _ensure_confirmed_captions(conn: sqlite3.Connection) -> None:
+    # init_db skips DDL on current-version databases, so this additive table is created on use too.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS confirmed_captions ("
+        "public_video_id TEXT NOT NULL, transcript_revision TEXT NOT NULL, "
+        "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, captions_json TEXT NOT NULL, "
+        "created_at TEXT DEFAULT (datetime('now')), "
+        "PRIMARY KEY (public_video_id, transcript_revision, start_ms, end_ms))"
+    )
+
+
+def save_confirmed_captions(
+    conn: sqlite3.Connection, video_id: str, revision: str, start_ms: int, end_ms: int,
+    captions: list[dict],
+) -> None:
+    """Store proofread captions (times relative to start_ms) for one source range."""
+    _ensure_confirmed_captions(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO confirmed_captions "
+        "(public_video_id, transcript_revision, start_ms, end_ms, captions_json) VALUES (?, ?, ?, ?, ?)",
+        (video_id, revision, int(start_ms), int(end_ms), json.dumps(captions, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def find_confirmed_captions(
+    conn: sqlite3.Connection, video_id: str, revision: str, start_ms: int, end_ms: int,
+    tolerance_ms: int = 50,
+) -> Optional[list[dict]]:
+    """Closest stored captions whose range matches within tolerance, else None."""
+    _ensure_confirmed_captions(conn)
+    row = conn.execute(
+        "SELECT captions_json FROM confirmed_captions WHERE public_video_id = ? AND transcript_revision = ? "
+        "AND ABS(start_ms - ?) <= ? AND ABS(end_ms - ?) <= ? "
+        "ORDER BY ABS(start_ms - ?) + ABS(end_ms - ?) LIMIT 1",
+        (video_id, revision, int(start_ms), tolerance_ms, int(end_ms), tolerance_ms,
+         int(start_ms), int(end_ms)),
+    ).fetchone()
+    return json.loads(row[0]) if row else None
 
 
 def get_video(conn: sqlite3.Connection, video_id: str) -> Optional[dict]:
@@ -1167,6 +1255,32 @@ def replace_highlight_candidates(
         conn.commit()
 
 
+def get_excitement_profile(conn: sqlite3.Connection, video_id: str) -> dict | None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    row = conn.execute(
+        "SELECT version, inputs_json, profile_json FROM excitement_profiles WHERE video_id = ?",
+        (storage_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"version": int(row[0]), "inputs": json.loads(row[1]), "profile": json.loads(row[2])}
+
+
+def save_excitement_profile(
+    conn: sqlite3.Connection, video_id: str, *, version: int, inputs: dict, profile: dict,
+    commit: bool = True,
+) -> None:
+    storage_id = _storage_id(conn, video_id) or video_id
+    conn.execute(
+        "INSERT OR REPLACE INTO excitement_profiles(video_id, version, inputs_json, profile_json, updated_at) "
+        "VALUES(?, ?, ?, ?, datetime('now'))",
+        (storage_id, int(version), json.dumps(inputs, ensure_ascii=False, sort_keys=True),
+         json.dumps(profile, ensure_ascii=False, separators=(",", ":"))),
+    )
+    if commit:
+        conn.commit()
+
+
 def get_highlight_run(conn: sqlite3.Connection, highlight_run_id: str) -> dict | None:
     row = conn.execute("SELECT * FROM highlight_runs WHERE highlight_run_id = ?", (highlight_run_id,)).fetchone()
     if row is None:
@@ -1328,6 +1442,7 @@ def delete_video(conn: sqlite3.Connection, video_id: str) -> None:
     public_id = public_video_id(conn, storage_id)
     conn.execute("DELETE FROM text_chunks WHERE video_id = ?", (storage_id,))
     conn.execute("DELETE FROM asr_segments WHERE video_id = ?", (storage_id,))
+    conn.execute("DELETE FROM excitement_profiles WHERE video_id = ?", (storage_id,))
     conn.execute("DELETE FROM legacy_video_aliases WHERE public_video_id = ?", (public_id,))
     conn.execute("DELETE FROM active_transcripts WHERE public_video_id = ?", (public_id,))
     conn.execute("DELETE FROM sources WHERE public_video_id = ?", (public_id,))

@@ -19,6 +19,8 @@ class DownloadError(Exception):
 
 # 進捗メッセージをyieldする最短間隔 (秒)。フックは毎秒何回も発火するため間引く。
 PROGRESS_INTERVAL_SEC = 2.0
+# HLS/DASHの断片を同時に取得する数 (yt-dlpの -N)。
+CONCURRENT_FRAGMENTS = 8
 
 
 def _progress_message(d: dict) -> Optional[str]:
@@ -68,13 +70,42 @@ def _build_basename(info: dict) -> str:
     return _sanitize(vid)
 
 
-def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[str, Optional[Path]]]:
+AUDIO_SUFFIX = ".audio"  # <basename>.audio.<ext>: the audio-only stand-in for <basename>.mp4
+
+
+class DownloadCancelled(DownloadError):
+    """cancel_event が立ったため中断した。"""
+
+
+def audio_proxy_for(video_path: Path) -> list[Path]:
+    """``<basename>.mp4`` に対応する音声だけのファイル (完成したものだけ)。"""
+    video_path = Path(video_path)
+    return sorted(path for path in video_path.parent.glob(f"{video_path.stem}{AUDIO_SUFFIX}.*")
+                  if not path.name.endswith((".part", ".ytdl")) and ".part-Frag" not in path.name)
+
+
+def video_path_for_proxy(audio_path: Path) -> Optional[Path]:
+    """音声だけのファイルに対応する ``<basename>.mp4`` (音声ファイルでなければ None)。"""
+    audio_path = Path(audio_path)
+    stem = audio_path.stem
+    if not stem.endswith(AUDIO_SUFFIX):
+        return None
+    return audio_path.with_name(stem[: -len(AUDIO_SUFFIX)] + ".mp4")
+
+
+def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool = False,
+                   cancel_event: Optional[threading.Event] = None) -> Iterator[Tuple[str, Optional[Path]]]:
     """URLから動画をダウンロードする。
 
     進捗メッセージを (message, None) としてリアルタイムにyieldし、
     完了時に最後の要素として (message, 完了ファイルパス) をyieldする。
     既に同じファイルが存在する場合はダウンロードをスキップしてそのパスを返す。
     失敗時はDownloadErrorを送出する。
+
+    audio_only=True では音声だけ (Twitchの Audio_Only、YouTubeの bestaudio) を
+    ``<basename>.audio.<ext>`` に保存する。文字起こしを先に始めるための軽い取得で、
+    音声だけの形式が無い動画では DownloadError になる。
+    cancel_event が立つと、次の進捗通知で中断して DownloadCancelled を送出する。
     """
     try:
         from yt_dlp import YoutubeDL
@@ -89,6 +120,8 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
     msg_queue: "queue.Queue[str]" = queue.Queue()
 
     def _hook(d):
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled("ダウンロードを中断しました")
         msg = _progress_message(d)
         if msg:
             msg_queue.put(msg)
@@ -109,21 +142,39 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
     if out_path.exists():
         yield f"既にダウンロード済みです: {out_path}", out_path
         return
+    if audio_only:
+        existing = audio_proxy_for(out_path)
+        if existing:
+            yield f"音声は取得済みです: {existing[0]}", existing[0]
+            return
+        if not any(str(item.get("vcodec") or "") in ("none", "audio only") or item.get("format_id") == "Audio_Only"
+                   for item in info.get("formats") or []):
+            raise DownloadError("この動画には音声だけの形式がありません")
 
     ydl_opts = {
         **runtime_options,
-        "format": "bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "outtmpl": str(save_dir / f"{basename}.%(ext)s"),
+        **({"format": "bestaudio/Audio_Only"} if audio_only
+           else {"format": "bestvideo+bestaudio/best", "merge_output_format": "mp4"}),
+        "outtmpl": str(save_dir / (f"{basename}{AUDIO_SUFFIX}.%(ext)s" if audio_only else f"{basename}.%(ext)s")),
         "noplaylist": True,
         "retries": 21,
+        # Twitch VODs and many streams are HLS fragments; fetching several at
+        # once is much faster than one by one.
+        "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
         "progress_hooks": [_hook],
     }
 
     title = info.get("title", basename)
+    try:  # remembered so library pickers can show what the stream was
+        from . import source_titles
+
+        source_titles.record(url, info.get("title") or "", info.get("upload_date"))
+    except Exception:
+        pass
     duration = info.get("duration")
     dur_note = f" (長さ {duration // 3600}時間{(duration % 3600) // 60}分)" if duration else ""
-    yield f"ダウンロードを開始します: {title}{dur_note}", None
+    what = "音声だけ" if audio_only else "動画"
+    yield f"{what}のダウンロードを開始します: {title}{dur_note}", None
 
     # ダウンロード本体は別スレッドで実行し、進捗をリアルタイムに流す
     result: dict = {}
@@ -158,7 +209,17 @@ def download_video(url: str, save_dir: Path = Path("video")) -> Iterator[Tuple[s
     thread.join()
 
     if "error" in result:
-        raise DownloadError(f"ダウンロードに失敗しました: {result['error']}")
+        error = result["error"]
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled("ダウンロードを中断しました") from error
+        raise DownloadError(f"ダウンロードに失敗しました: {error}")
+
+    if audio_only:
+        found = audio_proxy_for(out_path)
+        if not found:
+            raise DownloadError(f"ダウンロード後に音声ファイルが見つかりません: {basename}{AUDIO_SUFFIX}.*")
+        yield f"音声のダウンロード完了: {found[0]}", found[0]
+        return
 
     dl_info = result.get("info") or {}
     out_path = save_dir / f"{basename}.mp4"

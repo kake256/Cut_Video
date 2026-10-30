@@ -8,6 +8,22 @@ from unittest.mock import patch
 from moment_retrieval import ai_setup, local_selector
 
 
+def _inner(command_line):
+    """The command a console was started with (``cmd /s /k "<command>"``)."""
+    prefix = 'cmd /s /k "'
+    assert isinstance(command_line, str), command_line
+    assert command_line.startswith(prefix) and command_line.endswith('"'), command_line
+    return command_line[len(prefix):-1]
+
+
+class ConsoleQuotingTest(unittest.TestCase):
+    def test_quoted_paths_reach_cmd_unescaped(self):
+        # A list argument made Python write \"...\" which cmd.exe rejects.
+        line = ai_setup.console_command_line(r'"C:\Users\a b\AppData\Roaming\npm\claude.CMD" auth login')
+        self.assertEqual(line, r'cmd /s /k ""C:\Users\a b\AppData\Roaming\npm\claude.CMD" auth login"')
+        self.assertNotIn('\\"', line)
+
+
 class AiSetupTest(unittest.TestCase):
     def test_status_reads_cli_login_state(self):
         with patch.object(ai_setup.agent_runner, "find_executable", return_value="codex.exe"):
@@ -35,20 +51,19 @@ class AiSetupTest(unittest.TestCase):
 
     def test_install_and_login_run_fixed_commands_in_a_visible_window(self):
         started = []
-        popen = lambda command, **kwargs: started.append(command)
+        popen = lambda command, **kwargs: started.append(_inner(command))
         with patch.object(ai_setup.shutil, "which", return_value=None):
             message = ai_setup.install("codex", popen=popen)
         self.assertIn("Node.js", message)
-        self.assertEqual(started[-1][:2], ["cmd", "/k"])
-        self.assertIn("winget install --id OpenJS.NodeJS.LTS", started[-1][2])
+        self.assertIn("winget install --id OpenJS.NodeJS.LTS", started[-1])
         with patch.object(ai_setup.shutil, "which", return_value="npm"):
             ai_setup.install("claude", popen=popen)
-        self.assertIn("@anthropic-ai/claude-code", started[-1][2])
+        self.assertIn("@anthropic-ai/claude-code", started[-1])
         ai_setup.install("local", popen=popen)
-        self.assertIn("setup_ollama.bat", started[-1][2])
+        self.assertIn("setup_ollama.bat", started[-1])
         with patch.object(ai_setup.agent_runner, "find_executable", return_value=r"C:\x\codex.exe"):
             ai_setup.login("codex", popen=popen)
-        self.assertEqual(started[-1][2], '"C:\\x\\codex.exe" login')
+        self.assertEqual(started[-1], '"C:\\x\\codex.exe" login')
         with self.assertRaises(ValueError):
             ai_setup.install("unknown", popen=popen)
 
@@ -56,7 +71,7 @@ class AiSetupTest(unittest.TestCase):
 class PrepareTest(unittest.TestCase):
     def test_one_button_installs_logs_in_or_reports_ready(self):
         started = []
-        popen = lambda command, **kwargs: started.append(command[2])
+        popen = lambda command, **kwargs: started.append(_inner(command))
         ready = {"installed": True, "ready": True, "detail": ""}
         self.assertIn("準備済み", ai_setup.prepare("codex", status=ready, popen=popen))
         self.assertEqual(started, [])
@@ -174,6 +189,30 @@ class LocalSelectorTest(unittest.TestCase):
         )
         candidate = library.proposed[1][0]
         self.assertEqual((candidate["start_segment_id"], candidate["end_segment_id"]), (1, 6))
+
+    def test_trimmed_candidates_pass_the_app_boundary_check(self):
+        from moment_retrieval.highlight_analysis import fit_boundary
+
+        # Seg 2..7 is 60.0008s in seconds but exactly 60000ms after rounding,
+        # and the ids do not follow time order.
+        times = [(0.0, 4.0), (5.0, 9.0), (9.9996, 15.0), (20.0, 30.0), (31.0, 40.0),
+                 (41.0, 50.0), (51.0, 60.0), (61.0, 70.0004), (71.0, 80.0)]
+        ids = [10, 31, 12, 33, 14, 35, 16, 37, 18]
+        segments = [{"segment_id": seg_id, "start_sec": start, "end_sec": end, "text": "x"}
+                    for seg_id, (start, end) in zip(ids, times)]
+        rows = [{"segment_id": s["segment_id"], "start_ms": round(s["start_sec"] * 1000),
+                 "end_ms": round(s["end_sec"] * 1000), "text": "x"} for s in segments]
+        library = _Library(rows)
+        local_selector.select_clips(
+            "vid_x", clip_count=1, min_duration_sec=20, max_duration_sec=60, library=library,
+            provider=_Provider([[{"start_segment_id": 12, "end_segment_id": 37, "title": "長い",
+                                  "reason": "r", "score": 9}]]),
+        )
+        candidate = library.proposed[1][0]
+        self.assertEqual((candidate["start_segment_id"], candidate["end_segment_id"]), (12, 16))
+        fit_boundary(segments, candidate["start_segment_id"], candidate["end_segment_id"],
+                     min_duration_sec=20, max_duration_sec=60,
+                     context_back_sec=0.0, context_forward_sec=0.0)
 
     def test_posted_scenes_are_skipped_before_choosing(self):
         rows = [{"segment_id": i, "start_ms": i * 10000, "end_ms": i * 10000 + 9000, "text": f"文{i}"}

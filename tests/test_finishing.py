@@ -97,6 +97,23 @@ class SpeechSnapTest(unittest.TestCase):
         self.assertEqual((snapped[1].start, snapped[1].end), (5.0, 6.0))
         self.assertEqual(finishing.snap_captions_to_speech(captions, []), captions)
 
+    def test_a_line_shown_late_moves_back_to_where_the_voice_started(self):
+        snapped = finishing.snap_captions_to_speech([Caption(2.0, 3.0, "遅い")], [(1.4, 3.2)])
+        self.assertAlmostEqual(snapped[0].start, 1.37, places=2)
+
+    def test_a_line_placed_just_before_the_voice_waits_for_it(self):
+        snapped = finishing.snap_captions_to_speech([Caption(2.0, 3.0, "早い")], [(2.2, 4.0)])
+        self.assertAlmostEqual(snapped[0].start, 2.17, places=2)
+
+    def test_whisper_time_is_kept_when_the_detector_missed_the_voice(self):
+        # Shouting over game audio: the detector only picks the voice up later.
+        snapped = finishing.snap_captions_to_speech([Caption(37.5, 38.5, "崖の2フレーム")], [(38.6, 41.2)])
+        self.assertAlmostEqual(snapped[0].start, 37.5, places=2)
+
+    def test_a_short_line_is_not_kept_up_for_long(self):
+        snapped = finishing.snap_captions_to_speech([Caption(1.0, 27.0, "すばらしい！")], [(1.0, 1.5), (26.5, 27.2)])
+        self.assertLessEqual(snapped[0].end - snapped[0].start, 3.0)
+
 
 class RenderPlanTest(unittest.TestCase):
     def test_effect_line_pops_and_audio_is_mixed_with_a_limiter(self):

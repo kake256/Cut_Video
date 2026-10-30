@@ -20,6 +20,7 @@ from .output_profile import (
     caption_style_for_canvas,
 )
 from .publication import private_source_fingerprint
+from .video_encoder import h264_args
 from .subtitles import SubtitleCue
 
 
@@ -338,6 +339,19 @@ def captions_to_ass(
     return "\n".join(lines) + "\n"
 
 
+def blurred_background(width: int, height: int) -> str:
+    """Filter chain for the blurred fill behind a fitted frame.
+
+    Blurring at full size was most of the render time; blurring a quarter-size
+    copy and scaling it back looks the same and is several times faster.
+    """
+    small_w, small_h = max(2, width // 4 // 2 * 2), max(2, height // 4 // 2 * 2)
+    return (
+        f"scale={small_w}:{small_h}:force_original_aspect_ratio=increase,"
+        f"crop={small_w}:{small_h},boxblur=6:2,scale={width}:{height}"
+    )
+
+
 def build_short_filter(
     options: ShortVideoOptions | OutputProfile, *, include_captions: bool,
 ) -> str:
@@ -355,8 +369,7 @@ def build_short_filter(
         )
     return (
         "[0:v]split=2[background_source][foreground_source];"
-        f"[background_source]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},boxblur=24:2[background];"
+        f"[background_source]{blurred_background(width, height)}[background];"
         f"[foreground_source]scale={width}:{height}:force_original_aspect_ratio=decrease,"
         "setsar=1[foreground];"
         "[background][foreground]overlay=(W-w)/2:(H-h)/2,setsar=1"
@@ -575,10 +588,8 @@ def render_captioned_source_clip(
             "-t", f"{end_value - start_value:.3f}",
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "[aout]" if audio_filter else "0:a?",
-            "-c:v", render_profile.video_codec,
-            "-preset", render_profile.encoding_preset,
-            "-crf", str(render_profile.crf),
-            "-pix_fmt", render_profile.pixel_format,
+            *h264_args(crf=render_profile.crf, preset=render_profile.encoding_preset,
+                       pixel_format=render_profile.pixel_format),
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(output_path),
         ]
@@ -667,10 +678,8 @@ def render_short_clip(
             "-t", f"{end_value - start_value:.3f}",
             "-filter_complex", filter_complex,
             "-map", "[vout]", "-map", "[aout]" if audio_filter else "0:a?",
-            "-c:v", profile.video_codec,
-            "-preset", profile.encoding_preset,
-            "-crf", str(profile.crf),
-            "-pix_fmt", profile.pixel_format,
+            *h264_args(crf=profile.crf, preset=profile.encoding_preset,
+                       pixel_format=profile.pixel_format),
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(output_path),
         ]

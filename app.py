@@ -28,7 +28,7 @@ import gradio as gr
 
 from moment_retrieval import config, db, utils
 from cut_clip import cut_clip, cut_clips
-from moment_retrieval.downloader import DownloadError, download_video
+from moment_retrieval.downloader import DownloadCancelled, DownloadError, download_video
 from moment_retrieval.embedder import TextEmbedder
 from moment_retrieval.highlight_analysis import (
     QUERY_PROMPT_VERSION,
@@ -127,7 +127,11 @@ _preview_locks = _preview_cache_manager.locks
 _preview_protected_outputs = _preview_cache_manager.protected_outputs
 _crash_log = None
 # 実行中のインデックス処理サブプロセス (停止ボタン用)
-_index_state = {"proc": None, "stopped": False}
+# download_cancel: URLダウンロード中に立てると yt-dlp が次の進捗通知で中断する。
+# video_download: 文字起こしと並行して動いている動画本体のダウンロード。
+_index_state = {
+    "proc": None, "stopped": False, "download_cancel": None, "video_download": None,
+}
 _ui_experiment_recorder = UIExperimentRecorder(
     config.CACHE_ROOT / "ui-experiment-v1.jsonl"
 )
@@ -1823,6 +1827,13 @@ def dispatch_intuitive_command(command_json, state: dict | None) -> dict:
                 # 選択したツールを有効にする。
                 next_state["preview_mode"] = "source"
                 next_state["active_tool"] = tool
+            elif (
+                tool == "exclude_end"
+                and next_state.get("pending_cut_start") is not None
+            ):
+                # 除外開始の後は案内どおり「除外終了」を押しても終了待ちのまま。
+                # トグルで解除すると置いた除外開始まで消えてしまうため。
+                next_state["active_tool"] = "exclude_end"
             else:
                 next_state["active_tool"] = (
                     None if next_state.get("active_tool") == tool else tool
@@ -4251,6 +4262,10 @@ def do_index(
         raise gr.Error("別のインデックス処理が実行中です。完了までお待ちください。")
 
     log_lines = ["インデックス処理を開始します。ASRモデルの初回ロードには数分かかることがあります。"]
+    video_download = None  # full video fetched in the background while the audio is indexed
+    download_cancel = threading.Event()
+    _index_state["stopped"] = False
+    _index_state["download_cancel"] = download_cancel
     try:
         yield "\n".join(log_lines), gr.update()
 
@@ -4259,19 +4274,41 @@ def do_index(
             yield "\n".join(log_lines), gr.update()
             try:
                 local_path = None
-                for msg, path in download_video(video_path):
-                    # 進捗行(ダウンロード中...)は追記せず最終行を置き換える
-                    if (
-                        msg.startswith("  ダウンロード中")
-                        and log_lines
-                        and log_lines[-1].startswith("  ダウンロード中")
+                from moment_retrieval import audio_first
+
+                if audio_first.should_use(video_path):
+                    # 音声だけを先に取得して文字起こしを始め、動画は並行してダウンロードする
+                    try:
+                        for text, path in _follow_download(
+                            download_video(
+                                video_path, audio_only=True, cancel_event=download_cancel
+                            ),
+                            log_lines,
+                        ):
+                            yield text, gr.update()
+                            local_path = path or local_path
+                    except DownloadCancelled:
+                        raise
+                    except DownloadError as audio_error:
+                        log_lines.append(
+                            f"音声だけの先行取得はできませんでした（{audio_error}）。動画をダウンロードします。"
+                        )
+                        yield "\n".join(log_lines), gr.update()
+                    if local_path is not None and audio_first.is_audio_proxy(local_path):
+                        video_download = audio_first.VideoDownload(
+                            video_path, Path(local_path).parent
+                        ).start()
+                        _index_state["video_download"] = video_download
+                        log_lines.append(
+                            "音声を先に取得しました。文字起こしと並行して、動画をダウンロードします。"
+                        )
+                        yield "\n".join(log_lines), gr.update()
+                if local_path is None:
+                    for text, path in _follow_download(
+                        download_video(video_path, cancel_event=download_cancel), log_lines
                     ):
-                        log_lines[-1] = msg
-                    else:
-                        log_lines.append(msg)
-                    yield "\n".join(log_lines), gr.update()
-                    if path is not None:
-                        local_path = path
+                        yield text, gr.update()
+                        local_path = path or local_path
                 if local_path is None:
                     log_lines.append("エラー: ダウンロードに失敗しました(ファイルパスを取得できませんでした)。")
                     yield "\n".join(log_lines), gr.update()
@@ -4285,10 +4322,22 @@ def do_index(
                     yield "\n".join(log_lines), gr.update(choices=list_video_choices())
                     return
                 video_path = str(local_path)
+            except DownloadCancelled:
+                log_lines.append(
+                    "ダウンロードを停止しました。インデックス作成は始めていません。"
+                    "同じURLでもう一度追加すると、途中まで取得した分から再開します。"
+                )
+                yield "\n".join(log_lines), gr.update()
+                return
             except DownloadError as e:
                 log_lines.append(f"エラー: {e}")
                 yield "\n".join(log_lines), gr.update()
                 return
+        if _index_state["stopped"]:
+            # 停止ボタンがダウンロード完了と同時に押された場合
+            log_lines.append("処理を停止しました。インデックス作成は始めていません。")
+            yield "\n".join(log_lines), gr.update()
+            return
 
         # インデックス処理はサブプロセスで実行する。
         # (Gradioワーカースレッド内でのWhisperモデルロードはaccess violationで
@@ -4326,7 +4375,6 @@ def do_index(
         # 残留ジョブ掃除用にPIDを記録 (アプリごと落ちた場合、次回起動時に停止される)
         INDEX_JOB_PIDFILE.write_text(str(proc.pid), encoding="utf-8")
         _index_state["proc"] = proc
-        _index_state["stopped"] = False
         # `for line in proc.stdout` は先読みバッファで表示が遅延するためreadlineで読む
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
@@ -4347,8 +4395,36 @@ def do_index(
             yield "\n".join(log_lines), gr.update()
         code = proc.wait()
         INDEX_JOB_PIDFILE.unlink(missing_ok=True)
+        if code == 0 and video_download is not None:
+            log_lines.append("文字起こしが終わりました。動画のダウンロードを待っています（切り抜きには映像が必要です）。")
+            log_lines.append("  動画: ダウンロードを準備しています。")
+            yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+            try:
+                for message in _wait_video_download(video_download):
+                    if _index_state["stopped"]:
+                        video_download.cancel()
+                    log_lines[-1] = f"  動画: {message.strip()}"
+                    yield "\n".join(log_lines), gr.update()
+                swapped = _swap_audio_to_video(Path(str(video_path)), video_download.path)
+                log_lines[-1] = f"  動画のダウンロードが完了し、音声から動画に差し替えました: {swapped}"
+            except DownloadCancelled:
+                code = 1  # 停止ボタンによる中断。下の停止メッセージで報告する
+            except Exception as exc:
+                code = 1
+                log_lines.append(
+                    f"エラー: 動画のダウンロード・差し替えに失敗しました（{exc}）。文字起こしは保存済みです。"
+                    "同じURLでもう一度追加すると、動画だけ取得して差し替えます。"
+                )
+            video_download = None
         if code == 0:
             gr.Info("インデックス作成が完了しました。")
+            yield "\n".join(log_lines), gr.update(choices=list_video_choices())
+        elif _index_state["stopped"] and proc.returncode == 0:
+            # 文字起こしは完了済みで、動画本体のダウンロードだけを止めた
+            log_lines.append(
+                "動画のダウンロードを停止しました。文字起こしと検索は保存済みです。"
+                "同じURLでもう一度追加すると、動画だけ取得して差し替えます。"
+            )
             yield "\n".join(log_lines), gr.update(choices=list_video_choices())
         elif _index_state["stopped"]:
             log_lines.append(
@@ -4360,8 +4436,51 @@ def do_index(
             log_lines.append(f"エラー: インデックス処理が異常終了しました (exit code {code})")
             yield "\n".join(log_lines), gr.update()
     finally:
+        if video_download is not None:  # stopped or failed: do not leave it running
+            video_download.cancel()
         _index_state["proc"] = None
+        _index_state["download_cancel"] = None
+        _index_state["video_download"] = None
         _index_lock.release()
+
+
+def _follow_download(downloads, log_lines: list[str]):
+    """Mirror download progress into the log: yields (log text, finished path or None)."""
+    for msg, path in downloads:
+        # 進捗行(ダウンロード中...)は追記せず最終行を置き換える
+        if msg.startswith("  ダウンロード中") and log_lines and log_lines[-1].startswith("  ダウンロード中"):
+            log_lines[-1] = msg
+        else:
+            log_lines.append(msg)
+        yield "\n".join(log_lines), path
+
+
+def _wait_video_download(download, interval: float = 2.0):
+    """Yield the progress of a background video download until it ends (errors re-raised)."""
+    import time
+
+    last = None
+    while not download.done:
+        if download.message != last:
+            last = download.message
+            yield last
+        time.sleep(interval)
+    download.wait()
+
+
+def _swap_audio_to_video(audio_path: Path, video_file) -> str:
+    from moment_retrieval import audio_first
+
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        video = db.find_video_by_path(conn, str(Path(audio_path).resolve()))
+    finally:
+        conn.close()
+    if video is None:
+        raise RuntimeError("音声で登録した動画がライブラリに見つかりません")
+    audio_first.swap_to_video(str(video["video_id"]), Path(video_file))
+    return Path(video_file).name
 
 
 def format_latest_llm_analysis(video_choice: str) -> str:
@@ -4695,13 +4814,31 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 "<li>Codexのメモ: "
                 f"{html.escape(str(result['note']))}</li>"
             )
+        excitement_info = result.get("excitement") or {}
+        excitement_lines = list(excitement_info.get("candidates") or [])
+        llm_ranks = list(excitement_info.get("llm_rank") or [])
+        if excitement_info:
+            used = "と".join(
+                {"audio": "音量", "chat": "コメント"}.get(str(name), str(name))
+                for name in excitement_info.get("sources") or []
+            )
+            basis = (
+                f"文字起こしに加えて、{html.escape(used)}から計算した盛り上がりを"
+                "AIに参考として渡した候補です。映像だけの出来事や表情は評価していません。"
+            )
+            if excitement_info.get("ranked_by_excitement"):
+                basis += "候補は盛り上がりが高い順に並べています（同じ程度ならAIの順位のまま）。"
+        else:
+            basis = (
+                "文字起こしだけを使った候補です。映像だけの出来事、表情、"
+                "音の盛り上がりは評価していません。"
+            )
         parts = [
             '<div class="highlight-candidate-view">',
             *notices,
             '<section class="highlight-candidate-quality">',
             "<h3>見どころ候補</h3>",
-            "<p>文字起こしだけを使った候補です。映像だけの出来事、表情、"
-            "音の盛り上がりは評価していません。必ずプレビューで確認してください。</p>",
+            f"<p>{basis}必ずプレビューで確認してください。</p>",
             "<details><summary>生成品質を表示</summary><ul>",
             f"<li>生成方式: <strong>{generation_description}</strong></li>",
             query_html,
@@ -4757,6 +4894,14 @@ def _latest_highlight_view(video_choice: str) -> tuple[str, list[tuple[str, str]
                 parts.append(f"<li>内容: {summary}</li>")
             if reason:
                 parts.append(f"<li>選定理由: {reason}</li>")
+            if ordinal <= len(excitement_lines) and excitement_lines[ordinal - 1]:
+                llm_rank = (
+                    f"（AIの順位: {int(llm_ranks[ordinal - 1])}位）"
+                    if ordinal <= len(llm_ranks) else ""
+                )
+                parts.append(
+                    f"<li>{html.escape(str(excitement_lines[ordinal - 1]))}{llm_rank}</li>"
+                )
             if tags:
                 parts.append(f"<li>タグ: {tags}</li>")
             if candidate.get("boundary_warning"):
@@ -5068,7 +5213,9 @@ def highlight_generation_mode_update(generation_mode: str):
     return gr.update(visible=generation_mode == "query")
 
 
-def _highlight_export_context(video_choice: str) -> tuple[dict, list[dict]]:
+def _highlight_export_context(
+    video_choice: str, highlight_run_id: str | None = None
+) -> tuple[dict, list[dict]]:
     video_id = parse_video_choice(video_choice)
     if not video_id:
         raise gr.Error("動画を選択してください。")
@@ -5078,7 +5225,23 @@ def _highlight_export_context(video_choice: str) -> tuple[dict, list[dict]]:
         revision = db.get_active_transcript_revision(conn, video_id)
         if revision is None:
             raise gr.Error("この動画には有効な文字起こしがありません。")
-        run = db.get_latest_ready_highlight_run(conn, video_id, revision)
+        if highlight_run_id:
+            # A pinned run (auto-publish) stays exportable even after a newer
+            # run exists, as long as it still matches the active transcript.
+            run = db.get_highlight_run(conn, highlight_run_id)
+            storage_id = db._storage_id(conn, video_id) or video_id
+            if (
+                run is None
+                or run.get("status") != "ready"
+                or str(run.get("video_id")) not in {str(video_id), str(storage_id)}
+            ):
+                raise gr.Error("指定した見どころ候補が見つかりません。")
+            if str(run.get("transcript_revision") or "") != str(revision):
+                raise gr.Error(
+                    "指定した候補は古い文字起こしに基づいています。候補を提案し直してください。"
+                )
+        else:
+            run = db.get_latest_ready_highlight_run(conn, video_id, revision)
         if run is None:
             raise gr.Error("保存できる見どころ候補がありません。")
         candidates = db.get_highlight_candidates(conn, run["highlight_run_id"])
@@ -5222,6 +5385,33 @@ def _highlight_short_captions(
     mapped = map_subtitles(parsed, make_effective_export_plan(plan))
     warnings.extend(mapped.warnings)
     return prepare_short_captions(mapped.cues), warnings
+
+
+def _confirmed_highlight_captions(
+    video: dict, candidate: dict,
+) -> tuple[SubtitleCue, ...]:
+    """AIが聞き直しで校正した確定字幕（出力時間軸の相対ms）。なければ空。"""
+    video_id = str(video.get("public_video_id") or video.get("video_id") or "")
+    revision = str(video.get("_highlight_transcript_revision") or "")
+    if not video_id or not revision:
+        return ()
+    start_ms = round(float(candidate["start_sec"]) * 1000)
+    end_ms = round(float(candidate["end_sec"]) * 1000)
+    conn = db.get_conn()
+    try:
+        stored = db.find_confirmed_captions(conn, video_id, revision, start_ms, end_ms)
+    finally:
+        conn.close()
+    if not stored:
+        return ()
+    limit = end_ms - start_ms
+    cues = []
+    for ordinal, item in enumerate(stored, start=1):
+        start, end = int(item["start_ms"]), min(int(item["end_ms"]), limit)
+        text = str(item.get("text") or "").strip()
+        if text and 0 <= start < end:
+            cues.append(SubtitleCue(start, end, text, ordinal))
+    return tuple(cues)
 
 
 def _highlight_caption_rows(captions: tuple[SubtitleCue, ...]) -> list[list[object]]:
@@ -5594,8 +5784,17 @@ def export_highlight_candidates(
     metadata_description: str = "",
     metadata_tags: str = "",
     export_job_id: str | None = None,
+    highlight_run_id: str | None = None,
+    render_video: bool = True,
 ):
-    """Cut selected/generated candidates locally with atomic final publish."""
+    """Cut selected/generated candidates locally with atomic final publish.
+
+    ``render_video=False`` records only the posting metadata (source range); the
+    auto-publish finishing step renders the video from the source itself, so a
+    first render here would be thrown away.
+    """
+    if not render_video and not write_metadata:
+        raise ValueError("render_video=False requires write_metadata=True")
     if not _highlight_export_lock.acquire(blocking=False):
         raise gr.Error("別の見どころ候補を保存中です。完了までお待ちください。")
     outputs: list[str] = []
@@ -5605,7 +5804,7 @@ def export_highlight_candidates(
     try:
         if export_job_id:
             EXPORT_JOBS.transition(export_job_id, ExportStage.VALIDATING)
-        video, candidates = _highlight_export_context(video_choice)
+        video, candidates = _highlight_export_context(video_choice, highlight_run_id)
         if export_scope == "selected":
             if not selected_candidate_id:
                 raise gr.Error(
@@ -5689,9 +5888,15 @@ def export_highlight_candidates(
                             f"{ordinal}/{len(candidates)} 編集済み字幕 {len(captions)} 行を使用します。"
                         )
                     else:
-                        captions, subtitle_warnings = _highlight_short_captions(
-                            video, candidate,
-                        )
+                        captions = _confirmed_highlight_captions(video, candidate)
+                        if captions:
+                            log_lines.append(
+                                f"{ordinal}/{len(candidates)} 確定済み字幕 {len(captions)} 行を使用します。"
+                            )
+                        else:
+                            captions, subtitle_warnings = _highlight_short_captions(
+                                video, candidate,
+                            )
                     if not captions:
                         log_lines.append(
                             f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
@@ -5732,7 +5937,9 @@ def export_highlight_candidates(
                         )
                         if metadata_output.exists():
                             raise gr.Error("同名の投稿用メタデータが既にあります。")
-                    if export_format == "short":
+                    if not render_video:
+                        pass  # the finishing step renders this clip from the source
+                    elif export_format == "short":
                         render_short_clip(
                             Path(video["path"]), start, end, temporary,
                             captions=captions,
@@ -5790,17 +5997,19 @@ def export_highlight_candidates(
                             metadata_temporary, metadata_output,
                         )
                         metadata_published = True
-                    _publish_highlight_without_overwrite(temporary, output)
+                    if render_video:
+                        _publish_highlight_without_overwrite(temporary, output)
                 finally:
                     temporary.unlink(missing_ok=True)
                     metadata_temporary.unlink(missing_ok=True)
-                    if metadata_published and not output.exists():
+                    if metadata_published and render_video and not output.exists():
                         metadata_output.unlink(missing_ok=True)
                     claim.unlink(missing_ok=True)
                 outputs.append(str(output.resolve()))
                 log_lines.append(
                     f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
                     + ("（投稿用JSON付き）" if write_metadata else "")
+                    + ("（範囲のみ記録。動画は仕上げで作成）" if not render_video else "")
                 )
             except Exception:
                 if cancel_event is not None and cancel_event.is_set():
@@ -5979,17 +6188,32 @@ def shutdown_app():
 
 
 def stop_indexing():
-    """実行中のインデックス処理サブプロセスを停止する(子プロセスごと)。"""
+    """実行中の処理を段階に応じて停止する (ダウンロード停止とインデックス停止は別扱い)。"""
     import subprocess
 
     proc = _index_state.get("proc")
-    if proc is None or proc.poll() is not None:
-        raise gr.Error("実行中のインデックス処理はありません。")
-    _index_state["stopped"] = True
-    subprocess.run(
-        ["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True
-    )
-    gr.Info("インデックス処理を停止しました。")
+    download_cancel = _index_state.get("download_cancel")
+    video_download = _index_state.get("video_download")
+    if proc is not None and proc.poll() is None:
+        _index_state["stopped"] = True
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True
+        )
+        gr.Info("インデックス処理を停止しました。")
+        return
+    if video_download is not None and not video_download.done:
+        # 文字起こしは終わり、動画本体のダウンロードだけが残っている
+        _index_state["stopped"] = True
+        video_download.cancel()
+        gr.Info("動画のダウンロードを停止しています。")
+        return
+    if proc is None and download_cancel is not None and not download_cancel.is_set():
+        # ダウンロード中: yt-dlp の途中ファイルは残るので、同じURLで再開できる
+        _index_state["stopped"] = True
+        download_cancel.set()
+        gr.Info("ダウンロードを停止しています。")
+        return
+    raise gr.Error("実行中のインデックス処理はありません。")
 
 
 # ---------- インデックスの共有 (エクスポート/インポート) ----------
@@ -6091,7 +6315,10 @@ _INTUITIVE_COLLAPSE_VIDEO_PICKER_JS = r"""() => {
   if (content && button && getComputedStyle(content).display !== 'none') button.click();
   if (picker) picker.classList.remove('is-intuitive-reselecting');
   const focusEditor = () => {
-    const editor = document.getElementById('intuitive-mode-row');
+    // Align the whole header (not the mode row inside it) with the top, so the
+    // selection summary stays readable and the timeline ends above the save bar.
+    const editor = document.getElementById('intuitive-header')
+      || document.getElementById('intuitive-mode-row');
     if (editor) editor.scrollIntoView({block: 'start', behavior: 'auto'});
   };
   requestAnimationFrame(focusEditor);
@@ -6832,8 +7059,6 @@ with gr.Blocks(title="動画シーン検索") as demo:
 
         if UI_STUDIO:
             gr.HTML(
-                '<div class="studio-workspace-heading"><p>検索結果を確認し、プレビューと文字起こしで境界を決めます。</p>'
-                '<a href="#intuitive-save-bar">保存へ移動</a></div>'
                 '<details id="studio-layout-controls"><summary>レイアウトを調整</summary>'
                 '<div class="studio-layout-fields">'
                 '<label>左右の順序<select name="order"><option value="normal">検索・プレビュー・文字起こし</option><option value="reverse-sides">文字起こし・プレビュー・検索</option></select></label>'
@@ -7206,22 +7431,29 @@ with gr.Blocks(title="動画シーン検索") as demo:
                     "保存場所を開く", scale=1,
                     elem_id="intuitive-open-output-folder",
                 )
-            intuitive_saved_path = gr.Textbox(
-                label="保存結果", interactive=False, lines=1,
-                show_label=False, container=False,
-                elem_id="intuitive-saved-path",
-            )
             intuitive_export_job_id = gr.State("")
-            with gr.Row(elem_classes=["intuitive-compact-row"]):
+            # 保存の進捗・結果は1行にまとめ、固定バーの中で常に読めるようにする。
+            with gr.Row(
+                elem_classes=["intuitive-compact-row"],
+                elem_id="intuitive-save-status-row",
+            ):
                 intuitive_export_status = gr.Markdown(
                     "**保存処理:** 待機中",
                     elem_id="intuitive-export-status",
+                )
+                intuitive_saved_path = gr.Textbox(
+                    label="保存結果", interactive=False, lines=1,
+                    show_label=False, container=False,
+                    placeholder="保存したファイルの場所がここに出ます",
+                    elem_id="intuitive-saved-path",
+                )
+                intuitive_open_folder_status = gr.Markdown(
+                    "", elem_id="intuitive-open-folder-status",
                 )
                 intuitive_export_stop_btn = gr.Button(
                     "保存処理を停止", variant="stop", visible=False,
                     scale=0, min_width=140, elem_id="intuitive-export-stop",
                 )
-            intuitive_open_folder_status = gr.Markdown("")
 
         with gr.Accordion("UI比較計測（匿名・ローカル保存）", open=False):
             gr.Markdown(

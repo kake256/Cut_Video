@@ -1,7 +1,10 @@
 """Auto clip -> private upload -> one-click publish, with every external step faked."""
 import json
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -276,6 +279,82 @@ class PipelineTest(_Isolated):
         pipeline = auto_pipeline.AutoPipeline(steps={})
         self.assertEqual(pipeline.jobs["auto_old"].state, "failed")
         self.assertEqual(pipeline.jobs["auto_old"].source_video_key, "")
+
+
+class DeferredRenderTest(_Isolated):
+    def _status(self, outputs):
+        def run_logged(job, command):
+            status = Path(command[command.index("--status-file") + 1])
+            status.write_text(json.dumps({"state": "done", "outputs": outputs}), encoding="utf-8")
+            self.commands.append(command)
+            return 0
+        return run_logged
+
+    def test_export_only_records_ranges_when_finishing_follows(self):
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        for finish in (False, True):
+            self.commands = []
+            job = auto_pipeline.AutoJob(job_id=f"auto_defer_{finish}", source="x", agent="codex",
+                                        finish=finish, video_id="vid_x", highlight_run_id="run_x")
+            with patch.object(auto_pipeline, "_jobs_dir", return_value=self.root),                     patch.object(pipeline, "_run_logged", side_effect=self._status(["a.mp4"])):
+                pipeline._export(job)
+            self.assertEqual("--defer-render" in self.commands[0], finish)
+
+    def test_a_failed_finish_still_produces_a_plain_clip(self):
+        from moment_retrieval import finishing
+
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        made, lost = self.root / "made.mp4", self.root / "lost.mp4"
+        job = auto_pipeline.AutoJob(job_id="auto_plain", source="x", agent="codex", finish=True,
+                                    outputs=[str(made), str(lost)])
+
+        def plain(clip):
+            if clip == made:
+                clip.write_bytes(b"mp4")
+                return clip
+            raise RuntimeError("source gone")
+
+        with patch.object(finishing, "finish_exported_clip", side_effect=RuntimeError("ai down")),                 patch.object(finishing, "render_plain_clip", side_effect=plain):
+            pipeline._finish(job)
+        self.assertEqual(job.outputs, [str(made)])
+        self.assertTrue(any("仕上げなしの動画" in line for line in job.log))
+
+
+class KillProcessTreeTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "taskkill is Windows-only")
+    def test_cancel_stops_grandchildren_such_as_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+            # Parent starts a long-running grandchild (stands in for ffmpeg) and waits.
+            parent_code = (
+                "import subprocess, sys, time;"
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
+                f"open({str(pid_file)!r}, 'w').write(str(p.pid));"
+                "time.sleep(120)"
+            )
+            parent = subprocess.Popen([sys.executable, "-c", parent_code])
+            try:
+                deadline = time.time() + 20
+                while not pid_file.exists() or not pid_file.read_text():
+                    self.assertLess(time.time(), deadline, "grandchild did not start")
+                    time.sleep(0.1)
+                grandchild = int(pid_file.read_text())
+                auto_pipeline.kill_process_tree(parent)
+                parent.wait(timeout=10)
+                deadline = time.time() + 10
+                while _pid_running(grandchild) and time.time() < deadline:
+                    time.sleep(0.2)
+                self.assertFalse(_pid_running(grandchild))
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+
+
+def _pid_running(pid: int) -> bool:
+    listing = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True
+    ).stdout
+    return str(pid) in listing
 
 
 if __name__ == "__main__":

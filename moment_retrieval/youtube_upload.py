@@ -174,10 +174,7 @@ def load_credentials(*, interactive: bool = True):
     if creds and creds.valid:
         return creds
     if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-        except Exception:
-            creds = None
+        creds = _refresh(creds, Request)
     if not creds or not creds.valid:
         if not interactive:
             raise UploadError("YouTubeへのログインが必要です。")
@@ -189,6 +186,33 @@ def load_credentials(*, interactive: bool = True):
     token_path().parent.mkdir(parents=True, exist_ok=True)
     token_path().write_text(creds.to_json(), encoding="utf-8")
     return creds
+
+
+def _refresh(creds, request_factory: Callable, *, attempts: int = 3, sleep: Callable = None):
+    """Renew the access token; None only when Google says the sign-in itself is gone.
+
+    A network hiccup used to look like an expired sign-in, which made a background
+    upload open the browser sign-in and wait there forever.  Transient errors are
+    retried and then reported instead.
+    """
+    import time
+
+    from google.auth.exceptions import RefreshError
+
+    sleep = sleep or time.sleep
+    for attempt in range(attempts):
+        try:
+            creds.refresh(request_factory())
+            return creds
+        except RefreshError:
+            return None  # revoked or expired (invalid_grant): a new sign-in is needed
+        except Exception as exc:
+            if attempt + 1 == attempts:
+                raise UploadError(
+                    f"YouTubeに接続できませんでした（{type(exc).__name__}）。ネットワークを確認して再試行してください。"
+                ) from exc
+            sleep(2 * (attempt + 1))
+    return None
 
 
 def _service(service_factory: Callable | None, *, interactive: bool = True):
@@ -267,8 +291,13 @@ def upload_private(
     *,
     privacy: str = PRIVACY_STATUS,
     service_factory: Callable | None = None,
+    interactive: bool = True,
 ) -> Iterator[tuple[str, dict | None]]:
-    """Yield progress messages, then a final receipt for one private (or unlisted) upload."""
+    """Yield progress messages, then a final receipt for one private (or unlisted) upload.
+
+    Background jobs pass ``interactive=False``: a lost sign-in then fails with a
+    message instead of opening a browser sign-in nobody is watching.
+    """
     video_path = Path(video_path)
     if not video_path.is_file() or video_path.suffix.lower() != ".mp4":
         raise UploadError(f"アップロードできるmp4が見つかりません: {video_path.name}")
@@ -278,7 +307,7 @@ def upload_private(
         yield f"アップロード済みのため省略しました: {video_path.name}", previous
         return
     metadata = metadata_for(video_path)
-    service = _service(service_factory)
+    service = _service(service_factory, interactive=interactive)
     from googleapiclient.http import MediaFileUpload
 
     media = MediaFileUpload(str(video_path), mimetype="video/mp4", chunksize=CHUNK_BYTES, resumable=True)

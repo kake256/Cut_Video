@@ -128,7 +128,7 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(names, [
             "cut_inspect_youtube", "cut_read_youtube_captions", "cut_forget_youtube_preview",
             "cut_list_videos", "cut_read_transcript", "cut_search_transcript", "cut_propose_clips",
-            "cut_export_shorts", "cut_export_status",
+            "cut_relisten_range", "cut_set_captions", "cut_export_shorts", "cut_export_status",
         ])
         self.assertEqual(self.request("ping")["result"], {})
         self.assertEqual(self.request("not-supported")["error"]["code"], -32601)
@@ -183,7 +183,7 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         responses = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([m["id"] for m in responses], [1, 2, 3])
-        self.assertEqual(len(responses[1]["result"]["tools"]), 9)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 11)
         self.assertTrue(responses[2]["result"]["isError"])
         self.assertIn("INVALID_URL", responses[2]["result"]["content"][0]["text"])
         self.assertEqual(result.stderr, b"")
@@ -196,7 +196,7 @@ class StdioTests(unittest.TestCase):
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=15)
         config_text = result.stdout.decode("utf-8")
         self.assertIn('default_tools_approval_mode = "prompt"', config_text)
-        self.assertIn("tool_timeout_sec = 120", config_text)
+        self.assertIn("tool_timeout_sec = 900", config_text)
         self.assertIn("[mcp_servers.cut_youtube]", config_text)
 
 

@@ -10,6 +10,7 @@ the start of the nearest spoken word, and the caption shown at that moment pops.
 from __future__ import annotations
 
 import json
+import os
 import math
 import subprocess
 import tempfile
@@ -17,7 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .output_profile import CaptionProfile, caption_style_for_canvas
-from .short_video import _ass_text, _ass_time, wrap_caption_for_canvas
+from .short_video import _ass_text, _ass_time, blurred_background, wrap_caption_for_canvas
+from .video_encoder import h264_args
 
 SFX_TYPES = ("pop", "ding", "thud", "whoosh", "rise")
 SFX_LABELS = {"pop": "ポン（軽いツッコミ・小ネタ）", "ding": "チーン（ひらめき・正解・オチ）",
@@ -151,6 +153,28 @@ def words_from_segments(segments: list[dict], clip_start: float, clip_end: float
             if text and end > clip_start and start < clip_end:
                 words.append(Word(max(0.0, start - clip_start), min(clip_end, end) - clip_start, text))
     return sorted(words, key=lambda word: word.start)
+
+
+def words_for_clip(video_path: Path, segments: list[dict], start: float, end: float,
+                   log=None) -> tuple[list[Word], str]:
+    """字幕の元になる単語列。まず範囲の音声を聞き直し、失敗したらDBの文字起こしを使う。"""
+    try:
+        from . import relisten
+
+        raw = relisten.retranscribe_range(Path(video_path), start, end)
+        words = [
+            Word(max(0.0, float(item["start"]) - start), min(end, float(item["end"])) - start,
+                 str(item["word"]).strip())
+            for item in raw
+            if str(item["word"]).strip() and float(item["end"]) > start and float(item["start"]) < end
+        ]
+        if words:
+            return sorted(words, key=lambda word: word.start), "relisten"
+        raise RuntimeError("聞き直しで単語を得られませんでした")
+    except Exception as exc:
+        if log:
+            log(f"  音声の聞き直しに失敗したため、文字起こしの単語時刻を使います（{type(exc).__name__}）")
+    return words_from_segments(segments, start, end), "transcript"
 
 
 _BREAK_AFTER = tuple("、。！？!?…")
@@ -289,24 +313,39 @@ def captions_from_ai_lines(words: list[Word], lines: list[str], *, minimum_simil
 
 
 def snap_captions_to_speech(captions: list[Caption], regions: list[tuple[float, float]], *,
-                            reach: float = 0.6, tail: float = 0.25, minimum: float = 0.6) -> list[Caption]:
-    """Start each line when the voice starts and stop it soon after the voice stops."""
+                            reach: float = 0.6, tail: float = 0.25, minimum: float = 0.6,
+                            pull_back: float = 1.0) -> list[Caption]:
+    """Start each line when the voice starts and stop it soon after the voice stops.
+
+    A line is pulled back to a detected voice onset when the voice started with
+    nothing on screen.  It is delayed only a little: the voice detector misses
+    shouting over game audio, where Whisper's own word times are the better guide.
+    """
     if not regions:
         return captions
+    regions = sorted(regions)
     snapped: list[Caption] = []
     for caption in captions:
         start, end = caption.start, caption.end
+        shown_until = snapped[-1].end if snapped else -1.0
         inside = [r for r in regions if r[0] - 0.05 <= start <= r[1]]
         if not inside:
             onsets = [r[0] for r in regions if 0 <= r[0] - start <= reach]
             if onsets:
                 start = onsets[0] - 0.03
+        else:
+            onset = inside[0][0]
+            if start - onset > 0.15 and shown_until <= onset + 0.1:
+                # The voice started with nothing on screen; show the line with it.
+                start = max(onset - 0.03, start - pull_back, shown_until + 0.02)
         covering = [r for r in regions if r[0] <= end <= r[1] + tail]
         if not covering:
             ends = [r[1] for r in regions if start < r[1] <= end]
             if ends:
                 end = max(ends) + tail
         end = max(end, start + minimum)
+        # A Whisper word stretched over music can keep a short line up for many seconds.
+        end = min(end, start + max(minimum, min(5.0, 0.8 + 0.3 * len(caption.text))))
         snapped.append(Caption(round(max(0.0, start), 3), round(end, 3), caption.text))
     for index in range(len(snapped) - 1):
         current, following = snapped[index], snapped[index + 1]
@@ -368,7 +407,7 @@ def build_ass(captions: list[Caption], plan: FinishPlan, width: int, height: int
 def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]]) -> str:
     video = (
         "[0:v]split=2[bg_src][fg_src];"
-        f"[bg_src]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},boxblur=24:2[bg];"
+        f"[bg_src]{blurred_background(width, height)}[bg];"
         f"[fg_src]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1[fg];"
         "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,subtitles=filename=finish.ass[vout]"
     )
@@ -404,8 +443,7 @@ def render(source: Path, start: float, end: float, words: list[Word], plan: Fini
         command = [
             "ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-i", str(Path(source).resolve()),
             "-t", f"{duration:.3f}", "-filter_complex", build_filter(width, height, plan.sound_effects),
-            "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
+            "-map", "[vout]", "-map", "[aout]", *h264_args(crf=20, preset="medium"), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
         ]
         subprocess.run(command, cwd=tmp, check=True, capture_output=True, timeout=timeout)
     return output
@@ -455,6 +493,43 @@ def request_plan(agent: str, model: str, prompt: str, *, timeout: float = 600) -
         return _json_object(result.stdout)
 
 
+def render_plain_clip(clip: Path) -> Path:
+    """Fallback when finishing fails on a clip whose export recorded only its range.
+
+    Renders the source range with Whisper-timed captions and the title as hook,
+    no AI plan and no sound effects; if even that fails, a caption-less Short.
+    """
+    from . import db
+    from .short_video import ShortVideoOptions, render_short_clip
+
+    clip = Path(clip)
+    meta = json.loads(clip.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+    source = meta["source_range"]
+    start, end = float(source["start_sec"]), float(source["end_sec"])
+    conn = db.get_conn()
+    try:
+        revision = db.get_active_transcript_revision(conn, source["video_id"])
+        segments = db.get_segments_in_range(conn, source["video_id"], start, end, transcript_revision=revision)
+        video = db.get_video(conn, source["video_id"])
+    finally:
+        conn.close()
+    if not video or not Path(video["path"]).is_file():
+        raise RuntimeError("元動画が見つかりません")
+    temporary = clip.with_name(f".{clip.stem}.plain.mp4")
+    try:
+        try:
+            plan = FinishPlan(hook_text=str(meta.get("title") or clip.stem))
+            render(Path(video["path"]), start, end, words_from_segments(segments, start, end), plan, temporary)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            render_short_clip(Path(video["path"]), start, end, temporary,
+                              options=ShortVideoOptions(burn_captions=False))
+        os.replace(temporary, clip)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return clip
+
+
 def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str = "",
                          log=None) -> FinishPlan:
     """Replace an exported Short with its finished version (same file name).
@@ -479,7 +554,7 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
         conn.close()
     if not video or not Path(video["path"]).is_file():
         raise RuntimeError("元動画が見つかりません")
-    words = words_from_segments(segments, start, end)
+    words, words_from = words_for_clip(Path(video["path"]), segments, start, end, log)
     title = str(meta.get("title") or clip.stem)
     try:
         raw = request_plan(agent, model, plan_prompt(title, captions_from_words(words), end - start, focus))
@@ -489,11 +564,15 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
         raw = {"hook_text": title}
     plan = snap_sound_effects(validate_plan(raw, end - start), words)
     try:
-        from . import signals
+        from . import signals, speech_regions
 
-        # The whole video's speech regions are stored once; this clip reads its part.
-        profile = signals.ensure_audio(str(video["video_id"]), Path(video["path"]))
-        speech = signals.speech_between(profile, start, end)
+        try:
+            # Detect on this clip alone: the stored whole-video profile merges nearby
+            # regions, which hides the onsets the captions should start on.
+            speech = speech_regions.detect(Path(video["path"]), start, end)
+        except Exception:
+            profile = signals.ensure_audio(str(video["video_id"]), Path(video["path"]))
+            speech = signals.speech_between(profile, start, end)
     except Exception as exc:  # timing falls back to Whisper's word times
         speech = []
         if log:
@@ -507,7 +586,8 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
         temporary.unlink(missing_ok=True)
     clip.with_suffix(".finish.json").write_text(
         json.dumps({"agent": agent, "raw": raw, "applied": plan.__dict__,
-                    "captions_from": "ai" if ai_captions else "whisper", "speech_regions": len(speech)},
+                    "captions_from": "ai" if ai_captions else "whisper", "words_from": words_from,
+                    "speech_regions": len(speech)},
                    ensure_ascii=False, indent=2),
         encoding="utf-8")
     return plan

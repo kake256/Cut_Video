@@ -220,6 +220,27 @@ class AppLlmAnalysisTest(unittest.TestCase):
             self.assertEqual(sidecar.parent, video_path.parent)
             self.assertNotEqual(video_path.parent, Path(temporary).resolve())
 
+    def test_highlight_export_can_defer_the_render_to_finishing(self):
+        video = {"path": "private-source.mp4", "display_name": "synthetic_source.mp4", "duration": 120.0}
+        candidate = {"highlight_candidate_id": "candidate-1", "start_sec": 10.0, "end_sec": 20.0,
+                     "title": "候補タイトル", "export_title": "章タイトル"}
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(app, "_highlight_export_context", return_value=(video, [candidate])),
+                patch.object(app, "render_short_clip") as renderer,
+                patch.object(app, "_highlight_short_captions", return_value=((), [])),
+            ):
+                outputs = list(app.export_highlight_candidates(
+                    "vid_synthetic", "", "all", temporary, True, "short", "blur", "1080x1920", True,
+                    write_metadata=True, render_video=False,
+                ))
+            renderer.assert_not_called()
+            video_path = Path(outputs[-1][1][0])
+            self.assertFalse(video_path.exists())
+            payload = json.loads(video_path.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["source_range"]["start_sec"], 10.0)
+            self.assertIn("動画は仕上げで作成", outputs[-1][0])
+
     def test_highlight_export_can_render_captioned_short_video(self):
         video = {
             "path": "synthetic.mp4",

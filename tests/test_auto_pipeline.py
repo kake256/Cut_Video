@@ -281,6 +281,45 @@ class PipelineTest(_Isolated):
         self.assertEqual(pipeline.jobs["auto_old"].source_video_key, "")
 
 
+class DeferredRenderTest(_Isolated):
+    def _status(self, outputs):
+        def run_logged(job, command):
+            status = Path(command[command.index("--status-file") + 1])
+            status.write_text(json.dumps({"state": "done", "outputs": outputs}), encoding="utf-8")
+            self.commands.append(command)
+            return 0
+        return run_logged
+
+    def test_export_only_records_ranges_when_finishing_follows(self):
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        for finish in (False, True):
+            self.commands = []
+            job = auto_pipeline.AutoJob(job_id=f"auto_defer_{finish}", source="x", agent="codex",
+                                        finish=finish, video_id="vid_x", highlight_run_id="run_x")
+            with patch.object(auto_pipeline, "_jobs_dir", return_value=self.root),                     patch.object(pipeline, "_run_logged", side_effect=self._status(["a.mp4"])):
+                pipeline._export(job)
+            self.assertEqual("--defer-render" in self.commands[0], finish)
+
+    def test_a_failed_finish_still_produces_a_plain_clip(self):
+        from moment_retrieval import finishing
+
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        made, lost = self.root / "made.mp4", self.root / "lost.mp4"
+        job = auto_pipeline.AutoJob(job_id="auto_plain", source="x", agent="codex", finish=True,
+                                    outputs=[str(made), str(lost)])
+
+        def plain(clip):
+            if clip == made:
+                clip.write_bytes(b"mp4")
+                return clip
+            raise RuntimeError("source gone")
+
+        with patch.object(finishing, "finish_exported_clip", side_effect=RuntimeError("ai down")),                 patch.object(finishing, "render_plain_clip", side_effect=plain):
+            pipeline._finish(job)
+        self.assertEqual(job.outputs, [str(made)])
+        self.assertTrue(any("仕上げなしの動画" in line for line in job.log))
+
+
 class KillProcessTreeTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "taskkill is Windows-only")
     def test_cancel_stops_grandchildren_such_as_ffmpeg(self):

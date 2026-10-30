@@ -9,6 +9,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().casefold() in {"1", "true", "yes", "on"}
 
 
+# An app-local ffmpeg (tools/ffmpeg/bin) wins over the system one, so this app can
+# use a build whose NVENC matches the installed GPU driver without touching PATH
+# for anything else.  Child processes (export, MCP sidecar) inherit it.
+_LOCAL_FFMPEG = Path(__file__).resolve().parents[1] / "tools" / "ffmpeg" / "bin"
+if (_LOCAL_FFMPEG / "ffmpeg.exe").is_file() or (_LOCAL_FFMPEG / "ffmpeg").is_file():
+    if str(_LOCAL_FFMPEG) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = str(_LOCAL_FFMPEG) + os.pathsep + os.environ.get("PATH", "")
+
 DATA_DIR = Path(os.environ.get("CUT_VIDEO_DATA_DIR", "data"))
 # Phase 1 storage roles.  Defaults preserve the current on-disk layout while
 # allowing the frequently accessed library/search/cache roots to live on SSD.

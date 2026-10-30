@@ -243,6 +243,17 @@ CREATE TABLE IF NOT EXISTS used_clip_ranges (
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_used_clip_ranges_video ON used_clip_ranges(public_video_id, start_sec);
+
+-- Captions proofread from re-listened audio, keyed by source range (candidates are re-saved per run).
+CREATE TABLE IF NOT EXISTS confirmed_captions (
+    public_video_id TEXT NOT NULL,
+    transcript_revision TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    captions_json TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (public_video_id, transcript_revision, start_ms, end_ms)
+);
 """
 
 
@@ -664,6 +675,47 @@ def insert_video(conn: sqlite3.Connection, video_id: str, path: str, duration: f
         "VALUES(?, ?, ?, ?, ?)",
         (source_generation, public_id, path, source_fingerprint, source_status),
     )
+
+
+def _ensure_confirmed_captions(conn: sqlite3.Connection) -> None:
+    # init_db skips DDL on current-version databases, so this additive table is created on use too.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS confirmed_captions ("
+        "public_video_id TEXT NOT NULL, transcript_revision TEXT NOT NULL, "
+        "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, captions_json TEXT NOT NULL, "
+        "created_at TEXT DEFAULT (datetime('now')), "
+        "PRIMARY KEY (public_video_id, transcript_revision, start_ms, end_ms))"
+    )
+
+
+def save_confirmed_captions(
+    conn: sqlite3.Connection, video_id: str, revision: str, start_ms: int, end_ms: int,
+    captions: list[dict],
+) -> None:
+    """Store proofread captions (times relative to start_ms) for one source range."""
+    _ensure_confirmed_captions(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO confirmed_captions "
+        "(public_video_id, transcript_revision, start_ms, end_ms, captions_json) VALUES (?, ?, ?, ?, ?)",
+        (video_id, revision, int(start_ms), int(end_ms), json.dumps(captions, ensure_ascii=False)),
+    )
+    conn.commit()
+
+
+def find_confirmed_captions(
+    conn: sqlite3.Connection, video_id: str, revision: str, start_ms: int, end_ms: int,
+    tolerance_ms: int = 50,
+) -> Optional[list[dict]]:
+    """Closest stored captions whose range matches within tolerance, else None."""
+    _ensure_confirmed_captions(conn)
+    row = conn.execute(
+        "SELECT captions_json FROM confirmed_captions WHERE public_video_id = ? AND transcript_revision = ? "
+        "AND ABS(start_ms - ?) <= ? AND ABS(end_ms - ?) <= ? "
+        "ORDER BY ABS(start_ms - ?) + ABS(end_ms - ?) LIMIT 1",
+        (video_id, revision, int(start_ms), tolerance_ms, int(end_ms), tolerance_ms,
+         int(start_ms), int(end_ms)),
+    ).fetchone()
+    return json.loads(row[0]) if row else None
 
 
 def get_video(conn: sqlite3.Connection, video_id: str) -> Optional[dict]:

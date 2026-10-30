@@ -5387,6 +5387,33 @@ def _highlight_short_captions(
     return prepare_short_captions(mapped.cues), warnings
 
 
+def _confirmed_highlight_captions(
+    video: dict, candidate: dict,
+) -> tuple[SubtitleCue, ...]:
+    """AIが聞き直しで校正した確定字幕（出力時間軸の相対ms）。なければ空。"""
+    video_id = str(video.get("public_video_id") or video.get("video_id") or "")
+    revision = str(video.get("_highlight_transcript_revision") or "")
+    if not video_id or not revision:
+        return ()
+    start_ms = round(float(candidate["start_sec"]) * 1000)
+    end_ms = round(float(candidate["end_sec"]) * 1000)
+    conn = db.get_conn()
+    try:
+        stored = db.find_confirmed_captions(conn, video_id, revision, start_ms, end_ms)
+    finally:
+        conn.close()
+    if not stored:
+        return ()
+    limit = end_ms - start_ms
+    cues = []
+    for ordinal, item in enumerate(stored, start=1):
+        start, end = int(item["start_ms"]), min(int(item["end_ms"]), limit)
+        text = str(item.get("text") or "").strip()
+        if text and 0 <= start < end:
+            cues.append(SubtitleCue(start, end, text, ordinal))
+    return tuple(cues)
+
+
 def _highlight_caption_rows(captions: tuple[SubtitleCue, ...]) -> list[list[object]]:
     """Return editable, result-timeline caption rows without changing ASR."""
     return [
@@ -5758,8 +5785,16 @@ def export_highlight_candidates(
     metadata_tags: str = "",
     export_job_id: str | None = None,
     highlight_run_id: str | None = None,
+    render_video: bool = True,
 ):
-    """Cut selected/generated candidates locally with atomic final publish."""
+    """Cut selected/generated candidates locally with atomic final publish.
+
+    ``render_video=False`` records only the posting metadata (source range); the
+    auto-publish finishing step renders the video from the source itself, so a
+    first render here would be thrown away.
+    """
+    if not render_video and not write_metadata:
+        raise ValueError("render_video=False requires write_metadata=True")
     if not _highlight_export_lock.acquire(blocking=False):
         raise gr.Error("別の見どころ候補を保存中です。完了までお待ちください。")
     outputs: list[str] = []
@@ -5853,9 +5888,15 @@ def export_highlight_candidates(
                             f"{ordinal}/{len(candidates)} 編集済み字幕 {len(captions)} 行を使用します。"
                         )
                     else:
-                        captions, subtitle_warnings = _highlight_short_captions(
-                            video, candidate,
-                        )
+                        captions = _confirmed_highlight_captions(video, candidate)
+                        if captions:
+                            log_lines.append(
+                                f"{ordinal}/{len(candidates)} 確定済み字幕 {len(captions)} 行を使用します。"
+                            )
+                        else:
+                            captions, subtitle_warnings = _highlight_short_captions(
+                                video, candidate,
+                            )
                     if not captions:
                         log_lines.append(
                             f"{ordinal}/{len(candidates)} 字幕にできるASR時刻がないため、"
@@ -5896,7 +5937,9 @@ def export_highlight_candidates(
                         )
                         if metadata_output.exists():
                             raise gr.Error("同名の投稿用メタデータが既にあります。")
-                    if export_format == "short":
+                    if not render_video:
+                        pass  # the finishing step renders this clip from the source
+                    elif export_format == "short":
                         render_short_clip(
                             Path(video["path"]), start, end, temporary,
                             captions=captions,
@@ -5954,17 +5997,19 @@ def export_highlight_candidates(
                             metadata_temporary, metadata_output,
                         )
                         metadata_published = True
-                    _publish_highlight_without_overwrite(temporary, output)
+                    if render_video:
+                        _publish_highlight_without_overwrite(temporary, output)
                 finally:
                     temporary.unlink(missing_ok=True)
                     metadata_temporary.unlink(missing_ok=True)
-                    if metadata_published and not output.exists():
+                    if metadata_published and render_video and not output.exists():
                         metadata_output.unlink(missing_ok=True)
                     claim.unlink(missing_ok=True)
                 outputs.append(str(output.resolve()))
                 log_lines.append(
                     f"{ordinal}/{len(candidates)} 保存完了: {output.name}"
                     + ("（投稿用JSON付き）" if write_metadata else "")
+                    + ("（範囲のみ記録。動画は仕上げで作成）" if not render_video else "")
                 )
             except Exception:
                 if cancel_event is not None and cancel_event.is_set():

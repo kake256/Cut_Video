@@ -732,7 +732,11 @@ class AutoPipeline:
         command = [sys.executable, "export_shorts.py", "--video-id", job.video_id,
                    "--highlight-run-id", job.highlight_run_id, "--layout", job.layout,
                    "--status-file", str(status_file)]
-        self._log(job, "9:16ショートとして書き出しています。")
+        if job.finish:
+            # Finishing renders each clip from the source, so record only the ranges here.
+            command.append("--defer-render")
+        self._log(job, "9:16ショートとして書き出しています。" if not job.finish
+                  else "切り抜く範囲を記録しています（動画は仕上げで作成します）。")
         code = self._run_logged(job, command)
         status = json.loads(status_file.read_text(encoding="utf-8")) if status_file.is_file() else {}
         status_file.unlink(missing_ok=True)
@@ -756,8 +760,18 @@ class AutoPipeline:
                 )
             except Exception as exc:  # an unfinished clip is still a valid Short
                 self._log(job, f"  {index}本目の仕上げを省略しました（{type(exc).__name__}）")
+                if not Path(output).is_file():  # export only recorded the range
+                    try:
+                        finishing.render_plain_clip(Path(output))
+                        self._log(job, f"  {index}本目は仕上げなしの動画を作りました。")
+                    except Exception as fallback_exc:
+                        self._log(job, f"  {index}本目の動画を作れませんでした（{type(fallback_exc).__name__}）")
                 continue
             self._log(job, f"  {index}本目: 引き「{plan.hook_text}」・効果音{len(plan.sound_effects)}か所")
+        missing = [output for output in job.outputs if not Path(output).is_file()]
+        if missing:
+            job.outputs = [output for output in job.outputs if output not in missing]
+            self._log(job, f"  動画を作れなかった{len(missing)}本は投稿しません。")
 
     def _upload(self, job: AutoJob) -> None:
         from . import youtube_upload

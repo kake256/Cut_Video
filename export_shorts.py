@@ -23,7 +23,7 @@ def _write_status(path: Path, **fields) -> None:
 
 
 def export_run(video_id: str, highlight_run_id: str, *, layout: str, burn_captions: bool,
-               status_file: Path) -> tuple[list[str], str]:
+               status_file: Path, defer_render: bool = False) -> tuple[list[str], str]:
     import app
     from moment_retrieval import config
 
@@ -35,6 +35,7 @@ def export_run(video_id: str, highlight_run_id: str, *, layout: str, burn_captio
     for log_text, files in app.export_highlight_candidates(
         video_id, "", "all", output_root, True, "short", layout, "1080x1920",
         burn_captions, None, None, True, highlight_run_id=highlight_run_id,
+        render_video=not defer_render,
     ):
         _write_status(status_file, state="running", log=log_text, outputs=list(files))
     return [str(item) for item in files], log_text
@@ -46,6 +47,8 @@ def main() -> None:
     parser.add_argument("--highlight-run-id", required=True)
     parser.add_argument("--layout", choices=["blur", "crop"], default="blur")
     parser.add_argument("--no-captions", action="store_true")
+    parser.add_argument("--defer-render", action="store_true",
+                        help="record only the source range; the finishing step renders the video")
     parser.add_argument("--status-file", required=True, type=Path)
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
@@ -54,6 +57,7 @@ def main() -> None:
         outputs, log_text = export_run(
             args.video_id, args.highlight_run_id, layout=args.layout,
             burn_captions=not args.no_captions, status_file=args.status_file,
+            defer_render=args.defer_render,
         )
     except Exception as exc:  # report every failure through the status file
         _write_status(args.status_file, state="failed", log=f"{type(exc).__name__}: {exc}", outputs=[])

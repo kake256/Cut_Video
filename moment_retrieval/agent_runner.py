@@ -27,7 +27,8 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODELS = (("既定", ""), ("Opus", "opus"), ("Sonnet", "sonnet"))
 _MODEL_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _OLLAMA_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
-CLAUDE_TOOLS = ("cut_list_videos", "cut_read_transcript", "cut_search_transcript", "cut_propose_clips")
+CLAUDE_TOOLS = ("cut_list_videos", "cut_read_transcript", "cut_search_transcript", "cut_propose_clips",
+                "cut_relisten_range", "cut_set_captions")
 
 
 class AgentError(RuntimeError):
@@ -75,7 +76,11 @@ class ClipRequest:
             f"max_duration_sec={self.max_duration_sec:g}, note='{self.note}'）。"
             "候補はまとめて1回で保存する（却下された候補の代わりを足すときは、残す候補も含めて全件で呼び直す）。"
             "タイトルは30文字以内で内容が分かるものにし、reasonに選んだ理由を書く。\n"
-            "4. 最後に、保存された候補の時刻とタイトルを日本語で短く報告する。文字起こし本文は引用しない。"
+            "4. 保存された各候補について、cut_relisten_range（allow_transcript_transfer=true、候補のstart_ms/end_ms）"
+            "で音声の聞き直し結果を取得し、字幕を校正して cut_set_captions で確定する。"
+            "字幕は文字起こしではなく聞き直し結果から作る。誤認識は文脈で直し、1行10文字以内、時刻は範囲先頭からの相対ms、"
+            "聞き取れない叫びは「（絶叫）」とし、話していない内容は足さない。\n"
+            "5. 最後に、保存された候補の時刻とタイトルを日本語で短く報告する。文字起こし本文は引用しない。"
         )
 
 
@@ -158,7 +163,7 @@ def build_command(agent: str, executable: str, config_dir: Path, *,
         f"mcp_servers.cut_auto.command={json.dumps(server['command'])}",
         f"mcp_servers.cut_auto.args={json.dumps(server['args'])}",
         "mcp_servers.cut_auto.default_tools_approval_mode=\"approve\"",
-        "mcp_servers.cut_auto.tool_timeout_sec=300",
+        "mcp_servers.cut_auto.tool_timeout_sec=900",
     ]
     for key, value in server["env"].items():
         overrides.append(f"mcp_servers.cut_auto.env.{key}={json.dumps(value)}")

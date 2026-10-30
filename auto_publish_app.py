@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import socket
 import threading
 import webbrowser
@@ -28,8 +29,28 @@ from moment_retrieval.auto_pipeline import (  # noqa: E402
 )
 
 APP_PORT = int(os.environ.get("CUT_AUTO_PUBLISH_PORT", "7870"))
+
+# Gradio's multiselect dropdown ignores clicks on its arrow and stays open after a pick.
+_LIBRARY_ARROW_JS = """() => {
+  if (window.__cutLibraryArrow) return;
+  window.__cutLibraryArrow = true;
+  document.addEventListener('mousedown', (event) => {
+    const icon = event.target.closest('#auto-library .icon-wrap');
+    if (!icon) return;
+    event.preventDefault();
+    const input = icon.closest('#auto-library').querySelector('input');
+    if (document.activeElement === input) { input.blur(); return; }
+    input.focus();
+    input.click();
+  }, true);
+}"""
+_LIBRARY_CLOSE_JS = """() => {
+  const active = document.activeElement;
+  if (active && active.closest('#auto-library')) active.blur();
+}"""
 # Operable panels get a light gray fill; fields inside stay white so they read as inputs.
 APP_CSS = """
+#auto-library .icon-wrap { cursor: pointer; }
 .gradio-container {
     --body-background-fill: #ffffff;
     --block-background-fill: #f1f3f5;
@@ -479,15 +500,77 @@ def _duration_label(seconds: float) -> str:
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+_DATE_PREFIX = re.compile(r"^(\d{4})(\d{2})(\d{2})_")
+
+
+def _video_date(name: str, upload_date: str = "") -> str:
+    """YYYYMMDD from the downloaded file name (its stream date), else from the source metadata."""
+    match = _DATE_PREFIX.match(name)
+    if match:
+        return "".join(match.groups())
+    return upload_date if re.fullmatch(r"\d{8}", upload_date or "") else ""
+
+
+def _content_hints(video_ids: list[str], limit: int = 2) -> dict[str, list[str]]:
+    """A few highlight titles per video, as a clue to its content when no title is known."""
+    from moment_retrieval import db
+
+    hints: dict[str, list[str]] = {}
+    conn = db.get_conn()
+    try:
+        for video_id in video_ids:
+            revision = db.get_active_transcript_revision(conn, video_id)
+            run = db.get_latest_ready_highlight_run(conn, video_id, revision) if revision else None
+            if run:
+                titles = [str(c.get("title") or "").strip() for c in db.get_highlight_candidates(conn, run["highlight_run_id"])]
+                # Search-made candidates are titled after the query, which says nothing here.
+                hints[video_id] = [title for title in titles if title and "に関する場面" not in title][:limit]
+    finally:
+        conn.close()
+    return hints
+
+
 def library_choices() -> list[tuple[str, str]]:
-    choices = []
-    for video in library_videos():
+    """Newest first, labelled by stream date, title (or highlight titles) and length."""
+    from moment_retrieval import source_titles
+
+    videos = library_videos()
+    titles = source_titles.load()
+    hints = _content_hints([video["video_id"] for video in videos])
+    rows = []
+    for video in videos:
+        name = str(video["name"] or "")
+        meta = titles.get(source_titles.source_key(name) or "", {})
+        date = _video_date(name, str(meta.get("upload_date") or ""))
+        what = str(meta.get("title") or "") or " / ".join(hints.get(video["video_id"], []))             or Path(name).stem.removesuffix(".audio")
+        if len(what) > 40:
+            what = what[:39] + "…"
+        day = f"{int(date[4:6])}/{int(date[6:8])}" if date else "日付不明"
+        if date and date[:4] != str(datetime.now().year):
+            day = f"{date[:4]}/{day}"
         note = "" if video["source_available"] else "（共有・元動画は自動でダウンロード）"
-        choices.append((f"{video['name']}　{_duration_label(video['duration_sec'])}{note}", video["video_id"]))
-    return choices
+        rows.append((date, f"{day}｜{what}　{_duration_label(video['duration_sec'])}{note}", video["video_id"]))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [(label, video_id) for _date, label, video_id in rows]
+
+
+_titles_fetch_started = False
+
+
+def fetch_missing_titles_in_background() -> None:
+    """Once per run, look up stream titles for older downloads (metadata only)."""
+    global _titles_fetch_started
+    if _titles_fetch_started:
+        return
+    _titles_fetch_started = True
+    from moment_retrieval import source_titles
+
+    names = [str(video["name"] or "") for video in library_videos()]
+    threading.Thread(target=source_titles.fetch_missing, args=(names,), daemon=True).start()
 
 
 def refresh_library():
+    fetch_missing_titles_in_background()
     choices = library_choices()
     return gr.update(choices=choices), gr.update(choices=choices)
 
@@ -771,7 +854,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             with gr.Group(visible=False) as auto_library_group:
                 with gr.Row():
                     auto_library = gr.Dropdown(
-                        choices=[], multiselect=True, scale=5,
+                        choices=[], multiselect=True, scale=5, elem_id="auto-library",
                         label="文字起こし済みの動画（複数選択可・編集用CUTで処理した動画も含む）",
                     )
                     auto_library_refresh = gr.Button("一覧を更新", scale=1)
@@ -1051,6 +1134,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         refresh_library, outputs=[auto_library, share_export_video])
     demo.load(refresh_library, outputs=[auto_library, share_export_video])
     auto_library_refresh.click(refresh_library, outputs=[auto_library, share_export_video])
+    # Close the list after each pick (open it again to add more), and let the arrow open it.
+    auto_library.select(None, None, None, js=_LIBRARY_CLOSE_JS)
+    demo.load(None, None, None, js=_LIBRARY_ARROW_JS)
     share_export_btn.click(export_shared_index, inputs=[share_export_video, share_include_url],
                            outputs=[share_export_file, share_export_md], concurrency_id="library-share")
     share_import_btn.click(

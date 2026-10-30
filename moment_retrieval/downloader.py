@@ -165,6 +165,12 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
     }
 
     title = info.get("title", basename)
+    try:  # remembered so library pickers can show what the stream was
+        from . import source_titles
+
+        source_titles.record(url, info.get("title") or "", info.get("upload_date"))
+    except Exception:
+        pass
     duration = info.get("duration")
     dur_note = f" (長さ {duration // 3600}時間{(duration % 3600) // 60}分)" if duration else ""
     what = "音声だけ" if audio_only else "動画"

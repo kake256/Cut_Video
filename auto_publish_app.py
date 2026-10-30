@@ -690,6 +690,8 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
     else:
         lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
         if not lines:
+            if re.match(r"\s*https?://", str(focus or "")):
+                raise gr.Error("URLが「探したい場面」の欄に入っています。上の「動画のURL」の欄に入れ直してください。")
             raise gr.Error("動画のURLを入力してください。")
     _require_agent_ready(agent)
     submitted = []

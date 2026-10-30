@@ -11,6 +11,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 from . import config
@@ -18,6 +19,20 @@ from . import config
 _TWITCH = re.compile(r"(?:twitch\.tv/videos/|(?:^|_)v)(\d{6,})(?=$|[./?&_])")
 _YOUTUBE = re.compile(r"(?:[?&]v=|youtu\.be/|shorts/|(?:^|[_/]))([A-Za-z0-9_-]{11})(?=$|[.?&])")
 _lock = threading.Lock()
+RETRY_AFTER_SEC = 7 * 24 * 3600  # a deleted VOD is not asked about on every start
+
+
+class _QuietLogger:
+    """yt-dlp prints "ERROR: ... does not exist" for deleted VODs; a missing title is not an error here."""
+
+    def debug(self, _message):
+        pass
+
+    def warning(self, _message):
+        pass
+
+    def error(self, _message):
+        pass
 
 
 def _store_path() -> Path:
@@ -54,19 +69,22 @@ def load() -> dict[str, dict]:
     return data if isinstance(data, dict) else {}
 
 
-def record(url_or_name: str, title: str, upload_date: str | None = None) -> None:
-    key = source_key(url_or_name)
-    title = " ".join(str(title or "").split())
-    if not key or not title:
-        return
+def _save(key: str, entry: dict) -> None:
     with _lock:
         data = load()
-        data[key] = {"title": title, "upload_date": str(upload_date or "")}
+        data[key] = entry
         path = _store_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(temporary, path)
+
+
+def record(url_or_name: str, title: str, upload_date: str | None = None) -> None:
+    key = source_key(url_or_name)
+    title = " ".join(str(title or "").split())
+    if key and title:
+        _save(key, {"title": title, "upload_date": str(upload_date or "")})
 
 
 def fetch_missing(names: list[str], *, extract=None) -> int:
@@ -75,7 +93,9 @@ def fetch_missing(names: list[str], *, extract=None) -> int:
     keys = []
     for name in names:
         key = source_key(name)
-        if key and key not in known and key not in keys:
+        entry = known.get(key or "") or {}
+        recently_missing = not entry.get("title") and time.time() - float(entry.get("missing_at") or 0) < RETRY_AFTER_SEC
+        if key and not entry.get("title") and not recently_missing and key not in keys:
             keys.append(key)
     if not keys:
         return 0
@@ -83,15 +103,18 @@ def fetch_missing(names: list[str], *, extract=None) -> int:
         from yt_dlp import YoutubeDL
 
         def extract(url):
-            with YoutubeDL({"quiet": True, "skip_download": True, "no_warnings": True}) as ydl:
+            options = {"quiet": True, "skip_download": True, "no_warnings": True, "logger": _QuietLogger()}
+            with YoutubeDL(options) as ydl:
                 return ydl.extract_info(url, download=False, process=False)
     found = 0
     for key in keys:
         try:
             info = extract(source_url(key)) or {}
-        except Exception:  # deleted VOD, offline, rate limit: try again next time
-            continue
+        except Exception:  # deleted VOD, offline, rate limit: ask again after RETRY_AFTER_SEC
+            info = {}
         if info.get("title"):
             record(source_url(key), info["title"], info.get("upload_date"))
             found += 1
+        else:
+            _save(key, {"title": "", "upload_date": "", "missing_at": time.time()})
     return found

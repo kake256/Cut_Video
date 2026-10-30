@@ -50,7 +50,11 @@ class SourceTitleStoreTest(unittest.TestCase):
         data = source_titles.load()
         self.assertEqual(data["twitch:111111"]["title"], "既知の 配信")
         self.assertEqual(data["twitch:333333"], {"title": "取り直した配信", "upload_date": "20261002"})
-        self.assertNotIn("twitch:222222", data)
+        self.assertEqual(data["twitch:222222"]["title"], "")
+        # The deleted VOD is not asked about again on the next start.
+        asked.clear()
+        source_titles.fetch_missing(["20261002_000000_v222222.mp4"], extract=extract)
+        self.assertEqual(asked, [])
 
 
 class LibraryChoiceLabelTest(unittest.TestCase):

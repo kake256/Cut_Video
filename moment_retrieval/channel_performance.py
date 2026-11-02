@@ -30,6 +30,7 @@ BATCH_GAP_SEC = 120
 DEAD_BATCH_MEDIAN = 30  # a batch whose median is below this was barely shown to anyone
 MIN_SCORED = 12  # fewer judged clips than this says too little to steer the choice
 EXAMPLES = 6
+MIN_VIEWS_FOR_KEPT = 100  # below this the share kept past the opening is mostly noise
 
 
 def cache_path() -> Path:
@@ -99,13 +100,55 @@ def job_batches() -> dict[str, dict]:
     return result
 
 
-def refresh(*, service_factory: Callable | None = None, now: float | None = None) -> dict:
+def _analytics_service():
+    from google_auth_httplib2 import AuthorizedHttp
+    from googleapiclient.discovery import build
+
+    from . import youtube_upload
+
+    http = AuthorizedHttp(youtube_upload.load_credentials(interactive=False), http=youtube_upload._transport())
+    return build("youtubeAnalytics", "v2", http=http, cache_discovery=False)
+
+
+def fetch_retention(service, *, now: float | None = None, days: int = MAX_AGE_DAYS + 30) -> dict[str, dict]:
+    """video_id -> share of views kept past the first seconds, and the average share watched.
+
+    For Shorts ``views`` counts every start, swipes included, while ``engagedViews``
+    counts only views past the first few seconds, so their ratio is how often the
+    opening held the viewer.
+    """
+    now = time.time() if now is None else now
+    end = datetime.fromtimestamp(now).date()
+    start = datetime.fromtimestamp(now - days * 86400).date()
+    result: dict[str, dict] = {}
+    index = 1
+    while True:
+        response = service.reports().query(
+            ids="channel==MINE", startDate=start.isoformat(), endDate=end.isoformat(),
+            metrics="views,engagedViews,averageViewPercentage", dimensions="video",
+            sort="-views", maxResults=200, startIndex=index).execute()
+        rows = response.get("rows") or []
+        for video_id, views, engaged, percentage in rows:
+            if views:
+                result[str(video_id)] = {"kept": round(engaged / views, 3), "watched": round(percentage / 100, 3)}
+        if len(rows) < 200:
+            return result
+        index += len(rows)
+
+
+def refresh(*, service_factory: Callable | None = None, analytics_factory: Callable | None = None,
+            now: float | None = None) -> dict:
     """Fetch the counts again and save them with each video's batch."""
     from . import youtube_upload
 
     videos = fetch_videos(youtube_upload._service(service_factory, interactive=False))
+    try:
+        retention = fetch_retention((analytics_factory or _analytics_service)(), now=now)
+    except Exception:  # Analytics API off or not allowed: views alone still work
+        retention = {}
     batches = job_batches()
     for video in videos:
+        video.update(retention.get(video["id"]) or {})
         joined = batches.get(video["id"])
         # Clips posted outside an auto job (by hand from the app) are grouped by posting hour.
         video["batch"] = joined["batch"] if joined else f"hour:{int(video['published_at'] // 3600)}"
@@ -190,11 +233,29 @@ def prompt_section(*, data: dict | None = None, now: float | None = None) -> str
         return ""
 
     def lines(videos: list[dict]) -> str:
-        return "".join(f"- {video['title']}（{video['views']}回）\n" for video in videos)
+        return "".join(
+            f"- {video['title']}（{video['views']}回"
+            + (f"、冒頭で離れなかった人{video['kept']:.0%}" if _kept_known(video) else "") + "）\n"
+            for video in videos)
 
     return (
         "参考: このチャンネルで同時に投稿した切り抜きのうち、よく見られたもののタイトル:\n" + lines(good)
         + "同時に投稿した中であまり見られなかったもの:\n" + lines(poor)
         + "両者の題材や切り口の違いを踏まえ、よく見られた側に近い場面を優先する。"
         "あまり見られなかった側に近い場面は、他に良い場面がないときだけ選ぶ。タイトルを真似る必要はない。\n"
+        + _opening_line(scored((data or {}).get("videos") or [], now=now))
     )
+
+
+def _kept_known(video: dict) -> bool:
+    return "kept" in video and video.get("views", 0) >= MIN_VIEWS_FOR_KEPT
+
+
+def _opening_line(judged: list[dict]) -> str:
+    """How often the opening loses viewers here, when the channel has enough retention data."""
+    kept = [video["kept"] for video in judged if _kept_known(video)]
+    if len(kept) < MIN_SCORED:
+        return ""
+    return (f"このチャンネルでは、見始めた人の{1 - statistics.median(kept):.0%}が最初の数秒で離れている。"
+            "よく見られた切り抜きほど冒頭で離れる人が少ない。開始位置は、最初の1〜2秒で何が起きているか"
+            "分かる発言や出来事の直前にし、前置きや相づちから始めない。\n")

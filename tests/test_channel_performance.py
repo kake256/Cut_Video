@@ -77,6 +77,44 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(channel_performance.prompt_section(data={"videos": []}, now=NOW), "")
 
 
+class _Analytics:
+    """reports().query(...).execute() returning fixed rows, recording each query."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.queries = []
+
+    def reports(self):
+        return self
+
+    def query(self, **kwargs):
+        self.queries.append(kwargs)
+        return self
+
+    def execute(self):
+        return {"rows": self.rows}
+
+
+class RetentionTest(unittest.TestCase):
+    def test_kept_is_engaged_over_all_views(self):
+        analytics = _Analytics([["a", 200, 50, 31.5], ["b", 0, 0, 0.0]])
+        self.assertEqual(channel_performance.fetch_retention(analytics, now=NOW),
+                         {"a": {"kept": 0.25, "watched": 0.315}})
+        self.assertIn("engagedViews", analytics.queries[0]["metrics"])
+
+    def test_prompt_shows_retention_when_known(self):
+        videos = [{**video, "kept": 0.2} for video in _library()]
+        text = channel_performance.prompt_section(data={"videos": videos}, now=NOW)
+        self.assertIn("title a0（1800回、冒頭で離れなかった人20%）", text)
+        self.assertIn("title a7（20回）", text)  # too few views for the share to mean much
+        self.assertNotIn("最初の数秒", text)  # 11 clips with enough views, fewer than MIN_SCORED
+        busier = [{**video, "views": video["views"] * 10} for video in videos]
+        text = channel_performance.prompt_section(data={"videos": busier}, now=NOW)
+        self.assertIn("80%が最初の数秒で離れている", text)
+        plain = channel_performance.prompt_section(data={"videos": _library()}, now=NOW)
+        self.assertNotIn("最初の数秒", plain)
+
+
 class CacheTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -114,9 +152,13 @@ class CacheTest(unittest.TestCase):
                     "views": 3, "likes": 0, "comments": 0},
                    {"id": "v2", "title": "u", "published_at": NOW, "seconds": 60, "privacy": "public",
                     "views": 3, "likes": 0, "comments": 0}]
+        analytics = _Analytics([["v1", 10, 4, 25.0]])
         with patch.object(channel_performance, "fetch_videos", return_value=fetched), \
                 patch("moment_retrieval.youtube_upload._service", return_value=object()):
-            data = channel_performance.refresh(now=NOW)
+            data = channel_performance.refresh(now=NOW, analytics_factory=lambda: analytics)
+        self.assertEqual(data["videos"][0]["kept"], 0.4)
+        self.assertEqual(data["videos"][0]["watched"], 0.25)
+        self.assertNotIn("kept", data["videos"][1])
         self.assertEqual(data["videos"][0]["batch"], "auto_1")
         self.assertEqual(data["videos"][0]["source"], "twitch-video:v1")
         self.assertTrue(data["videos"][1]["batch"].startswith("hour:"))

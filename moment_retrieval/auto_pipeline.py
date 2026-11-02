@@ -696,6 +696,13 @@ class AutoPipeline:
             )
             return after
 
+        from .channel_performance import prompt_section as performance_section
+
+        # A requested scene wins over the channel's taste, so the hint is only for open choices.
+        performance = "" if job.focus else performance_section()
+        if performance:
+            self._log(job, "過去の投稿でよく見られた切り抜きとそうでないものを参考に選ぶよう指示します。")
+
         def register(process):
             with self.lock:
                 self.processes[job.job_id] = process
@@ -703,7 +710,8 @@ class AutoPipeline:
         output = agent_runner.run_agent(
             job.agent,
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
-                                     used_ranges=tuple(used), focus=job.focus, hints=prompt_section(hints)),
+                                     used_ranges=tuple(used), focus=job.focus,
+                                     hints=prompt_section(hints) + performance),
             register_process=register,
             model=job.model,
             effort=job.effort,

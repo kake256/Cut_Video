@@ -109,6 +109,42 @@ class PublicationTest(unittest.TestCase):
         os.utime(orphan, (old, old))
         self.assertEqual(cleanup_orphan_generations(self.conn, grace_sec=1), [orphan])
 
+    def test_superseded_generations_are_cleaned_but_current_and_leased_stay(self):
+        import os
+
+        def publish():
+            expected = self.conn.execute(
+                "SELECT current_publication_id FROM library_state"
+            ).fetchone()[0]
+            return publish_current_generation(self.conn, expected)
+
+        first = publish()
+        leased_snapshot = resolve_snapshot(self.conn)  # a search still reading `first`
+        second = publish()
+        third = publish()
+        root = config.search_generations_dir()
+        old = time.time() - 7200
+        for generation in (first, second, third):
+            os.utime(root / generation.generation_id, (old, old))
+
+        preview = cleanup_orphan_generations(self.conn, grace_sec=1, dry_run=True)
+        self.assertEqual(preview, [root / second.generation_id])
+        self.assertTrue((root / second.generation_id).exists())
+
+        self.assertEqual(
+            cleanup_orphan_generations(self.conn, grace_sec=1), [root / second.generation_id]
+        )
+        self.assertFalse((root / second.generation_id).exists())
+        self.assertTrue((root / third.generation_id / "vectors.faiss").exists())
+        self.assertTrue((root / first.generation_id).exists())
+
+        release_snapshot(self.conn, leased_snapshot)
+        self.assertEqual(
+            cleanup_orphan_generations(self.conn, grace_sec=1), [root / first.generation_id]
+        )
+        self.assertEqual(resolve_snapshot(self.conn, acquire_lease=False).generation_id,
+                         third.generation_id)
+
     def test_writer_lease_conflicts_across_connections_and_heartbeats(self):
         second = db.get_conn()
         try:
@@ -402,6 +438,33 @@ class PublicationTest(unittest.TestCase):
             ).fetchone()[0],
             expected,
         )
+
+
+class MigrationBackupRetentionTest(unittest.TestCase):
+    def test_only_the_newest_backups_are_kept(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "index.db"
+            conn = sqlite3.connect(database)
+            try:
+                conn.execute("CREATE TABLE t(x)")
+                conn.execute("INSERT INTO t VALUES (1)")
+                conn.commit()
+                backup_dir = Path(tmp) / "migration-backups"
+                backup_dir.mkdir()
+                for version in (1, 2, 3):
+                    old = backup_dir / f"index.db.v{version}.bak"
+                    old.write_bytes(b"old")
+                    os.utime(old, (1000 + version, 1000 + version))
+                unrelated = backup_dir / "other.db.v1.bak"
+                unrelated.write_bytes(b"keep")
+                created = db._backup_before_migration(conn, 4)
+            finally:
+                conn.close()
+            remaining = sorted(path.name for path in backup_dir.iterdir())
+        self.assertEqual(created.name, "index.db.v4.bak")
+        self.assertEqual(remaining, ["index.db.v3.bak", "index.db.v4.bak", "other.db.v1.bak"])
 
 
 if __name__ == "__main__":

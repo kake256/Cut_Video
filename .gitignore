@@ -35,3 +35,6 @@ Thumbs.db
 
 # OAuth client bundled into a distributed copy of CUT (do not publish)
 youtube_oauth_client.json
+
+# App-local binaries (e.g. an ffmpeg build matching the GPU driver)
+tools/

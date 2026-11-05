@@ -21,6 +21,7 @@ from typing import Callable
 from . import config
 
 YOUTUBE_API = "youtube.googleapis.com"
+SCRIPT_API = "script.googleapis.com"
 _PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 
 
@@ -154,6 +155,8 @@ def create_project_and_enable_api(*, runner: Callable = subprocess.run) -> dict:
         _state_path().parent.mkdir(parents=True, exist_ok=True)
         _state_path().write_text(json.dumps({"project_id": project_id, "account": account}), encoding="utf-8")
     _run(["services", "enable", YOUTUBE_API, f"--project={project_id}", "--quiet"], timeout=300, runner=runner)
+    # Lets the app create the cloud (GAS) version of the comment auto-reply.
+    _run(["services", "enable", SCRIPT_API, f"--project={project_id}", "--quiet"], timeout=300, runner=runner)
     return {"project_id": project_id, "account": account, "created": created}
 
 

@@ -22,8 +22,12 @@ class _Request:
         self.body = body
         self.steps = [(_Status(0.5), None), (None, {"id": "abcDEF12345", "status": {"privacyStatus": "private"}})]
 
-    def next_chunk(self):
-        return self.steps.pop(0)
+    def next_chunk(self, num_retries=0):
+        self.num_retries = num_retries
+        step = self.steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
 
 
 class _Service:
@@ -44,6 +48,60 @@ class _Service:
 
 
 class PublishTest(unittest.TestCase):
+    def test_publish_scope_is_requested_and_old_tokens_are_detected(self):
+        self.assertIn("https://www.googleapis.com/auth/youtube", youtube_upload.SCOPES)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
+            self.assertEqual(youtube_upload.missing_scopes(), [])
+            youtube_upload.token_path().write_text(json.dumps({"scopes": youtube_upload.SCOPES[:2]}), encoding="utf-8")
+            self.assertEqual(youtube_upload.missing_scopes(), ["https://www.googleapis.com/auth/youtube"])
+            with self.assertRaises(youtube_upload.UploadError):
+                youtube_upload.load_credentials(interactive=False)
+
+    def test_network_errors_while_renewing_are_retried_not_treated_as_signed_out(self):
+        from google.auth.exceptions import RefreshError, TransportError
+
+        class _Creds:
+            def __init__(self, failures):
+                self.failures = list(failures)
+                self.calls = 0
+
+            def refresh(self, request):
+                self.calls += 1
+                if self.failures:
+                    raise self.failures.pop(0)
+
+        flaky = _Creds([TransportError("timed out")])
+        self.assertIs(youtube_upload._refresh(flaky, object, sleep=lambda s: None), flaky)
+        self.assertEqual(flaky.calls, 2)
+        down = _Creds([TransportError("x")] * 3)
+        with self.assertRaisesRegex(youtube_upload.UploadError, "接続できませんでした"):
+            youtube_upload._refresh(down, object, sleep=lambda s: None)
+        revoked = _Creds([RefreshError("invalid_grant")])
+        self.assertIsNone(youtube_upload._refresh(revoked, object, sleep=lambda s: None))
+        self.assertEqual(revoked.calls, 1)
+
+    def test_background_upload_never_opens_the_browser_sign_in(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"x")
+            with patch("google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file") as flow:
+                with self.assertRaises(youtube_upload.UploadError):
+                    list(youtube_upload.upload_private(video, interactive=False))
+            flow.assert_not_called()
+
+    def test_missing_permission_error_is_explained(self):
+        class _Denied:
+            def videos(self):
+                return self
+
+            def update(self, part, body):
+                return SimpleNamespace(execute=lambda: (_ for _ in ()).throw(
+                    RuntimeError("HttpError 403 insufficientPermissions")))
+
+        with self.assertRaises(youtube_upload.UploadError) as ctx:
+            youtube_upload.publish("abcDEF12345", service_factory=_Denied)
+        self.assertIn("連携", str(ctx.exception))
+
     def test_publish_sets_public_and_reports_locked_private(self):
         service = _Service()
         result = youtube_upload.publish("abcDEF12345", service_factory=lambda: service)
@@ -74,6 +132,16 @@ class YouTubeUploadTest(unittest.TestCase):
         self.assertLessEqual(len(body["snippet"]["title"]), youtube_upload.MAX_TITLE)
         self.assertEqual(body["snippet"]["tags"], ["株", "決算"])
 
+    def test_unlisted_can_be_chosen_but_public_cannot(self):
+        metadata = youtube_upload.metadata_for(self.video)
+        self.assertEqual(metadata.request_body("unlisted")["status"]["privacyStatus"], "unlisted")
+        with self.assertRaises(youtube_upload.UploadError):
+            metadata.request_body("public")
+        service = _Service()
+        messages = list(youtube_upload.upload_private(self.video, privacy="unlisted", service_factory=lambda: service))
+        self.assertIn("限定公開", messages[0][0])
+        self.assertEqual(messages[-1][1]["watch_url"], "https://www.youtube.com/watch?v=abcDEF12345")
+
     def test_filename_is_the_fallback_title(self):
         self.assertEqual(youtube_upload.metadata_for(self.video).title, "clip_見どころ")
 
@@ -87,6 +155,37 @@ class YouTubeUploadTest(unittest.TestCase):
         again = list(youtube_upload.upload_private(self.video, service_factory=lambda: service))
         self.assertEqual(len(service.inserted), 1)
         self.assertIn("省略", again[0][0])
+
+    def test_a_stalled_upload_retries_then_fails_with_a_message_and_no_receipt(self):
+        import socket
+
+        service = _Service()
+        original = service.insert
+
+        def insert(part, body, media_body):
+            request = original(part, body, media_body)
+            request.steps = [socket.timeout("timed out")]
+            service.request = request
+            return request
+
+        service.insert = insert
+        with self.assertRaises(youtube_upload.UploadError) as caught:
+            list(youtube_upload.upload_private(self.video, service_factory=lambda: service))
+        self.assertIn("もう一度実行", str(caught.exception))
+        self.assertEqual(service.request.num_retries, youtube_upload.UPLOAD_RETRIES)
+        self.assertFalse(youtube_upload.receipt_path(self.video).is_file())
+
+    def test_service_has_a_network_timeout(self):
+        import httplib2
+
+        with patch.object(youtube_upload, "load_credentials", return_value=object()), \
+                patch("googleapiclient.discovery.build", side_effect=lambda *a, **k: k["http"]) as build:
+            http = youtube_upload._service(None, interactive=False)
+        self.assertIsInstance(http.http, httplib2.Http)
+        self.assertEqual(http.http.timeout, youtube_upload.HTTP_TIMEOUT_SEC)
+        # 308 "Resume Incomplete" after each chunk must not be followed as a redirect.
+        self.assertNotIn(308, http.http.redirect_codes)
+        self.assertNotIn("credentials", build.call_args.kwargs)
 
     def test_non_mp4_is_rejected(self):
         other = self.root / "notes.txt"
@@ -156,6 +255,84 @@ class AutoPublishAppTest(unittest.TestCase):
         self.assertEqual(auto_publish_app.APP_PORT, 7870)
         self.assertIsNotNone(auto_publish_app.demo)
         self.assertFalse(hasattr(app, "auto_submit"))
+
+    def test_download_only_button_starts_link_only_jobs(self):
+        import auto_publish_app
+
+        pipeline = SimpleNamespace(submit=Mock(return_value=SimpleNamespace(job_id="auto_dl")))
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
+                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", None, None)), \
+                patch.object(auto_publish_app.gr, "Info"):
+            result = auto_publish_app.auto_download_only("https://youtu.be/abcDEF12345\n\n")
+        pipeline.submit.assert_called_once_with("https://youtu.be/abcDEF12345", "codex", link_only=True)
+        self.assertEqual(result[0], "")
+
+    def test_only_the_visible_input_is_used(self):
+        import auto_publish_app
+
+        pipeline = SimpleNamespace(submit=Mock(return_value=SimpleNamespace(job_id="auto_x")))
+        common = ("codex", "gpt-6-luna", 1, "high", 20, 60, "blur", False)
+        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline),                 patch.object(auto_publish_app, "_require_agent_ready"), \
+                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", None, None)), \
+                patch.object(auto_publish_app.gr, "Info"):
+            auto_publish_app.auto_submit("library", "https://youtu.be/abcDEF12345", ["vid_a"], *common)
+            auto_publish_app.auto_submit("url", "https://youtu.be/abcDEF12345", ["vid_a"], *common)
+        sources = [call.args[0] for call in pipeline.submit.call_args_list]
+        self.assertEqual(sources, ["library:vid_a", "https://youtu.be/abcDEF12345"])
+        url_visible, library_visible, download_visible = auto_publish_app.on_mode_change("library")
+        self.assertEqual((url_visible["visible"], library_visible["visible"], download_visible["visible"]),
+                         (False, True, False))
+
+    def test_length_layout_and_effort_are_saved_as_defaults(self):
+        import auto_publish_app
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "LIBRARY_ROOT", Path(tmp)):
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "unlisted"))
+            auto_publish_app.save_ui_settings("max", 15, 45, "crop", False, "unlisted")
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("max", 15.0, 45.0, "crop", False, "unlisted"))
+            self.assertEqual(auto_publish_app._upload_args("unlisted"), {"upload": True, "privacy": "unlisted"})
+            self.assertEqual(auto_publish_app._upload_args("none"), {"upload": False, "privacy": "private"})
+            with self.assertRaises(auto_publish_app.gr.Error):
+                auto_publish_app.save_ui_settings("high", 50, 20, "blur")
+            (Path(tmp) / "auto_publish_ui.json").write_text('{"max_sec": 999, "layout": "x", "upload": "public"}',
+                                                            encoding="utf-8")
+            self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "unlisted"))
+
+    def test_privacy_buttons_change_right_away_and_summarise_failures(self):
+        import auto_publish_app
+        from moment_retrieval import made_clips
+
+        with self.assertRaises(auto_publish_app.gr.Error):
+            auto_publish_app.change_clip_privacy([], "public")
+
+        def change(path, privacy):
+            if path != "a.mp4":
+                raise youtube_upload.UploadError("権限がありません")
+            return {"video_id": "yt1", "privacy_status": privacy, "watch_url": "https://www.youtube.com/watch?v=yt1"}
+
+        with patch.object(made_clips, "change_privacy", side_effect=change) as changed, \
+                patch.object(auto_publish_app, "_sync_job_uploads") as synced, \
+                patch.object(auto_publish_app, "cards_signature", return_value="[]"), \
+                patch.object(auto_publish_app.gr, "Info"):
+            result = auto_publish_app.change_clip_privacy(["a.mp4", "b.mp4", "c.mp4"], "public")
+        self.assertEqual(changed.call_count, 3)
+        synced.assert_called_once()
+        self.assertIn("watch?v=yt1", result[0])
+        self.assertIn("2本を公開にできませんでした: 権限がありません", result[0])
+        self.assertEqual(len(result), 2)
+
+    def test_card_signature_tracks_uploads_and_privacy_only(self):
+        import auto_publish_app
+
+        clip = SimpleNamespace(path=Path("a.mp4"), receipt=None)
+        cards = [{"job_id": "auto_a", "clips": [clip]}]
+        before = auto_publish_app.cards_signature(cards)
+        self.assertEqual(auto_publish_app.cards_signature(cards), before)
+        clip.receipt = {"video_id": "yt1", "privacy_status": "private"}
+        uploaded = auto_publish_app.cards_signature(cards)
+        self.assertNotEqual(uploaded, before)
+        clip.receipt = {"video_id": "yt1", "privacy_status": "public"}
+        self.assertNotEqual(auto_publish_app.cards_signature(cards), uploaded)
 
     def test_quit_stops_running_jobs_then_exits_later(self):
         import auto_publish_app

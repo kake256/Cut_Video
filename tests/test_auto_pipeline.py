@@ -1,7 +1,10 @@
 """Auto clip -> private upload -> one-click publish, with every external step faked."""
 import json
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -118,6 +121,23 @@ class PipelineTest(_Isolated):
         self.assertEqual(saved["state"], "done")
         reloaded = auto_pipeline.AutoPipeline(steps={})
         self.assertEqual(reloaded.jobs["auto_test"].highlight_run_id, "highlight_1")
+        steps = [item["step"] for item in saved["timings"]]
+        self.assertEqual(steps, ["metadata", "download", "index", "select", "await_video", "export", "upload"])
+        self.assertTrue(all(item["seconds"] >= 0 for item in saved["timings"]))
+
+    def test_report_sums_step_times_and_counts_fallbacks(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import report_auto_jobs
+
+        job = {"job_id": "auto_r", "state": "done", "agent": "claude", "model": "sonnet", "created_at": 100.0,
+               "_ended_at": 9999.0, "outputs": ["a", "b"], "video_id": "",
+               "timings": [{"step": "index", "started_at": 100.0, "seconds": 300.0},
+                           {"step": "finish", "started_at": 400.0, "seconds": 120.0}],
+               "log": ["  1本目:音声の聞き直しに失敗したため、文字起こしの単語時刻を使います（RuntimeError）"]}
+        row = report_auto_jobs.summarise(job)
+        self.assertEqual(row["steps_min"], {"index": 5.0, "finish": 2.0})
+        self.assertEqual(row["total_min"], 7.0)
+        self.assertEqual(row["fallbacks"], {"聞き直し失敗→文字起こしの字幕": 1})
 
     def test_publish_needs_only_the_click_and_happens_once(self):
         calls = []
@@ -216,6 +236,62 @@ class PipelineTest(_Isolated):
         relink.assert_called_once_with(ids["shared"], downloaded)
         self.assertEqual(video_id, ids["shared"])
 
+    def test_finishing_runs_between_export_and_upload_only_when_requested(self):
+        calls = []
+        pipeline = self._pipeline(calls)
+        pipeline.steps["finish"] = lambda job: calls.append("finish")
+        for finish, expected in ((False, []), (True, ["finish"])):
+            calls.clear()
+            job = auto_pipeline.AutoJob(job_id=f"auto_fin_{finish}", source="x", agent="codex", finish=finish)
+            pipeline.jobs[job.job_id] = job
+            pipeline.run(job)
+            self.assertEqual([c for c in calls if c == "finish"], expected)
+            if finish:
+                self.assertLess(calls.index("export"), calls.index("finish"))
+                self.assertLess(calls.index("finish"), calls.index("upload"))
+
+    def test_clip_ranges_are_fetched_instead_of_waiting_while_the_video_downloads(self):
+        calls = []
+        pipeline = self._pipeline(calls)
+        pipeline.steps["finish"] = lambda job: calls.append("finish")
+        pipeline.steps["await_video"] = lambda job: calls.append("await_video")
+        for sections_ok, expected in ((True, ["export", "sections", "finish"]),
+                                      (False, ["export", "sections", "await_video", "finish"])):
+            calls.clear()
+            pipeline.steps["sections"] = lambda job, ok=sections_ok: (calls.append("sections"), ok)[1]
+            job = auto_pipeline.AutoJob(job_id=f"auto_sec_{sections_ok}", source="x", agent="claude", finish=True)
+            pipeline.jobs[job.job_id] = job
+            with patch.object(pipeline, "_video_still_downloading", return_value=True):
+                pipeline.run(job)
+            self.assertEqual(job.state, "done")
+            self.assertEqual([c for c in calls if c in {"export", "sections", "await_video", "finish"}], expected)
+
+    def test_section_download_maps_each_clip_to_its_file_and_offset(self):
+        from moment_retrieval import downloader
+
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        outputs = []
+        for index, (start, end) in enumerate(((1.0, 30.0), (100.0, 160.0))):
+            clip = self.root / f"c{index}.mp4"
+            clip.with_suffix(".metadata.json").write_text(
+                json.dumps({"source_range": {"start_sec": start, "end_sec": end}}), encoding="utf-8")
+            outputs.append(str(clip))
+        job = auto_pipeline.AutoJob(job_id="auto_map", source="https://x", agent="claude", finish=True,
+                                    outputs=outputs)
+        pipeline.video_downloads[job.job_id] = type("D", (), {"url": "https://x", "done": False})()
+        seen = {}
+
+        def fake(url, ranges, directory, **_kwargs):
+            seen["ranges"] = ranges
+            return [Path(directory) / f"section_{index:02d}.mp4" for index in range(len(ranges))]
+
+        with patch.object(downloader, "download_sections", side_effect=fake):
+            self.assertTrue(pipeline._sections(job))
+        self.assertEqual(seen["ranges"], [(0.0, 32.0), (98.0, 162.0)])
+        files = pipeline.clip_sources[job.job_id]["files"]
+        self.assertEqual(files[outputs[1]][1], 98.0)
+        self.assertEqual(files[outputs[1]][0].name, "section_01.mp4")
+
     def test_link_only_job_downloads_and_links_without_clipping(self):
         calls = []
         pipeline = self._pipeline(calls)
@@ -225,7 +301,7 @@ class PipelineTest(_Isolated):
         pipeline.run(job)
         self.assertEqual(job.state, "done")
         self.assertEqual(calls, ["metadata", "download", "index"])
-        self.assertIn("関連付けました", job.log[-1])
+        self.assertIn("文字起こしが完了しました", job.log[-1])
 
     def test_backfill_records_clips_uploaded_before_tracking(self):
         from moment_retrieval import db, used_ranges
@@ -262,6 +338,124 @@ class PipelineTest(_Isolated):
         pipeline = auto_pipeline.AutoPipeline(steps={})
         self.assertEqual(pipeline.jobs["auto_old"].state, "failed")
         self.assertEqual(pipeline.jobs["auto_old"].source_video_key, "")
+
+
+class DeferredRenderTest(_Isolated):
+    def _status(self, outputs):
+        def run_logged(job, command):
+            status = Path(command[command.index("--status-file") + 1])
+            status.write_text(json.dumps({"state": "done", "outputs": outputs}), encoding="utf-8")
+            self.commands.append(command)
+            return 0
+        return run_logged
+
+    def test_export_only_records_ranges_when_finishing_follows(self):
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        for finish in (False, True):
+            self.commands = []
+            job = auto_pipeline.AutoJob(job_id=f"auto_defer_{finish}", source="x", agent="codex",
+                                        finish=finish, video_id="vid_x", highlight_run_id="run_x")
+            with patch.object(auto_pipeline, "_jobs_dir", return_value=self.root),                     patch.object(pipeline, "_run_logged", side_effect=self._status(["a.mp4"])):
+                pipeline._export(job)
+            self.assertEqual("--defer-render" in self.commands[0], finish)
+
+    def test_a_failed_finish_still_produces_a_plain_clip(self):
+        from moment_retrieval import finishing
+
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        made, lost = self.root / "made.mp4", self.root / "lost.mp4"
+        job = auto_pipeline.AutoJob(job_id="auto_plain", source="x", agent="codex", finish=True,
+                                    outputs=[str(made), str(lost)])
+
+        def plain(clip, section=None):
+            if clip == made:
+                clip.write_bytes(b"mp4")
+                return clip
+            raise RuntimeError("source gone")
+
+        with patch.object(finishing, "finish_exported_clip", side_effect=RuntimeError("ai down")),                 patch.object(finishing, "render_plain_clip", side_effect=plain):
+            pipeline._finish(job)
+        self.assertEqual(job.outputs, [str(made)])
+        self.assertTrue(any("仕上げなしの動画" in line for line in job.log))
+
+    def test_clips_are_finished_side_by_side_and_the_whisper_model_released(self):
+        from moment_retrieval import finishing, relisten
+
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        outputs = [self.root / f"clip{index}.mp4" for index in range(4)]
+        job = auto_pipeline.AutoJob(job_id="auto_par", source="x", agent="claude", finish=True,
+                                    outputs=[str(path) for path in outputs])
+        running, peak, lock = [0], [0], threading.Lock()
+
+        def finish(clip, **_kwargs):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            time.sleep(0.2)
+            clip.write_bytes(b"mp4")
+            with lock:
+                running[0] -= 1
+            return finishing.FinishPlan(hook_text="引き")
+
+        with patch.object(auto_pipeline, "FINISH_WORKERS", 3), \
+                patch.object(finishing, "finish_exported_clip", side_effect=finish), \
+                patch.object(relisten, "release_model") as release:
+            pipeline._finish(job)
+        self.assertEqual(peak[0], 3)
+        self.assertEqual(job.outputs, [str(path) for path in outputs])
+        release.assert_called_once()
+
+    def test_selection_leaves_captions_to_finishing(self):
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        requests = []
+        for finish in (False, True):
+            job = auto_pipeline.AutoJob(job_id=f"auto_cap_{finish}", source="x", agent="claude",
+                                        finish=finish, video_id="vid_x")
+            with patch.object(pipeline, "_signals", return_value=[]), \
+                    patch("moment_retrieval.used_ranges.for_video", return_value=[]), \
+                    patch.object(agent_runner, "run_agent",
+                                 side_effect=lambda agent, request, **_k: requests.append(request) or ""), \
+                    patch.object(pipeline, "_ready_run_ids", return_value=[]), \
+                    patch.object(pipeline, "_collect_runs", return_value="run_x"):
+                pipeline._select(job)
+        self.assertEqual([request.confirm_captions for request in requests], [True, False])
+
+
+class KillProcessTreeTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "taskkill is Windows-only")
+    def test_cancel_stops_grandchildren_such_as_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+            # Parent starts a long-running grandchild (stands in for ffmpeg) and waits.
+            parent_code = (
+                "import subprocess, sys, time;"
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']);"
+                f"open({str(pid_file)!r}, 'w').write(str(p.pid));"
+                "time.sleep(120)"
+            )
+            parent = subprocess.Popen([sys.executable, "-c", parent_code])
+            try:
+                deadline = time.time() + 20
+                while not pid_file.exists() or not pid_file.read_text():
+                    self.assertLess(time.time(), deadline, "grandchild did not start")
+                    time.sleep(0.1)
+                grandchild = int(pid_file.read_text())
+                auto_pipeline.kill_process_tree(parent)
+                parent.wait(timeout=10)
+                deadline = time.time() + 10
+                while _pid_running(grandchild) and time.time() < deadline:
+                    time.sleep(0.2)
+                self.assertFalse(_pid_running(grandchild))
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+
+
+def _pid_running(pid: int) -> bool:
+    listing = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True
+    ).stdout
+    return str(pid) in listing
 
 
 if __name__ == "__main__":

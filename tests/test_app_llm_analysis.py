@@ -220,6 +220,27 @@ class AppLlmAnalysisTest(unittest.TestCase):
             self.assertEqual(sidecar.parent, video_path.parent)
             self.assertNotEqual(video_path.parent, Path(temporary).resolve())
 
+    def test_highlight_export_can_defer_the_render_to_finishing(self):
+        video = {"path": "private-source.mp4", "display_name": "synthetic_source.mp4", "duration": 120.0}
+        candidate = {"highlight_candidate_id": "candidate-1", "start_sec": 10.0, "end_sec": 20.0,
+                     "title": "候補タイトル", "export_title": "章タイトル"}
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(app, "_highlight_export_context", return_value=(video, [candidate])),
+                patch.object(app, "render_short_clip") as renderer,
+                patch.object(app, "_highlight_short_captions", return_value=((), [])),
+            ):
+                outputs = list(app.export_highlight_candidates(
+                    "vid_synthetic", "", "all", temporary, True, "short", "blur", "1080x1920", True,
+                    write_metadata=True, render_video=False,
+                ))
+            renderer.assert_not_called()
+            video_path = Path(outputs[-1][1][0])
+            self.assertFalse(video_path.exists())
+            payload = json.loads(video_path.with_suffix(".metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["source_range"]["start_sec"], 10.0)
+            self.assertIn("動画は仕上げで作成", outputs[-1][0])
+
     def test_highlight_export_can_render_captioned_short_video(self):
         video = {
             "path": "synthetic.mp4",
@@ -767,6 +788,53 @@ class AppLlmAnalysisTest(unittest.TestCase):
         self.assertIn('value="candidate-safe"', rendered)
         self.assertIn("highlight-candidate-description", rendered)
         self.assertEqual(choices[0][1], "candidate-safe")
+        self.assertIn("文字起こしだけを使った候補です", rendered)
+
+    def test_latest_highlights_show_excitement_line_per_candidate(self):
+        ready = {
+            "highlight_run_id": "highlight-ready",
+            "status": "ready",
+            "requested_count": 3,
+            "result": {
+                "requested_count": 3,
+                "all_segment_linked": True,
+                "excitement": {
+                    "sources": ["audio", "chat"],
+                    "candidates": ["盛り上がり: 最大8/10, コメント2.5倍, 笑い多め"],
+                    "ranked_by_excitement": True,
+                    "llm_rank": [3],
+                },
+            },
+        }
+        candidates = [{
+            "highlight_candidate_id": "candidate-1",
+            "start_sec": 10.0,
+            "end_sec": 35.0,
+            "title": "候補",
+            "summary": "要点を説明している。",
+            "reason": "笑いが起きたため。",
+            "category": "笑い",
+            "tags": [],
+            "boundary_warning": False,
+        }]
+        with (
+            patch.object(app, "parse_video_choice", return_value="vid_synthetic"),
+            patch.object(app.db, "get_conn", return_value=_Connection()),
+            patch.object(app.db, "init_db"),
+            patch.object(
+                app.db, "get_active_transcript_revision", return_value="revision-1"
+            ),
+            patch.object(app.db, "list_highlight_runs", return_value=[ready]),
+            patch.object(
+                app.db, "get_highlight_candidates", return_value=candidates
+            ),
+        ):
+            rendered, _choices = app._latest_highlight_view("synthetic")
+
+        self.assertIn("<li>盛り上がり: 最大8/10, コメント2.5倍, 笑い多め（AIの順位: 3位）</li>", rendered)
+        self.assertIn("盛り上がりが高い順に並べています", rendered)
+        self.assertIn("音量とコメントから計算した盛り上がり", rendered)
+        self.assertNotIn("文字起こしだけを使った候補です", rendered)
 
     def test_highlight_candidate_opens_as_exact_clean_edit_plan(self):
         video = {

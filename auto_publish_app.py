@@ -8,22 +8,70 @@ Publishing stays a one-click action limited to allow-listed channels.
 from __future__ import annotations
 
 import html
+import json
 import os
+import re
 import socket
 import threading
 import webbrowser
+from datetime import datetime
+from functools import partial
 from pathlib import Path
+from urllib.parse import quote
 
 os.chdir(Path(__file__).resolve().parent)
 
+# onnxruntime (Silero VAD, used when finishing relistens each clip) fails to load its
+# DLL on Windows once gradio is imported, so load it first.
+try:
+    import onnxruntime  # noqa: E402,F401
+except ImportError:
+    pass
+
 import gradio as gr  # noqa: E402
 
-from moment_retrieval import agent_runner, ai_setup, config, gcloud_setup, youtube_upload  # noqa: E402
+from moment_retrieval import (  # noqa: E402
+    agent_runner, ai_setup, config, gcloud_setup, youtube_auto_reply, youtube_gas, youtube_upload,
+)
 from moment_retrieval.auto_pipeline import (  # noqa: E402
     LIBRARY_PREFIX, SHORTS_MAX_SEC, AutoPipeline, PipelineError, library_videos,
 )
 
 APP_PORT = int(os.environ.get("CUT_AUTO_PUBLISH_PORT", "7870"))
+
+# Gradio's multiselect dropdown ignores clicks on its arrow and stays open after a pick.
+_LIBRARY_ARROW_JS = """() => {
+  if (window.__cutLibraryArrow) return;
+  window.__cutLibraryArrow = true;
+  document.addEventListener('mousedown', (event) => {
+    const icon = event.target.closest('#auto-library .icon-wrap');
+    if (!icon) return;
+    event.preventDefault();
+    const input = icon.closest('#auto-library').querySelector('input');
+    if (document.activeElement === input) { input.blur(); return; }
+    input.focus();
+    input.click();
+  }, true);
+}"""
+_LIBRARY_CLOSE_JS = """() => {
+  const active = document.activeElement;
+  if (active && active.closest('#auto-library')) active.blur();
+}"""
+# Operable panels get a light gray fill; fields inside stay white so they read as inputs.
+APP_CSS = """
+#auto-library .icon-wrap { cursor: pointer; }
+.gradio-container {
+    --body-background-fill: #ffffff;
+    --block-background-fill: #f1f3f5;
+    --block-border-color: #dde1e6;
+    --input-background-fill: #ffffff;
+}
+.dark .gradio-container {
+    --body-background-fill: #0f1115;
+    --block-background-fill: #1d2026;
+    --input-background-fill: #121418;
+}
+"""
 
 
 
@@ -52,6 +100,9 @@ def auto_account_status() -> str:
     source = "（アプリ同梱のクライアントを使用）" if youtube_upload.client_source() == "bundled" else ""
     if channel is None:
         return f"**YouTube:** 未連携です。「YouTubeアカウントを連携」を押してください。{source}"
+    if channel.get("needs_relink"):
+        return ("**YouTube:** 連携中ですが、公開するには追加の許可が必要です。"
+                f"「設定」タブで「YouTubeアカウントを連携」をやり直してください。{source}")
     return f"**YouTube:** 連携中 — {html.escape(str(channel.get('title') or channel.get('id')))}{source}"
 
 
@@ -163,6 +214,181 @@ def auto_disconnect_account() -> str:
     return auto_account_status()
 
 
+_AUTO_REPLIER = youtube_auto_reply.BackgroundReplier()
+_REPLY_STATUS_LABELS = {"replied": "返信済み", "error": "失敗"}
+
+
+def reply_status() -> str:
+    settings = youtube_auto_reply.load_settings()
+    state = "有効" if settings.enabled else "無効"
+    if settings.run_on == "gas":
+        gas = youtube_gas.load_state()
+        lines = [
+            f"**コメント返信:** {state} / 実行場所: GAS（パソコンが起動していなくても返信します） / "
+            f"{settings.interval_minutes}分ごとに確認 / 1日{settings.daily_limit}件まで",
+            f"[スクリプトを開く（初回は「実行」で許可）]({gas.get('setup_url') or gas.get('editor_url', '')}) / "
+            f"[状態の確認ページ（返信ログのスプレッドシートもここから）]({gas.get('web_url', '')})",
+        ]
+        return "\n\n".join(lines)
+    login = "連携中" if youtube_auto_reply.is_connected() else "未連携（「返信用に連携」を押してください）"
+    lines = [
+        f"**コメント返信:** {state} / 実行場所: このパソコン（アプリを開いている間だけ） / ログイン: {login} / "
+        f"今日 {youtube_auto_reply.replies_today()}/{settings.daily_limit}件 / "
+        f"{settings.interval_minutes}分ごとに確認",
+    ]
+    if _AUTO_REPLIER.last_message:
+        lines.append(f"前回の自動実行: {html.escape(_AUTO_REPLIER.last_message)}")
+    return "\n\n".join(lines)
+
+
+def _push_to_gas() -> str:
+    """Send changed settings to GAS when it is the one replying; '' when nothing to report."""
+    settings = youtube_auto_reply.load_settings()
+    if settings.run_on != "gas":
+        return ""
+    try:
+        youtube_gas.sync(settings)
+    except (youtube_gas.GasError, youtube_auto_reply.AutoReplyError) as exc:
+        return f"\n\n**GASへの反映に失敗しました:** {html.escape(str(exc))}"
+    except Exception as exc:
+        return f"\n\n**GASへの反映に失敗しました:** {type(exc).__name__}"
+    return "\n\nGASにも反映しました。"
+
+
+def reply_gas_enable() -> str:
+    """Create/update the GAS project and open its consent page; the browser opens on this PC."""
+    problems = youtube_upload.setup_problems()
+    if problems:
+        return "**GAS:** " + " ".join(problems)
+    settings = youtube_auto_reply.load_settings()
+    previous = settings.run_on
+
+    def restore():
+        youtube_auto_reply.save_settings(settings.enabled, settings.templates, settings.daily_limit,
+                                         settings.interval_minutes, run_on=previous)
+
+    try:
+        settings = youtube_auto_reply.save_settings(
+            settings.enabled, settings.templates, settings.daily_limit, settings.interval_minutes, run_on="gas")
+        state = youtube_gas.deploy(settings)
+    except youtube_gas.GasError as exc:
+        restore()
+        if exc.url:
+            webbrowser.open(exc.url)
+        return f"**GAS:** {html.escape(str(exc))}"
+    except Exception as exc:
+        restore()
+        return f"**GAS:** 準備に失敗しました（{type(exc).__name__}: {html.escape(str(exc))[:200]}）。"
+    setup_link = state.get("setup_url") or state.get("editor_url", "")
+    webbrowser.open(setup_link)
+    owner = html.escape(state.get("owner_email") or "スクリプトを作った個人のGoogleアカウント")
+    return (
+        f"**GAS:** スクリプトを用意し、ブラウザで開きました（{owner} で開きます。アカウントを聞かれたらこれを選択）。"
+        "上部の「実行」を押してください（関数は最初から「setup」が選ばれています）。"
+        "「承認が必要です」→「権限を確認」→ アカウントを選択 →「詳細」→「CUT コメント自動返信（安全ではないページ）に移動」→"
+        "「許可」と進み、下の実行ログに「準備完了: （チャンネル名）として…」と出れば完了です。"
+        f"\n\nブラウザが開かない場合は[こちら]({setup_link})。"
+        "\n\n" + reply_status()
+    )
+
+
+def reply_gas_stop() -> str:
+    settings = youtube_auto_reply.load_settings()
+    youtube_auto_reply.save_settings(settings.enabled, settings.templates, settings.daily_limit,
+                                     settings.interval_minutes, run_on="pc")
+    try:  # tell GAS to stop replying; its trigger then finds nothing to do
+        youtube_gas.sync(youtube_auto_reply.load_settings())
+        note = "GAS側の返信は止めました。"
+    except Exception as exc:
+        note = (f"GAS側を止められませんでした（{type(exc).__name__}）。"
+                "スクリプトを開き、左の「トリガー」から autoReply を削除してください。")
+    return f"**GAS:** このパソコンで返信する設定に戻しました。{note}\n\n" + reply_status()
+
+
+def reply_log_markdown() -> str:
+    rows = youtube_auto_reply.recent_log()
+    if not rows:
+        return "まだ返信していません。"
+    lines = ["| 日時 | 状態 | 相手 | コメント | 返信 |", "|---|---|---|---|---|"]
+    for row in rows:
+        when = (youtube_auto_reply.parse_time(row["created_at"]) or datetime.now()).astimezone()
+        cells = [when.strftime("%m/%d %H:%M"), _REPLY_STATUS_LABELS.get(row["status"], row["status"]),
+                 row["author"], row["comment_text"][:60], row["reply_text"][:60] or row["error"][:60]]
+        lines.append("| " + " | ".join(
+            html.escape(str(cell)).replace("|", "／").replace("\n", " ") for cell in cells) + " |")
+    return "\n".join(lines)
+
+
+def reply_templates_view():
+    """The registered replies (line breaks shown as-is) and the choices for deletion."""
+    templates = youtube_auto_reply.load_settings().templates
+    if not templates:
+        return "まだ定型文がありません。下の欄に入力して「追加」を押してください。", gr.update(choices=[], value=None)
+    blocks = []
+    for number, text in enumerate(templates, start=1):
+        quoted = "<br>".join(html.escape(line) for line in text.split("\n"))
+        blocks.append(f"**{number}.**<br>{quoted}")
+    choices = [(f"{number}. {text.splitlines()[0][:40]}", str(number - 1))
+               for number, text in enumerate(templates, start=1)]
+    return "\n\n".join(blocks), gr.update(choices=choices, value=None)
+
+
+def reply_load_settings():
+    settings = youtube_auto_reply.load_settings()
+    return settings.enabled, settings.include_past, settings.daily_limit, settings.interval_minutes
+
+
+def reply_save_settings(enabled: bool, include_past: bool, daily_limit, interval_minutes) -> str:
+    templates = youtube_auto_reply.load_settings().templates
+    try:
+        youtube_auto_reply.save_settings(enabled, templates, daily_limit, interval_minutes,
+                                         include_past=include_past)
+    except youtube_auto_reply.AutoReplyError as exc:
+        return f"**コメント返信:** {exc}"
+    return reply_status() + _push_to_gas()
+
+
+def reply_add_template(text: str):
+    try:
+        youtube_auto_reply.add_template(text)
+    except youtube_auto_reply.AutoReplyError as exc:
+        return (f"**コメント返信:** {exc}", gr.update(), *reply_templates_view())
+    return (reply_status() + _push_to_gas(), "", *reply_templates_view())
+
+
+def reply_remove_template(index):
+    try:
+        youtube_auto_reply.remove_template(index)
+    except youtube_auto_reply.AutoReplyError as exc:
+        return (f"**コメント返信:** {exc}", gr.update(), *reply_templates_view())
+    return (reply_status() + _push_to_gas(), youtube_auto_reply.load_settings().enabled,
+            *reply_templates_view())
+
+
+def reply_connect() -> str:
+    problems = youtube_upload.setup_problems()
+    if problems:
+        return "**コメント返信:** " + " ".join(problems)
+    try:
+        youtube_auto_reply.connect_account()
+    except Exception as exc:
+        return f"**コメント返信:** 連携に失敗しました（{type(exc).__name__}: {html.escape(str(exc))[:200]}）。"
+    return reply_status() + _push_to_gas()  # GAS replies with this login too
+
+
+def reply_disconnect() -> str:
+    youtube_auto_reply.disconnect_account()
+    return reply_status()
+
+
+def reply_run_now():
+    try:
+        message = youtube_auto_reply.run_once(manual=True).message
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"[:300]
+    return f"**手動実行:** {html.escape(message)}\n\n" + reply_status(), reply_log_markdown()
+
+
 def auto_agent_status() -> str:
     status = ai_setup.all_status()
     short = {"codex": "Codex", "claude": "Claude Code", "local": "ローカルAI"}
@@ -176,37 +402,73 @@ _AUTO_STATE_LABELS = {
 }
 
 
-def auto_jobs_view():
-    jobs = _auto_pipeline().list_jobs()[:10]
-    if not jobs:
-        return "まだジョブはありません。", gr.update(choices=[], value=None), gr.update(choices=[], value=None)
-    parts = []
-    publishable: list[tuple[str, str]] = []
+CARD_JOBS = 10  # newest jobs shown as cards; jobs with unposted clips are always shown
+
+
+def clip_cards() -> list[dict]:
+    """Finished jobs as cards, read from the job files so the daily batch's jobs appear too."""
+    from moment_retrieval import made_clips
+
+    groups: dict[str, list] = {}
+    for clip in made_clips.list_clips():
+        groups.setdefault(clip.job_id, []).append(clip)
+    return [
+        {"job_id": job_id, "source": clips[0].job_source, "batch": clips[0].batch, "clips": clips}
+        for index, (job_id, clips) in enumerate(groups.items())
+        if index < CARD_JOBS or any(not clip.receipt for clip in clips)
+    ]
+
+
+def cards_signature(cards=None) -> str:
+    """Changes only when clips are added, uploaded or change privacy, so the cards
+    (and any ticked checkboxes) are not rebuilt on every progress refresh."""
+    cards = clip_cards() if cards is None else cards
+    return json.dumps([
+        [card["job_id"], [[str(clip.path)] + [(clip.receipt or {}).get(key) for key in
+                                              ("video_id", "privacy_status", "upload_status", "missing_on_youtube")]
+                          for clip in card["clips"]]]
+        for card in cards
+    ], ensure_ascii=False)
+
+
+def _job_history_markdown(jobs) -> str:
+    lines = []
     for job in jobs:
         state = _AUTO_STATE_LABELS.get(job.state, job.state)
-        step = f" / {job.step}" if job.state == "running" and job.step else ""
-        parts.append(f"### {html.escape(job.job_id)} — {state}{html.escape(step)}")
-        parts.append(f"- 元動画: {html.escape(job.source)}")
-        if job.source_channel:
-            parts.append(f"- チャンネル: {html.escape(job.source_channel)}")
-        if job.source_video_key:
-            parts.append(f"- 動画ID: {html.escape(job.source_video_key)}")
-        for upload in job.uploads:
-            status = "公開中" if upload.get("privacy_status") == "public" else "非公開"
-            link = upload.get("watch_url") or upload.get("studio_url")
-            parts.append(f"- [{status}] {html.escape(str(upload.get('title', '')))} — {link}")
-            if status == "非公開":
-                publishable.append(
-                    (f"{upload.get('title')}（{job.job_id}）", f"{job.job_id}|{upload.get('video_id')}")
-                )
+        uploads = f"・アップロード {len(job.uploads)}本" if job.uploads else ""
+        if getattr(job, "focus", ""):
+            uploads += f"・探した場面: {html.escape(job.focus)}"
         recent = "\n".join(job.log[-8:])
-        # Blank lines around the HTML block keep the next job's heading rendered as Markdown.
-        parts.append(f"\n<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n")
-    running = [(job.job_id, job.job_id) for job in jobs if job.state in {"queued", "running"}]
+        lines.append(
+            f"**{html.escape(job.job_id)}** — {state}{uploads}　{html.escape(job.source)}\n\n"
+            f"<details><summary>ログ</summary>\n\n```\n{recent}\n```\n\n</details>\n"
+        )
+    return "\n".join(lines) or "まだジョブはありません。"
+
+
+def auto_jobs_view():
+    """Running jobs stay visible; finished ones go to the collapsed history."""
+    jobs = _auto_pipeline().list_jobs()[:10]
+    active = [job for job in jobs if job.state in {"queued", "running"}]
+    if active:
+        parts = []
+        for job in active:
+            state = _AUTO_STATE_LABELS.get(job.state, job.state)
+            step = f"（{job.step}）" if job.step else ""
+            last = job.log[-1] if job.log else ""
+            video = _auto_pipeline().video_download_status(job.job_id)
+            video_line = f"<br><small>並行中の動画ダウンロード: {html.escape(video)}</small>" if video else ""
+            parts.append(f"- **{html.escape(job.job_id)}** {state}{html.escape(step)} — "
+                         f"{html.escape(job.source)}<br><small>{html.escape(last)}</small>{video_line}")
+        running_md = "\n".join(parts)
+    else:
+        running_md = "実行中のジョブはありません。"
+    running = [(job.job_id, job.job_id) for job in active]
     return (
-        "\n".join(parts),
-        gr.update(choices=publishable, value=publishable[0][1] if publishable else None),
+        running_md,
+        cards_signature(),
         gr.update(choices=running, value=running[0][1] if running else None),
+        _job_history_markdown(jobs),
     )
 
 
@@ -258,7 +520,7 @@ def summary_status() -> str:
     if youtube.startswith("連携中"):
         youtube_part = f"YouTube: {youtube}"
     else:
-        youtube_part = "YouTube: 未連携（「設定」タブで連携すると非公開アップロードまで自動。未連携なら書き出しまで）"
+        youtube_part = "YouTube: 未連携（「設定」タブで連携するとアップロードまで自動。未連携なら書き出しまで）"
     return f"{youtube_part}　|　AI: {auto_agent_status()}"
 
 
@@ -267,32 +529,208 @@ def _duration_label(seconds: float) -> str:
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+_DATE_PREFIX = re.compile(r"^(\d{4})(\d{2})(\d{2})_")
+
+
+def _video_date(name: str, upload_date: str = "") -> str:
+    """YYYYMMDD from the downloaded file name (its stream date), else from the source metadata."""
+    match = _DATE_PREFIX.match(name)
+    if match:
+        return "".join(match.groups())
+    return upload_date if re.fullmatch(r"\d{8}", upload_date or "") else ""
+
+
+def _content_hints(video_ids: list[str], limit: int = 2) -> dict[str, list[str]]:
+    """A few highlight titles per video, as a clue to its content when no title is known."""
+    from moment_retrieval import db
+
+    hints: dict[str, list[str]] = {}
+    conn = db.get_conn()
+    try:
+        for video_id in video_ids:
+            revision = db.get_active_transcript_revision(conn, video_id)
+            run = db.get_latest_ready_highlight_run(conn, video_id, revision) if revision else None
+            if run:
+                titles = [str(c.get("title") or "").strip() for c in db.get_highlight_candidates(conn, run["highlight_run_id"])]
+                # Search-made candidates are titled after the query, which says nothing here.
+                hints[video_id] = [title for title in titles if title and "に関する場面" not in title][:limit]
+    finally:
+        conn.close()
+    return hints
+
+
 def library_choices() -> list[tuple[str, str]]:
-    choices = []
-    for video in library_videos():
+    """Newest first, labelled by stream date, title (or highlight titles) and length."""
+    from moment_retrieval import source_titles
+
+    videos = library_videos()
+    titles = source_titles.load()
+    hints = _content_hints([video["video_id"] for video in videos])
+    rows = []
+    for video in videos:
+        name = str(video["name"] or "")
+        meta = titles.get(source_titles.source_key(name) or "", {})
+        date = _video_date(name, str(meta.get("upload_date") or ""))
+        what = str(meta.get("title") or "") or " / ".join(hints.get(video["video_id"], []))             or Path(name).stem.removesuffix(".audio")
+        if len(what) > 40:
+            what = what[:39] + "…"
+        day = f"{int(date[4:6])}/{int(date[6:8])}" if date else "日付不明"
+        if date and date[:4] != str(datetime.now().year):
+            day = f"{date[:4]}/{day}"
         note = "" if video["source_available"] else "（共有・元動画は自動でダウンロード）"
-        choices.append((f"{video['name']}　{_duration_label(video['duration_sec'])}{note}", video["video_id"]))
-    return choices
+        rows.append((date, f"{day}｜{what}　{_duration_label(video['duration_sec'])}{note}", video["video_id"]))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [(label, video_id) for _date, label, video_id in rows]
+
+
+_titles_fetch_started = False
+
+
+def fetch_missing_titles_in_background() -> None:
+    """Once per run, look up stream titles for older downloads (metadata only)."""
+    global _titles_fetch_started
+    if _titles_fetch_started:
+        return
+    _titles_fetch_started = True
+    from moment_retrieval import source_titles
+
+    names = [str(video["name"] or "") for video in library_videos()]
+    threading.Thread(target=source_titles.fetch_missing, args=(names,), daemon=True).start()
 
 
 def refresh_library():
+    fetch_missing_titles_in_background()
     choices = library_choices()
     return gr.update(choices=choices), gr.update(choices=choices)
 
 
-def auto_submit(sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
-                min_sec, max_sec, layout: str, upload: bool):
+_UI_SETTINGS_DEFAULTS = {"min_sec": 20, "max_sec": SHORTS_MAX_SEC, "layout": "blur",
+                         "effort": agent_runner.DEFAULT_EFFORT, "finish": True, "upload": "unlisted"}
+UPLOAD_CHOICES = [("非公開でアップロード", "private"), ("限定公開でアップロード", "unlisted"), ("アップロードしない", "none")]
+
+
+def _upload_args(upload) -> dict:
+    """The upload control's value as submit() arguments (a bare bool is the old checkbox)."""
+    if upload is True or upload in (None, "private"):
+        return {"upload": True, "privacy": "private"}
+    if upload == "unlisted":
+        return {"upload": True, "privacy": "unlisted"}
+    return {"upload": False, "privacy": "private"}
+
+
+def _ui_settings_path() -> Path:
+    return config.LIBRARY_ROOT / "auto_publish_ui.json"
+
+
+def load_ui_settings() -> dict:
+    """Saved defaults for length, layout and reasoning effort (invalid values fall back)."""
+    try:
+        saved = json.loads(_ui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    settings = dict(_UI_SETTINGS_DEFAULTS)
+    try:
+        min_sec, max_sec = float(saved.get("min_sec", settings["min_sec"])), float(saved.get("max_sec", settings["max_sec"]))
+        if 5 <= min_sec <= max_sec <= SHORTS_MAX_SEC:
+            settings.update(min_sec=min_sec, max_sec=max_sec)
+    except (TypeError, ValueError):
+        pass
+    if saved.get("layout") in {"blur", "crop"}:
+        settings["layout"] = saved["layout"]
+    if saved.get("effort") in agent_runner.EFFORTS:
+        settings["effort"] = saved["effort"]
+    if isinstance(saved.get("finish"), bool):
+        settings["finish"] = saved["finish"]
+    if saved.get("upload") in {"private", "unlisted", "none"}:
+        settings["upload"] = saved["upload"]
+    return settings
+
+
+def apply_ui_settings():
+    settings = load_ui_settings()
+    return (settings["effort"], settings["min_sec"], settings["max_sec"], settings["layout"], settings["finish"],
+            settings["upload"])
+
+
+def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = True, upload: str = "private") -> str:
+    try:
+        min_sec, max_sec = float(min_sec), float(max_sec)
+    except (TypeError, ValueError):
+        raise gr.Error("長さは数値で入力してください。")
+    if not 5 <= min_sec <= max_sec <= SHORTS_MAX_SEC:
+        raise gr.Error(f"長さは 5秒 <= 最短 <= 最長 <= {SHORTS_MAX_SEC}秒 で指定してください。")
+    if layout not in {"blur", "crop"} or effort not in agent_runner.EFFORTS:
+        raise gr.Error("レイアウトと推論の強さを選んでください。")
+    path = _ui_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort,
+                                "finish": bool(finish),
+                                "upload": upload if upload in {"private", "unlisted", "none"} else "private"},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+    return "保存しました。次回からこの設定で開きます。"
+
+
+def on_mode_change(mode: str):
+    url = mode == "url"
+    return gr.update(visible=url), gr.update(visible=not url), gr.update(visible=url)
+
+
+def auto_download_only(sources: str):
+    """Download and transcribe URLs (or index local files) without clipping or uploading."""
     lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
-    lines += [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
     if not lines:
-        raise gr.Error("動画のURLを入力するか、文字起こし済みの動画を選んでください。")
+        raise gr.Error("ダウンロードしたい動画のURLを入力してください。")
+    submitted = []
+    for line in lines[:10]:
+        try:
+            # The AI is not called in link-only jobs; any valid agent satisfies validation.
+            job = _auto_pipeline().submit(line, "codex", link_only=True)
+        except PipelineError as exc:
+            raise gr.Error(f"{line}: {exc}") from exc
+        submitted.append(job.job_id)
+    gr.Info(f"{len(submitted)}件のダウンロードと文字起こしを開始しました。")
+    return ("", *auto_jobs_view())
+
+
+def _require_agent_ready(agent: str) -> None:
+    """Stop before queueing when the chosen CLI is missing or signed out (its jobs would fail later)."""
+    checks = {"codex": ai_setup.codex_status, "claude": ai_setup.claude_status}
+    if agent not in checks:
+        return
+    status = checks[agent]()
+    if status["ready"]:
+        return
+    label, button = {"codex": ("Codex", "Codex"), "claude": ("Claude Code", "Claude")}[agent]
+    if not status["installed"]:
+        raise gr.Error(f"{label} がインストールされていません。「設定」タブの「{button}」ボタンで準備してください。")
+    raise gr.Error(
+        f"{label} にログインしていません（ログインの期限切れを含む）。「設定」タブの「{button}」ボタンを押し、"
+        "開いたウィンドウとブラウザでログインし直してから、もう一度開始してください。"
+    )
+
+
+def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
+                min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
+    # Only the input that is shown counts; a leftover value in the hidden one is ignored.
+    if mode == "library":
+        lines = [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
+        if not lines:
+            raise gr.Error("文字起こし済みの動画を選んでください。")
+    else:
+        lines = [line.strip() for line in str(sources or "").splitlines() if line.strip()]
+        if not lines:
+            if re.match(r"\s*https?://", str(focus or "")):
+                raise gr.Error("URLが「探したい場面」の欄に入っています。上の「動画のURL」の欄に入れ直してください。")
+            raise gr.Error("動画のURLを入力してください。")
+    _require_agent_ready(agent)
     submitted = []
     for line in lines[:10]:
         try:
             job = _auto_pipeline().submit(
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
-                model=model or "", effort=(effort or "") if agent == "codex" else "",
+                max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
+                model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
+                finish=bool(finish),
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -314,7 +752,7 @@ def export_shared_index(video_id: str, include_url: bool):
 
 
 def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
-                        min_sec, max_sec, layout: str, upload: bool):
+                        min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
     """Import a share zip; optionally start a job that downloads, relinks and clips it."""
     from moment_retrieval import db, source_origin
     from moment_retrieval.share import ShareError, import_index
@@ -343,9 +781,9 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
         try:
             job = _auto_pipeline().submit(
                 origin, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
-                max_duration_sec=float(max_sec), layout=layout, upload=bool(upload),
+                max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "",
-                link_only=not start_clipping,
+                link_only=not start_clipping, focus=focus or "", finish=bool(finish),
             )
         except PipelineError as exc:
             log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
@@ -357,18 +795,241 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
     return log, gr.update(choices=choices), gr.update(choices=choices)
 
 
-def auto_publish(selection: str):
-    if not selection or "|" not in selection:
-        raise gr.Error("公開する動画を選択してください。")
-    job_id, video_id = selection.split("|", 1)
+def _sync_job_uploads(video_id: str, receipt: dict) -> None:
+    """Keep the in-memory job (and its file) in step with a privacy change.
+
+    Only finished jobs whose saved state matches memory are written back, so a job
+    another process (e.g. the daily batch) is working on is never overwritten.
+    """
+    from moment_retrieval.auto_pipeline import TERMINAL
+
+    pipeline = _auto_pipeline()
+    with pipeline.lock:
+        for job in pipeline.jobs.values():
+            for upload in job.uploads:
+                if upload.get("video_id") != video_id:
+                    continue
+                upload["privacy_status"] = receipt.get("privacy_status")
+                path = config.CACHE_ROOT / "auto_jobs" / f"{job.job_id}.json"
+                try:
+                    saved_state = json.loads(path.read_text(encoding="utf-8")).get("state")
+                except (OSError, ValueError):
+                    saved_state = None
+                if job.state in TERMINAL and saved_state == job.state:
+                    pipeline._save(job)
+
+
+def upload_clips(paths, privacy: str):
+    """Upload the checked clips one by one, streaming progress; uploaded ones are skipped."""
+    from moment_retrieval import made_clips
+
+    picked = [str(item) for item in (paths or []) if item]
+    if not picked:
+        raise gr.Error("アップロードする動画にチェックを入れてください。")
+    privacy = "unlisted" if privacy == "unlisted" else "private"  # the YouTube setting; "none" -> private
+    log: list[str] = []
+    done = 0
+    for number, path in enumerate(picked, start=1):
+        log.append(f"- [{number}/{len(picked)}] {html.escape(Path(path).name)}")
+        yield "\n".join(log), gr.update()
+        try:
+            for message, receipt in made_clips.upload(path, privacy):
+                if not message:
+                    continue
+                line = "  - " + html.escape(message.strip())
+                if message.startswith("  アップロード中") and "アップロード中" in log[-1]:
+                    log[-1] = line
+                else:
+                    log.append(line)
+                if receipt and not message.startswith("アップロード済み"):
+                    done += 1
+                yield "\n".join(log), gr.update()
+        except youtube_upload.UploadError as exc:
+            log.append(f"  - 失敗: {html.escape(str(exc))}")
+        except Exception as exc:
+            log.append(f"  - 失敗: {type(exc).__name__}: {html.escape(str(exc))[:200]}")
+        yield "\n".join(log), cards_signature()
+    if done:
+        gr.Info(f"{done}本をアップロードしました。")
+
+
+def publish_clips_from_ui(paths, interval_hours=None):
+    """Queue the checked clips to go public one at a time, ``interval_hours`` apart (not all at once)."""
+    from moment_retrieval import publish_queue
+
+    picked = [str(item) for item in (paths or []) if item]
+    if not picked:
+        raise gr.Error("公開する動画にチェックを入れてください。")
     try:
-        result = _auto_pipeline().publish(job_id, video_id)
-    except (PipelineError, youtube_upload.UploadError) as exc:
-        raise gr.Error(str(exc)) from exc
+        hours = float(interval_hours) if interval_hours is not None and float(interval_hours) > 0 else None
+    except (TypeError, ValueError):
+        hours = None
+    hours = hours or publish_queue.DEFAULT_INTERVAL_HOURS
+    added, skipped = publish_queue.enqueue(picked, interval_hours=hours)
+    lines = []
+    if added:
+        first = datetime.fromtimestamp(added[0]["not_before"])
+        lines.append(f"- {len(added)}本を公開待ちに入れました。アプリを開いている間に、{hours:g}時間おきに1本ずつ公開します"
+                     f"（最初は{first:%m/%d %H:%M}ごろ、全部終わるまで約{max(0, len(added) - 1) * hours:g}時間）。")
+        gr.Info(f"{len(added)}本を公開待ちに入れました。")
+    lines += [f"- 公開待ちに入れませんでした: {html.escape(name)}: {html.escape(reason)}" for name, reason in skipped]
+    return "\n".join(lines), cards_signature()
+
+
+def publish_queue_markdown() -> str:
+    from moment_retrieval import publish_queue
+
+    info = publish_queue.summary()
+    if not info["remaining"] and not info["recent"]:
+        return "公開待ちの動画はありません。"
+    lines = []
+    if info["remaining"]:
+        lines.append(f"**公開待ち 残り{info['remaining']}本**・次の公開予定 "
+                     f"{datetime.fromtimestamp(info['next_at']):%m/%d %H:%M}ごろ（アプリを開いている間だけ進みます）")
+        for item in info["pending"]:
+            label = publish_queue.STATE_LABELS.get(item.get("state"), item.get("state"))
+            lines.append(f"- {label} {datetime.fromtimestamp(item['not_before']):%m/%d %H:%M} "
+                         f"{html.escape(item['title'])}")
+    else:
+        lines.append("公開待ちの動画はありません。")
+    if info["recent"]:
+        lines.append("\n最近の結果:")
+        for item in info["recent"]:
+            label = publish_queue.STATE_LABELS.get(item.get("state"), item.get("state"))
+            when = f"{datetime.fromtimestamp(item['finished_at']):%m/%d %H:%M}" if item.get("finished_at") else ""
+            note = f" — {html.escape(item['message'])}" if item.get("message") else ""
+            lines.append(f"- {label} {when} {html.escape(item['title'])}{note}")
+    return "\n".join(lines)
+
+
+def publish_queue_cancel():
+    from moment_retrieval import publish_queue
+
+    return f"公開待ちの{publish_queue.cancel_waiting()}本を取り消しました。", publish_queue_markdown()
+
+
+def change_clip_privacy(paths, privacy: str):
+    """Set the checked uploaded clips to one privacy; failures are listed instead of stopping the rest."""
+    from moment_retrieval import made_clips
+
+    picked = [str(item) for item in (paths or []) if item]
+    if not picked:
+        raise gr.Error("公開設定を変える動画にチェックを入れてください。")
+    if privacy not in youtube_upload.PRIVACY_CHOICES:
+        raise gr.Error("変更先の公開設定を選んでください。")
+    label = youtube_upload.PRIVACY_LABELS.get(privacy, privacy)
+    done, failed = [], []
+    for path in picked:
+        try:
+            receipt = made_clips.change_privacy(path, privacy)
+        except youtube_upload.UploadError as exc:
+            failed.append((Path(path).name, str(exc)))
+            continue
+        except Exception as exc:
+            failed.append((Path(path).name, f"{type(exc).__name__}: {exc}"[:200]))
+            continue
+        _sync_job_uploads(str(receipt["video_id"]), receipt)
+        done.append(receipt["watch_url"])
+    if done:
+        gr.Info(f"{len(done)}本を{label}にしました。")
+    lines = [f"- {label}にしました: {url}" for url in done]
+    reasons = {reason for _name, reason in failed}
+    if failed and len(reasons) == 1:  # one reason is enough when all failed the same way
+        lines.append(f"- {len(failed)}本を{label}にできませんでした: {html.escape(reasons.pop())}")
+    else:
+        lines += [f"- {label}にできませんでした: {html.escape(name)}: {html.escape(reason)}" for name, reason in failed]
+    return "\n".join(lines), cards_signature()
+
+
+def refresh_clip_statuses():
+    from moment_retrieval import made_clips
+
+    paths = [str(clip.path) for card in clip_cards() for clip in card["clips"] if clip.receipt]
+    try:
+        count = made_clips.refresh_statuses(paths) if paths else 0
+    except youtube_upload.UploadError as exc:
+        return f"YouTubeの状態を確認できませんでした: {html.escape(str(exc))}", gr.update()
     except Exception as exc:
-        raise gr.Error(f"公開に失敗しました: {exc}") from exc
-    gr.Info(f"公開しました: {result['watch_url']}")
-    return auto_jobs_view()
+        return f"YouTubeの状態を確認できませんでした（{type(exc).__name__}）。", gr.update()
+    message = f"{count}本の公開設定と処理状況をYouTubeから取り直しました。" if count else "投稿済みの動画がありません。"
+    return message, cards_signature()
+
+
+def refresh_clip_statuses_quietly():
+    """On page load: bring the labels in line with YouTube (changes made in Studio etc.), silently."""
+    _message, signature = refresh_clip_statuses()
+    return signature
+
+
+def repost_list(max_views, min_days):
+    from moment_retrieval import repost
+
+    try:
+        found = repost.candidates(max_views=int(max_views or repost.DEFAULT_MAX_VIEWS),
+                                  min_age_days=float(min_days or repost.DEFAULT_MIN_AGE_DAYS))
+    except Exception as exc:
+        return gr.update(choices=[], value=[]), f"一覧を作れませんでした（{type(exc).__name__}）。"
+    choices = [(f"{item['title']}（{item['views']}回・{datetime.fromtimestamp(item['published_at']):%m/%d}投稿）",
+                item["video_id"]) for item in found]
+    message = f"{len(found)}本あります。再投稿する動画を選んでください。" if found else "当てはまる動画はありません。"
+    return gr.update(choices=choices, value=[]), message
+
+
+def repost_queue_markdown() -> str:
+    from moment_retrieval import repost
+
+    items = [item for item in repost.load_queue() if item.get("state") != "cancelled"]
+    if not items:
+        return "再投稿の予約はありません。"
+    lines = []
+    for item in sorted(items, key=lambda item: item["not_before"]):
+        when = (f"{datetime.fromtimestamp(item['not_before']):%m/%d %H:%M}以降"
+                if item.get("state") == "queued" else "")
+        note = f" — {html.escape(item['message'])}" if item.get("message") else ""
+        lines.append(f"- {repost.STATE_LABELS.get(item.get('state'), item.get('state'))} {when} "
+                     f"{html.escape(item['title'])}{note}")
+    return "\n".join(lines)
+
+
+def repost_enqueue(video_ids, interval_hours, max_views, min_days):
+    from moment_retrieval import repost
+
+    if not video_ids:
+        return "動画を選んでください。", repost_queue_markdown(), gr.update()
+    wanted = set(video_ids)
+    found = [item for item in repost.candidates(max_views=int(max_views or repost.DEFAULT_MAX_VIEWS),
+                                                min_age_days=float(min_days or repost.DEFAULT_MIN_AGE_DAYS))
+             if item["video_id"] in wanted]
+    added = repost.enqueue(found, interval_hours=float(interval_hours or repost.DEFAULT_INTERVAL_HOURS))
+    hours = float(interval_hours or repost.DEFAULT_INTERVAL_HOURS)
+    return (f"{len(added)}本を予約しました。アプリを開いている間に、{hours:g}時間おきに1本ずつ再投稿します"
+            f"（全部終わるまで約{max(0, len(added) - 1) * hours:g}時間）。",
+            repost_queue_markdown(), gr.update(choices=[], value=[]))
+
+
+def repost_enqueue_all(interval_hours, max_views, min_days):
+    """Queue every clip the current conditions list (the list need not be built first)."""
+    from moment_retrieval import repost
+
+    found = repost.candidates(max_views=int(max_views or repost.DEFAULT_MAX_VIEWS),
+                              min_age_days=float(min_days or repost.DEFAULT_MIN_AGE_DAYS))
+    if not found:
+        return "当てはまる動画はありません。", repost_queue_markdown(), gr.update()
+    return repost_enqueue([item["video_id"] for item in found], interval_hours, max_views, min_days)
+
+
+def repost_cancel():
+    from moment_retrieval import repost
+
+    return f"待ちの{repost.cancel_waiting()}本を取り消しました。", repost_queue_markdown()
+
+
+def refresh_everything():
+    """The top "更新" button: re-read jobs (incl. the daily batch's), clips, their YouTube state and the video list."""
+    fetch_missing_titles_in_background()
+    refresh_clip_statuses()
+    choices = library_choices()
+    return (summary_status(), *auto_jobs_view(), gr.update(choices=choices), gr.update(choices=choices))
 
 
 def auto_cancel(job_id: str):
@@ -386,7 +1047,7 @@ _QUIT_JS = """() => {
         document.body.innerHTML =
             '<div style="display:flex;align-items:center;justify-content:center;'
             + 'height:100vh;font-family:sans-serif;font-size:1.4rem;color:#888;">'
-            + 'アプリを終了しました。このタブは閉じてください。</div>';
+            + 'アプリを終了しました。ブラウザで開いている場合は、このタブを閉じてください。</div>';
     }, 200);
 }"""
 
@@ -399,12 +1060,13 @@ def shutdown_app():
             pipeline.cancel(job.job_id)
     # Let this response reach the browser before the process exits.
     threading.Timer(3.0, lambda: os._exit(0)).start()
-    return gr.update(visible=True, value="**アプリを終了しました。このタブは閉じてください。**")
+    return gr.update(visible=True, value="**アプリを終了しました。ブラウザで開いている場合は、このタブを閉じてください。**")
 
 
 with gr.Blocks(title="CUT 自動投稿") as demo:
     with gr.Row():
         gr.Markdown("# CUT 自動投稿")
+        refresh_all_btn = gr.Button("最新の状態に更新", scale=0, min_width=190)
         quit_btn = gr.Button("アプリを終了", variant="stop", scale=0, min_width=120)
         quit_confirm_btn = gr.Button("本当に終了する（実行中のジョブも停止）", variant="stop",
                                      visible=False, scale=0)
@@ -422,16 +1084,22 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     status_md = gr.Markdown("")
     with gr.Tabs():
         with gr.Tab("切り抜き"):
-            auto_sources = gr.Textbox(
-                label="動画のURL（YouTube / Twitch）またはファイルのパス　※1行に1つ",
-                lines=2, placeholder="https://www.youtube.com/watch?v=...",
+            auto_mode = gr.Radio(
+                choices=[("新しい動画（URL）", "url"), ("文字起こし済みの動画", "library")],
+                value="url", label="切り抜く動画",
             )
-            with gr.Row():
-                auto_library = gr.Dropdown(
-                    choices=[], multiselect=True, scale=5,
-                    label="または文字起こし済みの動画から選ぶ（編集用CUTで処理した動画も含む）",
+            with gr.Group(visible=True) as auto_url_group:
+                auto_sources = gr.Textbox(
+                    label="動画のURL（YouTube / Twitch）またはファイルのパス　※1行に1つ",
+                    lines=2, placeholder="https://www.youtube.com/watch?v=...",
                 )
-                auto_library_refresh = gr.Button("一覧を更新", scale=1)
+            with gr.Group(visible=False) as auto_library_group:
+                with gr.Row():
+                    auto_library = gr.Dropdown(
+                        choices=[], multiselect=True, scale=5, elem_id="auto-library",
+                        label="文字起こし済みの動画（複数選択可・編集用CUTで処理した動画も含む）",
+                    )
+                    auto_library_refresh = gr.Button("一覧を更新", scale=1)
             with gr.Row():
                 auto_agent = gr.Radio(
                     choices=[("Codex", "codex"), ("Claude Code", "claude"), ("ローカルAI", "local")], value="codex",
@@ -442,7 +1110,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     label="モデル", scale=2,
                 )
                 auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="本数", scale=2)
-            with gr.Accordion("長さ・レイアウト・アップロード・推論の強さ", open=False):
+            auto_focus = gr.Textbox(
+                label="探したい場面（任意）　空欄なら見どころ全般から選びます",
+                placeholder="例: 謎解きができなくてキレている箇所",
+                max_length=200,
+            )
+            with gr.Accordion("長さ・レイアウト・仕上げ・推論の強さ・アップロード", open=False):
                 with gr.Row():
                     auto_effort = gr.Dropdown(
                         choices=list(agent_runner.EFFORTS), value=agent_runner.DEFAULT_EFFORT,
@@ -457,21 +1130,136 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_layout = gr.Radio(
                         choices=[("ぼかし背景", "blur"), ("切り取り", "crop")], value="blur", label="縦型レイアウト",
                     )
-                    auto_upload = gr.Checkbox(value=True, label="YouTubeへ非公開アップロードする")
-            auto_start_btn = gr.Button("切り抜いて非公開アップロード", variant="primary", size="lg")
+                    auto_finish = gr.Checkbox(
+                        value=True, label="仕上げる（引きのタイトル・字幕のタイミング調整・効果音）",
+                    )
+                    auto_upload = gr.Radio(choices=UPLOAD_CHOICES, value="unlisted", label="YouTube")
+                with gr.Row():
+                    auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さ・YouTubeを既定として保存", scale=1)
+                    auto_settings_md = gr.Markdown("", scale=2)
+            with gr.Row():
+                auto_start_btn = gr.Button("切り抜いてアップロード", variant="primary", size="lg", scale=3)
+                auto_download_btn = gr.Button("ダウンロードと文字起こしだけ", size="lg", scale=1)
             gr.Markdown(
                 "<small>権利者から切り抜きの許可を得た動画だけに使ってください。文字起こしは選んだAIへ送られます。"
-                "アップロードは常に**非公開**で、公開は下の「公開する」かYouTube Studioで行います。</small>"
+                "アップロードは**非公開**か**限定公開**（リンクを知っている人だけが見られる）で、"
+                "公開は下のジョブの一覧かYouTube Studioで行います。</small>"
             )
             gr.Markdown("### ジョブ")
-            with gr.Row():
-                auto_publish_select = gr.Dropdown(choices=[], label="公開する動画", scale=4)
-                auto_publish_btn = gr.Button("公開する", scale=1)
-            auto_jobs_md = gr.Markdown("まだジョブはありません。")
+            auto_jobs_md = gr.Markdown("実行中のジョブはありません。")
+            auto_uploads_sig = gr.State("[]")
+            publish_result_md = gr.Markdown("")
+            with gr.Accordion("公開待ち（チェックした動画を1本ずつ間隔をあけて公開します）", open=True):
+                with gr.Row():
+                    publish_interval = gr.Number(value=3, minimum=0.1, label="公開の間隔（時間）", scale=1)
+                    publish_queue_refresh_btn = gr.Button("公開待ちを更新", size="sm", scale=1)
+                    publish_queue_cancel_btn = gr.Button("公開待ちを取り消す", size="sm", scale=1)
+                publish_queue_md = gr.Markdown(publish_queue_markdown)
+            publish_queue_refresh_btn.click(publish_queue_markdown, outputs=[publish_queue_md])
+            publish_queue_cancel_btn.click(publish_queue_cancel, outputs=[publish_result_md, publish_queue_md])
+
+            @gr.render(inputs=[auto_uploads_sig])
+            def render_clip_cards(signature):
+                from moment_retrieval import made_clips, publish_queue
+
+                queued = publish_queue.pending_by_path()
+
+                cards = clip_cards()
+                if not cards:
+                    return
+                with gr.Row():
+                    gr.Markdown("**作った動画**（未投稿はチェックしてアップロード、アップロード済みはリンクから確認し、チェックして公開できます）",
+                                scale=4)
+                    status_btn = gr.Button("YouTubeの状態を確認", scale=1, size="sm")
+                status_btn.click(refresh_clip_statuses, outputs=[publish_result_md, auto_uploads_sig],
+                                 concurrency_id="youtube-publish", concurrency_limit=1)
+                for card in cards:
+                    job_id, clips = card["job_id"], card["clips"]
+                    with gr.Group():
+                        how = "（書き出しのみ・毎日の自動処理など）" if card["batch"] else ""
+                        lines = [f"**{html.escape(job_id)}**{how} — 元動画: {html.escape(card['source'])}"]
+                        for clip in clips:
+                            status = made_clips.status_label(clip.receipt)
+                            waiting = queued.get(publish_queue._key(clip.path))
+                            if waiting:
+                                status += f"・公開待ち {datetime.fromtimestamp(waiting['not_before']):%m/%d %H:%M}"
+                            if clip.receipt:
+                                video_id = html.escape(str(clip.receipt["video_id"]))
+                                links = (f"[ショートで見る](https://www.youtube.com/shorts/{video_id})・"
+                                         f"[Studioで編集](https://studio.youtube.com/video/{video_id}/edit)")
+                            else:
+                                links = (f'<a href="/gradio_api/file={quote(str(clip.path))}" target="_blank">'
+                                         "再生して確認</a>")
+                            lines.append(f"- [{status}] {html.escape(clip.title)} — {links}")
+                        gr.Markdown("\n".join(lines), padding=True)
+                        unposted = [(clip.title, str(clip.path)) for clip in clips if not clip.receipt]
+                        if unposted:
+                            # Uploaded with the 切り抜き tab's YouTube setting, like a manual run.
+                            to_upload = gr.CheckboxGroup(choices=unposted, label="アップロードする動画")
+                            with gr.Row():
+                                upload_picked = gr.Button("チェックした動画をアップロード")
+                                upload_all = gr.Button("このジョブの全部をアップロード")
+                            upload_picked.click(
+                                upload_clips, inputs=[to_upload, auto_upload],
+                                outputs=[publish_result_md, auto_uploads_sig],
+                                concurrency_id="youtube-upload", concurrency_limit=1,
+                            )
+                            upload_all.click(
+                                partial(upload_clips, tuple(path for _title, path in unposted)),
+                                inputs=[auto_upload], outputs=[publish_result_md, auto_uploads_sig],
+                                concurrency_id="youtube-upload", concurrency_limit=1,
+                            )
+                        private = [(clip.title, str(clip.path)) for clip in clips
+                                   if clip.receipt and clip.receipt.get("privacy_status") != "public"
+                                   and not clip.receipt.get("missing_on_youtube")]
+                        if private:
+                            picked = gr.CheckboxGroup(choices=private, label="公開する動画")
+                            with gr.Row():
+                                publish_picked = gr.Button("チェックした動画を公開")
+                                publish_all = gr.Button("このジョブの全部を公開")
+                            publish_picked.click(
+                                publish_clips_from_ui, inputs=[picked, publish_interval],
+                                outputs=[publish_result_md, auto_uploads_sig],
+                                concurrency_id="youtube-publish", concurrency_limit=1,
+                            ).then(publish_queue_markdown, outputs=[publish_queue_md])
+                            publish_all.click(
+                                partial(publish_clips_from_ui, tuple(path for _title, path in private)),
+                                inputs=[publish_interval], outputs=[publish_result_md, auto_uploads_sig],
+                                concurrency_id="youtube-publish", concurrency_limit=1,
+                            ).then(publish_queue_markdown, outputs=[publish_queue_md])
+
+            with gr.Accordion("ジョブの履歴（ログ）", open=False):
+                auto_history_md = gr.Markdown("まだジョブはありません。")
             with gr.Accordion("実行中のジョブを停止", open=False):
                 with gr.Row():
                     auto_cancel_select = gr.Dropdown(choices=[], label="実行中のジョブ", scale=4)
                     auto_cancel_btn = gr.Button("停止", variant="stop", scale=1)
+            with gr.Accordion("伸びていない動画の再投稿", open=False):
+                gr.Markdown(
+                    "投稿から日数が経っても再生回数が少ない動画を、旧動画を**非公開**にして（削除はしません）"
+                    "投稿し直します。まとめて上げると表示されにくいので、1本ずつ間隔を空けます。"
+                )
+                with gr.Row():
+                    repost_max_views = gr.Number(value=30, precision=0, label="再生回数がこれ未満")
+                    repost_min_days = gr.Number(value=3, label="投稿から何日以上")
+                    repost_interval = gr.Number(value=3, label="再投稿の間隔（時間）")
+                repost_list_btn = gr.Button("一覧を作る")
+                repost_status_md = gr.Markdown()
+                repost_picked = gr.CheckboxGroup(choices=[], label="再投稿する動画")
+                with gr.Row():
+                    repost_go_btn = gr.Button("選んだ動画を再投稿の予約に入れる", variant="primary")
+                    repost_all_btn = gr.Button("条件に当てはまる全部を再投稿の予約に入れる")
+                    repost_cancel_btn = gr.Button("待ちの予約を取り消す")
+                repost_queue_md = gr.Markdown(repost_queue_markdown)
+                repost_list_btn.click(repost_list, inputs=[repost_max_views, repost_min_days],
+                                      outputs=[repost_picked, repost_status_md])
+                repost_go_btn.click(repost_enqueue,
+                                    inputs=[repost_picked, repost_interval, repost_max_views, repost_min_days],
+                                    outputs=[repost_status_md, repost_queue_md, repost_picked])
+                repost_all_btn.click(repost_enqueue_all,
+                                     inputs=[repost_interval, repost_max_views, repost_min_days],
+                                     outputs=[repost_status_md, repost_queue_md, repost_picked])
+                repost_cancel_btn.click(repost_cancel, outputs=[repost_status_md, repost_queue_md])
             auto_timer = gr.Timer(5)
 
         with gr.Tab("インデックスの共有"):
@@ -495,6 +1283,69 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             )
             share_import_btn = gr.Button("読み込む", variant="primary")
             share_import_log = gr.Textbox(label="読み込みログ", interactive=False, lines=6)
+
+        with gr.Tab("コメント返信"):
+            gr.Markdown(
+                "自分のチャンネルの動画に付いた未返信のコメントへ、登録した定型文で自動返信します（承認なし）。"
+                "自分のコメントや、自分が既に返信したコメントには返信しません。"
+                "YouTubeのAPIにハートを付ける機能はないため、ハートはYouTube Studioで付けてください。"
+                f"1回の確認で返信するのは1件まで、返信どうしの間隔は{youtube_auto_reply.MIN_GAP_MINUTES}分以上あけ、"
+                "1日の上限を超えては返信しません。このパソコンで動かす場合はアプリを開いている間だけ動きます"
+                "（パソコンを起動していなくても返信したい場合は、下の「GASで動かす」を使います）。"
+            )
+            reply_status_md = gr.Markdown("")
+            with gr.Row():
+                reply_connect_btn = gr.Button("返信用に連携", variant="primary")
+                reply_disconnect_btn = gr.Button("返信用の連携を解除")
+            gr.Markdown(
+                "<small>返信にはコメント管理の許可（youtube.force-ssl）が必要なため、アップロード用とは別に連携します。"
+                "OAuthクライアントは「設定」タブで読み込んだものを使います。</small>"
+            )
+            gr.Markdown("### 定型文")
+            gr.Markdown(
+                "<small>登録した中から毎回ランダムに選びます（直前と同じ文は避けます）。"
+                "改行を含む文もそのまま返信します。{name} は相手の名前に置き換わります。</small>"
+            )
+            reply_templates_md = gr.Markdown("")
+            reply_new_template = gr.Textbox(label="追加する定型文（改行できます）", lines=3,
+                                            placeholder="コメントありがとうございます！")
+            reply_add_btn = gr.Button("追加", variant="primary")
+            with gr.Row():
+                reply_remove_select = gr.Dropdown(choices=[], label="削除する定型文", scale=4)
+                reply_remove_btn = gr.Button("削除", variant="stop", scale=1)
+            gr.Markdown("### 返信の設定")
+            reply_enabled = gr.Checkbox(value=False, label="自動返信を有効にする")
+            reply_include_past = gr.Checkbox(
+                value=True,
+                label="過去の未返信コメントも対象にする（古いものから順に。オフにすると設定を初めて保存した後のコメントだけ）",
+            )
+            with gr.Row():
+                reply_daily_limit = gr.Number(value=youtube_auto_reply.DEFAULT_DAILY_LIMIT, precision=0,
+                                              minimum=1, maximum=youtube_auto_reply.MAX_DAILY_LIMIT,
+                                              label="1日の返信上限（件）")
+                reply_interval = gr.Number(value=youtube_auto_reply.DEFAULT_INTERVAL_MINUTES, precision=0,
+                                           minimum=youtube_auto_reply.MIN_INTERVAL_MINUTES,
+                                           label="確認の間隔（分）")
+            with gr.Row():
+                reply_save_btn = gr.Button("設定を保存", variant="primary")
+                reply_run_btn = gr.Button("今すぐ1回実行")
+                reply_refresh_btn = gr.Button("状態を更新")
+            gr.Markdown("### パソコンを起動していなくても返信する（GAS）")
+            gr.Markdown(
+                "「GASで動かす」を押すと、あなたのGoogleアカウントに返信用のスクリプト（Google Apps Script）を作り、"
+                "Googleのサーバー上で上と同じ設定のまま返信を続けます。返信には「返信用に連携」で選んだチャンネルの"
+                "ログインを使うため、ブランドアカウントのチャンネルでも動きます（先に「返信用に連携」を済ませてください）。"
+                "初回だけ、ブラウザでGoogleへのログインと許可を求められます（2回とも、ブランドアカウントではなく"
+                "管理している個人のGoogleアカウントを選びます）。"
+                "「Apps Script APIがオフ」と表示されたら、開いたページのスイッチを1回オンにしてから、もう一度押してください。"
+                "定型文や設定を変えると、GASにも自動で反映します。"
+            )
+            with gr.Row():
+                reply_gas_btn = gr.Button("GASで動かす（作成・更新）", variant="primary")
+                reply_gas_stop_btn = gr.Button("このパソコンで動かすに戻す")
+            reply_gas_md = gr.Markdown("")
+            gr.Markdown("### 直近の返信ログ（このパソコンで返信した分）")
+            reply_log_md = gr.Markdown("")
 
         with gr.Tab("設定"):
             gr.Markdown("### 見どころを選ぶAI")
@@ -546,13 +1397,16 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 bundle_btn = gr.Button("このクライアントをアプリに同梱する")
                 bundle_md = gr.Markdown("")
 
-    auto_job_outputs = [auto_jobs_md, auto_publish_select, auto_cancel_select]
+    auto_job_outputs = [auto_jobs_md, auto_uploads_sig, auto_cancel_select, auto_history_md]
     demo.load(summary_status, outputs=[status_md])
     demo.load(auto_account_status, outputs=[auto_account_md])
     demo.load(auto_agent_status, outputs=[auto_agents_md])
     demo.load(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
+    # The labels come from the saved receipts; refresh them from YouTube once per page load.
+    demo.load(refresh_clip_statuses_quietly, outputs=[auto_uploads_sig], show_progress="hidden")
     demo.load(gcp_status, outputs=[gcp_status_md])
     auto_timer.tick(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
+    auto_timer.tick(publish_queue_markdown, outputs=[publish_queue_md], show_progress="hidden")
     auto_agent.change(on_agent_change, inputs=[auto_agent], outputs=[auto_model, auto_effort])
     auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
     gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
@@ -574,24 +1428,56 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         summary_status, outputs=[status_md])
     auto_start_btn.click(
         auto_submit,
-        inputs=[auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+        inputs=[auto_mode, auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
+    auto_mode.change(on_mode_change, inputs=[auto_mode],
+                     outputs=[auto_url_group, auto_library_group, auto_download_btn])
+    demo.load(apply_ui_settings,
+              outputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish, auto_upload])
+    auto_settings_save.click(save_ui_settings,
+                             inputs=[auto_effort, auto_min_sec, auto_max_sec, auto_layout, auto_finish, auto_upload],
+                             outputs=[auto_settings_md])
+    auto_download_btn.click(auto_download_only, inputs=[auto_sources],
+                            outputs=[auto_sources, *auto_job_outputs]).then(
+        refresh_library, outputs=[auto_library, share_export_video])
     demo.load(refresh_library, outputs=[auto_library, share_export_video])
     auto_library_refresh.click(refresh_library, outputs=[auto_library, share_export_video])
+    # Close the list after each pick (open it again to add more), and let the arrow open it.
+    auto_library.select(None, None, None, js=_LIBRARY_CLOSE_JS)
+    demo.load(None, None, None, js=_LIBRARY_ARROW_JS)
     share_export_btn.click(export_shared_index, inputs=[share_export_video, share_include_url],
                            outputs=[share_export_file, share_export_md], concurrency_id="library-share")
     share_import_btn.click(
         import_shared_index,
         inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)
-    auto_publish_btn.click(auto_publish, inputs=[auto_publish_select], outputs=auto_job_outputs,
-                           concurrency_id="youtube-publish", concurrency_limit=1)
     auto_cancel_btn.click(auto_cancel, inputs=[auto_cancel_select], outputs=auto_job_outputs)
+    refresh_all_btn.click(refresh_everything,
+                          outputs=[status_md, *auto_job_outputs, auto_library, share_export_video])
+    demo.load(reply_load_settings, outputs=[reply_enabled, reply_include_past, reply_daily_limit, reply_interval])
+    demo.load(reply_templates_view, outputs=[reply_templates_md, reply_remove_select])
+    demo.load(reply_status, outputs=[reply_status_md])
+    demo.load(reply_log_markdown, outputs=[reply_log_md])
+    reply_save_btn.click(reply_save_settings,
+                         inputs=[reply_enabled, reply_include_past, reply_daily_limit, reply_interval],
+                         outputs=[reply_status_md])
+    reply_add_btn.click(reply_add_template, inputs=[reply_new_template],
+                        outputs=[reply_status_md, reply_new_template, reply_templates_md, reply_remove_select])
+    reply_remove_btn.click(reply_remove_template, inputs=[reply_remove_select],
+                           outputs=[reply_status_md, reply_enabled, reply_templates_md, reply_remove_select])
+    reply_connect_btn.click(reply_connect, outputs=[reply_status_md], concurrency_id="youtube-account")
+    reply_disconnect_btn.click(reply_disconnect, outputs=[reply_status_md])
+    reply_gas_btn.click(reply_gas_enable, outputs=[reply_gas_md], concurrency_id="youtube-account").then(
+        reply_status, outputs=[reply_status_md])
+    reply_gas_stop_btn.click(reply_gas_stop, outputs=[reply_gas_md]).then(reply_status, outputs=[reply_status_md])
+    reply_run_btn.click(reply_run_now, outputs=[reply_status_md, reply_log_md], concurrency_id="youtube-reply")
+    reply_refresh_btn.click(lambda: (reply_status(), reply_log_markdown()),
+                            outputs=[reply_status_md, reply_log_md])
 
 
 def _port_in_use(port: int) -> bool:
@@ -618,10 +1504,76 @@ def _disable_console_quick_edit() -> None:
         pass
 
 
-if __name__ == "__main__":
+def _running_jobs() -> int:
+    return sum(1 for job in _auto_pipeline().list_jobs() if job.state in {"queued", "running"})
+
+
+def _open_window(url: str, *, on_close=None) -> bool:
+    """Show the UI in its own window (pywebview).  False when that is not possible."""
+    try:
+        import webview
+    except ImportError:
+        return False
+    webview.settings["ALLOW_DOWNLOADS"] = True  # share zips and exported files
+    window = webview.create_window("CUT 自動投稿", url, width=1280, height=920, min_size=(900, 600),
+                                   text_select=True)
+
+    def closing():
+        if on_close is None or not _running_jobs():
+            return True
+        return window.create_confirmation_dialog(
+            "CUT 自動投稿", "実行中のジョブがあります。止めて終了しますか？")
+
+    window.events.closing += closing
+    try:
+        webview.start()
+    except Exception as exc:  # e.g. the WebView2 runtime is missing
+        print(f"専用ウィンドウを開けなかったため、ブラウザで開きます: {exc}")
+        return False
+    if on_close is not None:
+        on_close()
+    return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CUT 自動投稿")
+    parser.add_argument("--browser", action="store_true", help="専用ウィンドウではなくブラウザで開く")
+    args = parser.parse_args(argv)
+    url = f"http://127.0.0.1:{APP_PORT}"
     _disable_console_quick_edit()
     if _port_in_use(APP_PORT):
-        print(f"自動投稿アプリは既に起動しています: http://127.0.0.1:{APP_PORT}")
-        webbrowser.open(f"http://127.0.0.1:{APP_PORT}")
+        print(f"自動投稿アプリは既に起動しています: {url}")
+        # A second window onto the running app; closing it leaves that app running.
+        if args.browser or not _open_window(url):
+            webbrowser.open(url)
         raise SystemExit(0)
-    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True)
+    _AUTO_REPLIER.start()
+    from moment_retrieval import repost
+
+    repost.start_worker()
+    from moment_retrieval import publish_queue
+
+    publish_queue.start_worker(on_published=lambda receipt: _sync_job_uploads(str(receipt["video_id"]), receipt))
+    if args.browser:
+        demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=True, css=APP_CSS,
+                    allowed_paths=[str(config.ARTIFACT_ROOT)])
+        return
+    demo.launch(server_name="127.0.0.1", server_port=APP_PORT, inbrowser=False, css=APP_CSS,
+                allowed_paths=[str(config.ARTIFACT_ROOT)], prevent_thread_lock=True)
+
+    def stop():
+        pipeline = _auto_pipeline()
+        for job in pipeline.list_jobs():
+            if job.state in {"queued", "running"}:
+                pipeline.cancel(job.job_id)
+        os._exit(0)
+
+    if not _open_window(url, on_close=stop):
+        webbrowser.open(url)
+        demo.block_thread()
+
+
+if __name__ == "__main__":
+    main()

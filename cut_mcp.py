@@ -3,7 +3,8 @@
 
 YouTube caption tools never touch the local library. Library tools read the
 local transcript database and may store clip *proposals* as highlight
-candidates, but never load Gradio/Whisper/embeddings, read media, or export.
+candidates, but never load Gradio/embeddings or export.  Only
+cut_relisten_range loads Whisper (lazily) to re-recognise a chosen range's audio.
 This deliberately implements only MCP initialization, ping and tools, with no
 HTTP listener or SDK dependency that could alter the application environment.
 """
@@ -43,7 +44,10 @@ INSTRUCTIONS = (
     "Local library: cut_list_videos, then cut_read_transcript/cut_search_transcript send the user's local "
     "transcript text to Codex, so set allow_transcript_transfer=true only when the user asked to use it. "
     "To suggest clips, call cut_propose_clips with segment IDs you actually read; CUT snaps them to "
-    "segment boundaries and stores them as highlight candidates. Only when the user asked for automatic "
+    "segment boundaries and stores them as highlight candidates. Captions must not come from the rough "
+    "transcript: for each saved candidate call cut_relisten_range (CUT re-transcribes that audio range), "
+    "proofread it (fix mis-recognitions from context, at most 10 characters per cue, unclear shouting such as "
+    "（絶叫）, never invent speech), then cut_set_captions, before exporting. Only when the user asked for automatic "
     "export, call cut_export_shorts with the returned highlight_run_id and poll cut_export_status until done; "
     "otherwise the user previews and saves in CUT. Never claim a file exists before status is done. "
     "No tool uploads or publishes anything."
@@ -157,6 +161,8 @@ LIBRARY_TOOLS = [
             "読んだsegment_idの範囲で切り抜き候補を最大10件提案する。CUTがsegment境界に合わせ、"
             "最小尺まで前後を補い、最大尺超過や重複を除外して「見どころ候補」に保存する。"
             "動画ファイルは書き出さない。利用者がCUTでプレビューして保存する。"
+            "保存後は、返ったsaved_candidatesごとにcut_relisten_rangeで音声を聞き直し、校正した字幕を"
+            "cut_set_captionsで確定してからcut_export_shortsを呼ぶ。"
         ),
         "inputSchema": _schema({
             "video_id": _VIDEO_ID,
@@ -170,7 +176,45 @@ LIBRARY_TOOLS = [
                         "idempotentHint": False, "openWorldHint": False},
     },
 ]
+_CAPTION_CUE = _schema({
+    "start_ms": {"type": "integer", "minimum": 0, "maximum": 600_000},
+    "end_ms": {"type": "integer", "minimum": 1, "maximum": 600_000},
+    "text": {"type": "string", "maxLength": 40},
+}, ["start_ms", "end_ms", "text"])
 LIBRARY_TOOLS += [
+    {
+        "name": "cut_relisten_range",
+        "description": (
+            "選んだ範囲（cut_propose_clipsのsaved_candidatesのstart_ms/end_ms）の音声をWhisperで聞き直し、"
+            "単語と時刻（範囲先頭からの相対ms）を返す。AIは音声を聞けないため、字幕はcut_read_transcriptの"
+            "文字起こしではなくこの結果から校正する。数十秒〜数分かかる。同意条件はcut_read_transcriptと同じ。"
+        ),
+        "inputSchema": _schema({
+            "video_id": _VIDEO_ID,
+            "allow_transcript_transfer": _TRANSFER_FLAG,
+            "start_ms": {"type": "integer", "minimum": 0, "maximum": 2_000_000_000},
+            "end_ms": {"type": "integer", "minimum": 1, "maximum": 2_000_000_000},
+        }, ["video_id", "allow_transcript_transfer", "start_ms", "end_ms"]),
+        "annotations": {"readOnlyHint": True, "destructiveHint": False,
+                        "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "cut_set_captions",
+        "description": (
+            "cut_relisten_rangeの結果を校正した字幕を、その範囲の確定字幕として保存する。"
+            "start_ms/end_msは候補の範囲、captionsの時刻は範囲先頭からの相対ms。時刻順・重なりなし・"
+            "範囲内、1行1〜10文字（空白は1つに正規化）、最大300行。聞き取れない叫びは「（絶叫）」等にし、"
+            "話していない内容は足さない。確定後のcut_export_shortsでこの字幕が焼き込まれる。"
+        ),
+        "inputSchema": _schema({
+            "video_id": _VIDEO_ID,
+            "start_ms": {"type": "integer", "minimum": 0, "maximum": 2_000_000_000},
+            "end_ms": {"type": "integer", "minimum": 1, "maximum": 2_000_000_000},
+            "captions": {"type": "array", "minItems": 1, "maxItems": 300, "items": _CAPTION_CUE},
+        }, ["video_id", "start_ms", "end_ms", "captions"]),
+        "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                        "idempotentHint": True, "openWorldHint": False},
+    },
     {
         "name": "cut_export_shorts",
         "description": (
@@ -352,6 +396,12 @@ class CaptionTools:
             return self.library.read_transcript(
                 arguments["video_id"], arguments.get("start_index", 0), arguments.get("max_segments", 120),
             )
+        if name == "cut_relisten_range":
+            return self.library.relisten_range(arguments["video_id"], arguments["start_ms"], arguments["end_ms"])
+        if name == "cut_set_captions":
+            return self.library.set_captions(
+                arguments["video_id"], arguments["start_ms"], arguments["end_ms"], arguments["captions"],
+            )
         if name == "cut_export_shorts":
             return self.library.start_short_export(
                 arguments["video_id"], arguments["highlight_run_id"],
@@ -460,7 +510,7 @@ def main():
         print("[mcp_servers.cut_youtube]")
         print("command = " + json.dumps(command))
         print("args = " + json.dumps([str(Path(__file__).resolve().as_posix())]))
-        print('startup_timeout_sec = 10\ntool_timeout_sec = 120\ndefault_tools_approval_mode = "prompt"')
+        print('startup_timeout_sec = 10\ntool_timeout_sec = 900\ndefault_tools_approval_mode = "prompt"')
         return
     serve(sys.stdin.buffer, sys.stdout.buffer)
 

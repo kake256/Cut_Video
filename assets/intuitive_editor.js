@@ -1386,4 +1386,22 @@
   });
   installSearchMarkerObservers();
   installOverallControlsObserver();
+  // The fixed save bar grows while saving (status row, stop button). Publish its
+  // height so the page keeps enough bottom padding to scroll content above it.
+  const installSaveBarHeightObserver = (attempt = 0) => {
+    const bar = document.querySelector('#intuitive-editor-tab > div > #intuitive-save-bar');
+    if (!bar || typeof ResizeObserver === 'undefined') {
+      if (bar === null && attempt < 40) {
+        setTimeout(() => installSaveBarHeightObserver(attempt + 1), 250);
+      }
+      return;
+    }
+    new ResizeObserver(() => {
+      const height = Math.ceil(bar.getBoundingClientRect().height);
+      if (height > 0) {
+        document.documentElement.style.setProperty('--intuitive-save-bar-height', `${height}px`);
+      }
+    }).observe(bar);
+  };
+  installSaveBarHeightObserver();
 }

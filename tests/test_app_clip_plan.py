@@ -920,6 +920,28 @@ class ClipPlanTest(unittest.TestCase):
         self.assertIsNone(state["pending_cut_start"])
         self.assertIsNone(state["active_tool"])
 
+    def test_pressing_exclude_end_after_exclude_start_keeps_the_start(self):
+        state = self._intuitive_state()
+        state = self._intuitive_command(state, "set_tool", tool="exclude_start")
+        state = self._intuitive_command(state, "set_from_timeline", time=30.0)
+        self.assertEqual(state["active_tool"], "exclude_end")
+        # The guide says to choose the end; pressing the highlighted button must not cancel.
+        state = self._intuitive_command(state, "set_tool", tool="exclude_end")
+        self.assertEqual(state["active_tool"], "exclude_end")
+        self.assertEqual(state["pending_cut_start"], 30.0)
+        state = self._intuitive_command(
+            state, "set_from_word", start=39.0, end=40.0
+        )
+        self.assertEqual(
+            [(cut["start"], cut["end"]) for cut in state["exclusions"]],
+            [(30.0, 40.0)],
+        )
+        # Choosing another tool is still the explicit way to drop the pending start.
+        state = self._intuitive_command(state, "set_tool", tool="exclude_start")
+        state = self._intuitive_command(state, "set_from_timeline", time=50.0)
+        state = self._intuitive_command(state, "set_tool", tool="overall_start")
+        self.assertIsNone(state["pending_cut_start"])
+
     def test_intuitive_timeline_time_requires_selected_tool(self):
         state = self._intuitive_state()
         with self.assertRaises(gr.Error):

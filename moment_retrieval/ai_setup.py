@@ -102,7 +102,17 @@ def all_status() -> dict:
 def _open_console(command: str, *, popen: Callable = subprocess.Popen) -> None:
     """Run a fixed command in a new console window the user can watch."""
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-    popen(["cmd", "/k", command], cwd=str(REPO_ROOT), creationflags=flags)
+    popen(console_command_line(command), cwd=str(REPO_ROOT), creationflags=flags)
+
+
+def console_command_line(command: str) -> str:
+    """One command line string for cmd.exe.
+
+    A list argument would be re-quoted by Python as ``\\"...\\"``, which cmd.exe
+    does not understand ('"C:\\...\\claude.CMD"' is not recognized).  With ``/s``,
+    cmd strips exactly the outer pair of quotes and runs the rest as written.
+    """
+    return f'cmd /s /k "{command}"'
 
 
 def install(agent: str, *, popen: Callable = subprocess.Popen) -> str:

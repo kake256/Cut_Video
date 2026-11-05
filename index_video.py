@@ -245,6 +245,19 @@ def _run_optional_llm_analysis(
         )
 
 
+def _record_audio_profile(video_id: str, video: Path) -> Iterator[str]:
+    """Store loudness and speech regions next to the transcript (best effort)."""
+    from moment_retrieval import signals
+
+    yield "音声の波形（音量と発話区間）を記録中..."
+    try:
+        signals.ensure_audio(video_id, video)
+    except Exception as exc:  # the transcript is already published; this is only a helper
+        yield f"  注意: 音声の波形を記録できませんでした（{type(exc).__name__}）。次に使うときに再試行します。"
+    else:
+        yield "  音声の波形を記録しました"
+
+
 def run_indexing(
     video: Path,
     video_id: Optional[str] = None,
@@ -456,6 +469,7 @@ def run_indexing(
                 f"チャンク {len(chunk_ids)} 件を登録しました。"
             )
         yield from post_messages
+        yield from _record_audio_profile(video_id, video)
         if llm_analysis:
             selected_model = (llm_model or config.LLM_ANALYSIS_MODEL).strip()
             if not selected_model:

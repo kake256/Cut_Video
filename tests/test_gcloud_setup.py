@@ -50,6 +50,8 @@ class GcloudSetupTest(unittest.TestCase):
         self.assertIn(["projects", "create", first["project_id"], "--name=CUT-YouTube", "--quiet"], fake.calls)
         self.assertIn(["services", "enable", "youtube.googleapis.com",
                        f"--project={first['project_id']}", "--quiet"], fake.calls)
+        self.assertIn(["services", "enable", "script.googleapis.com",
+                       f"--project={first['project_id']}", "--quiet"], fake.calls)
         second = gcloud_setup.create_project_and_enable_api(runner=fake)
         self.assertFalse(second["created"])
         self.assertEqual(second["project_id"], first["project_id"])

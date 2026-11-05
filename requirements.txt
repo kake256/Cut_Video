@@ -6,6 +6,8 @@ datasets==3.6.0
 faiss-cpu>=1.8.0
 numpy>=1.26
 gradio==6.19.0
+# Opens the auto-publish app in its own window (Edge WebView2) instead of a browser tab.
+pywebview>=6.2
 torch>=2.6
 # Site extractors change frequently.  The default extra supplies the supported
 # JavaScript solver scripts (EJS); Node.js or Deno is installed separately.

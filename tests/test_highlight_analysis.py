@@ -122,6 +122,15 @@ class HighlightAnalysisTest(unittest.TestCase):
         with self.assertRaisesRegex(AnalysisValidationError, "invalid time"):
             suppress_overlaps([{"start_sec": 1, "end_sec": 1}])
 
+    def test_long_candidates_sharing_a_scene_are_duplicates(self):
+        # 25 s shared by two ~150 s clips is under the 30% ratio but is the same scene
+        first = {"start_sec": 0.0, "end_sec": 149.0}
+        second = {"start_sec": 124.0, "end_sec": 245.0}
+        kept, suppressed = suppress_overlaps([first, second])
+        self.assertEqual((kept, suppressed), ([first], 1))
+        apart = {"start_sec": 140.0, "end_sec": 260.0}  # 9 s touch is fine
+        self.assertEqual(suppress_overlaps([first, apart]), ([first, apart], 0))
+
     def test_query_hits_become_segment_linked_deduplicated_candidates(self):
         rows = [
             {

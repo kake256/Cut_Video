@@ -130,6 +130,13 @@ class ConfirmedCaptionsTest(unittest.TestCase):
         self.assertLess(prompt.index("cut_propose_clips"), prompt.index("cut_relisten_range"))
         self.assertIn("cut_set_captions", agent_runner.CLAUDE_TOOLS)
 
+    def test_agent_skips_captions_when_finishing_makes_them(self):
+        prompt = agent_runner.ClipRequest(video_id="vid_x", confirm_captions=False).prompt()
+        self.assertIn("cut_propose_clips", prompt)
+        self.assertNotIn("cut_relisten_range", prompt)
+        self.assertNotIn("cut_set_captions", prompt)
+        self.assertIn("4. 最後に", prompt)
+
     def test_finishing_uses_relisten_and_falls_back(self):
         segments = [{"start_sec": 10.0, "end_sec": 12.0, "text": "あい",
                      "words_json": '[{"word":"あい","start":10.5,"end":11.0}]'}]
@@ -145,6 +152,42 @@ class ConfirmedCaptionsTest(unittest.TestCase):
         self.assertEqual(source, "transcript")
         self.assertEqual([w.text for w in words], ["あい"])
         self.assertTrue(logs)
+
+    def test_finishing_from_a_section_file_relistens_in_its_own_time(self):
+        # The section file's 0 s is 8 s into the source; the clip is 10-20 s of the source.
+        raw = [{"start": 2.2, "end": 2.6, "word": "や"}]
+        with patch("moment_retrieval.relisten.retranscribe_range", return_value=raw) as relisten:
+            words, source = finishing.words_for_clip(self.media, [], 10.0, 20.0, media_start=2.0)
+        self.assertEqual(relisten.call_args.args[1:], (2.0, 12.0))
+        self.assertEqual(source, "relisten")
+        self.assertAlmostEqual(words[0].start, 0.2)
+        self.assertAlmostEqual(words[0].end, 0.6)
+        path, start, end = finishing._media({}, 10.0, 20.0, (self.media, 8.0))
+        self.assertEqual((path, start, end), (self.media, 2.0, 12.0))
+
+    def test_finish_exported_clip_renders_from_the_given_section(self):
+        import json
+
+        clip = Path(self.tmp.name) / "clip.mp4"
+        clip.with_suffix(".metadata.json").write_text(json.dumps(
+            {"title": "t", "source_range": {"video_id": self.vid, "start_sec": 10.0, "end_sec": 20.0}}),
+            encoding="utf-8")
+        section = Path(self.tmp.name) / "section_00.mp4"
+        section.write_bytes(b"x")
+        rendered = {}
+
+        def render(media, start, end, words, plan, output, **_kwargs):
+            rendered.update(media=media, start=start, end=end)
+            Path(output).write_bytes(b"mp4")
+
+        with patch.object(db, "get_conn", self.connect), \
+                patch.object(finishing, "words_for_clip", return_value=([], "relisten")) as words, \
+                patch.object(finishing, "request_plan", return_value={"hook_text": "x"}), \
+                patch("moment_retrieval.speech_regions.detect", return_value=[]), \
+                patch.object(finishing, "render", side_effect=render):
+            finishing.finish_exported_clip(clip, agent="claude", section=(section, 8.0))
+        self.assertEqual(rendered, {"media": section, "start": 2.0, "end": 12.0})
+        self.assertEqual(words.call_args.kwargs["media_start"], 2.0)
 
 
 if __name__ == "__main__":

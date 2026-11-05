@@ -5295,13 +5295,21 @@ def _safe_highlight_filename_part(
     return sanitized
 
 
+def _media_stem(name: str) -> str:
+    """File stem for output names; an audio stand-in (``x.audio.webm``) names like its video ``x.mp4``."""
+    from moment_retrieval.downloader import AUDIO_SUFFIX
+
+    stem = Path(name).stem
+    return stem[: -len(AUDIO_SUFFIX)] if stem.endswith(AUDIO_SUFFIX) else stem
+
+
 def _highlight_video_output_directory(output_root: Path, video: dict) -> Path:
     """Return the stable per-video directory below the highlight output root."""
     video_name = str(
         video.get("display_name") or Path(str(video.get("path") or "")).name
     )
     safe_video_name = _safe_highlight_filename_part(
-        Path(video_name).stem,
+        _media_stem(video_name),
         fallback="動画",
         max_length=64,
     )
@@ -5329,7 +5337,7 @@ def _available_highlight_output_path(
     output_dir: Path, video_name: str, chapter_title: str, *, variant: str = ""
 ) -> Path:
     safe_video_name = _safe_highlight_filename_part(
-        Path(video_name).stem,
+        _media_stem(video_name),
         fallback="動画",
         max_length=64,
     )

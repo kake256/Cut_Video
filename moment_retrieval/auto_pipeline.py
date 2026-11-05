@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,6 +27,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"done", "failed", "cancelled"}
 # YouTube Shorts accept vertical videos up to 3 minutes.
 SHORTS_MAX_SEC = 180
+# Clips finished side by side.  Each mostly waits for the AI's plan (about 45 s with
+# Claude Sonnet); the render and relisten parts share the GPU without trouble at 3.
+FINISH_WORKERS = int(os.environ.get("CUT_VIDEO_FINISH_WORKERS", "3"))
+# Seconds fetched around each clip range when only the ranges are downloaded.
+SECTION_MARGIN_SEC = 2.0
 STEPS = ("取り込み", "文字起こし", "候補選び", "書き出し", "投稿")
 
 
@@ -65,6 +71,8 @@ class AutoJob:
     privacy: str = "private"  # upload as "private" or "unlisted"; public only by the publish button
     source_channel_key: str = ""
     source_video_key: str = ""
+    # {"step", "started_at", "seconds"} per pipeline step; scripts/report_auto_jobs.py sums them up.
+    timings: list[dict] = field(default_factory=list)
 
 
 def _jobs_dir() -> Path:
@@ -175,12 +183,15 @@ class AutoPipeline:
         self.cancelled: set[str] = set()
         self.processes: dict[str, object] = {}
         self.video_downloads: dict[str, object] = {}  # job_id -> audio_first.VideoDownload
+        # job_id -> {"dir": Path, "files": {output: (section file, offset)}} while finishing from sections
+        self.clip_sources: dict[str, dict] = {}
+        self.background: list[threading.Thread] = []  # full-video downloads that outlive their job
         self.lock = threading.RLock()
         self.worker: threading.Thread | None = None
         self.steps = {
             "metadata": self._metadata, "download": self._download, "index": self._index,
             "select": self._select, "export": self._export, "finish": self._finish, "upload": self._upload,
-            "await_video": self._await_video,
+            "await_video": self._await_video, "sections": self._sections,
             **(steps or {}),
         }
         self._load()
@@ -309,7 +320,7 @@ class AutoPipeline:
         try:
             self._check_cancel(job)
             job.step = STEPS[0]
-            info, channel, local_path = self.steps["metadata"](job)
+            info, channel, local_path = self._call(job, "metadata")
             if channel is not None:
                 job.source_channel = f"{channel.name}（{channel.key}）"
                 job.source_channel_key = channel.key
@@ -317,31 +328,38 @@ class AutoPipeline:
             if video is not None:
                 job.source_video_key = video.key
             if local_path is None:
-                local_path = self.steps["download"](job)
+                local_path = self._call(job, "download")
             self._check_cancel(job)
             job.step = STEPS[1]
-            job.video_id = self.steps["index"](job, Path(local_path))
+            job.video_id = self._call(job, "index", Path(local_path))
             if job.link_only:
-                self.steps["await_video"](job)
+                self._call(job, "await_video")
                 job.state = "done"
                 self._log(job, "ダウンロードと文字起こしが完了しました（切り抜きはしていません）。"
                                "「文字起こし済みの動画から選ぶ」から切り抜けます。")
                 return
             self._check_cancel(job)
             job.step = STEPS[2]
-            job.highlight_run_id = self.steps["select"](job)
+            job.highlight_run_id = self._call(job, "select")
             self._check_cancel(job)
             job.step = STEPS[3]
-            self.steps["await_video"](job)
+            # Finishing renders each clip itself, so when the full video is still on its
+            # way it fetches just the clip ranges instead of waiting for all of it.
+            by_sections = job.finish and self._video_still_downloading(job)
+            if not by_sections:
+                self._call(job, "await_video")
             self._check_cancel(job)
-            job.outputs = self.steps["export"](job)
+            job.outputs = self._call(job, "export")
             self._check_cancel(job)
+            if by_sections and not self._call(job, "sections"):
+                self._call(job, "await_video")  # sections failed: fall back to the full video
+                self._check_cancel(job)
             if job.finish:
-                self.steps["finish"](job)
+                self._call(job, "finish")
                 self._check_cancel(job)
             job.step = STEPS[4]
             if job.upload:
-                self.steps["upload"](job)
+                self._call(job, "upload")
             else:
                 self._log(job, "投稿しない設定のため、書き出しまでで終了しました。")
             job.state = "done"
@@ -357,8 +375,25 @@ class AutoPipeline:
                 self.processes.pop(job.job_id, None)
                 self.cancelled.discard(job.job_id)
                 download = self.video_downloads.pop(job.job_id, None)
-            if download is not None:  # stopped or failed before the video was needed
-                download.cancel()
+                sections = self.clip_sources.pop(job.job_id, None)
+            if download is not None:
+                if job.state == "done" and job.video_id:
+                    self._complete_video_later(job, download)  # clips were made from sections
+                else:  # stopped or failed before the video was needed
+                    download.cancel()
+                self._save(job)
+            if sections:
+                shutil.rmtree(sections["dir"], ignore_errors=True)
+
+    def _call(self, job: AutoJob, name: str, *args):
+        """Run one step and record how long it took, so daily jobs can be compared."""
+        started = time.time()
+        try:
+            return self.steps[name](job, *args)
+        finally:
+            with self.lock:
+                job.timings.append({"step": name, "started_at": round(started, 1),
+                                    "seconds": round(time.time() - started, 1)})
                 self._save(job)
 
     def _metadata(self, job: AutoJob):
@@ -481,6 +516,95 @@ class AutoPipeline:
                 self.video_downloads.pop(job.job_id, None)
         audio_first.swap_to_video(job.video_id, path)
         self._log(job, "動画のダウンロードが完了し、音声から動画に差し替えました（文字起こしはそのまま使います）。")
+
+    def _video_still_downloading(self, job: AutoJob) -> bool:
+        with self.lock:
+            download = self.video_downloads.get(job.job_id)
+        return download is not None and not download.done
+
+    def _sections(self, job: AutoJob) -> bool:
+        """Download only the exported clip ranges; False when that fails (wait for the video then)."""
+        from .downloader import DownloadCancelled, download_sections
+
+        clips = []
+        for output in job.outputs:
+            try:
+                meta = json.loads(Path(output).with_suffix(".metadata.json").read_text(encoding="utf-8"))
+                source = meta["source_range"]
+                clips.append((output, float(source["start_sec"]), float(source["end_sec"])))
+            except (OSError, ValueError, KeyError, TypeError):
+                self._log(job, "切り抜く範囲を読めなかったため、動画全体のダウンロードを待ちます。")
+                return False
+        with self.lock:
+            url = getattr(self.video_downloads.get(job.job_id), "url", "")
+        if not clips or not url:
+            return False
+        ranges = [(max(0.0, start - SECTION_MARGIN_SEC), end + SECTION_MARGIN_SEC) for _output, start, end in clips]
+        directory = _jobs_dir() / f"{job.job_id}.sections"
+        with self.lock:
+            self.clip_sources[job.job_id] = {"dir": directory, "files": {}}
+        footage = sum(end - start for start, end in ranges) / 60
+        self._log(job, f"動画全体のダウンロードを待たずに、切り抜く{len(ranges)}区間（計{footage:.0f}分）だけを先に取得します。"
+                       "全体のダウンロードは裏で続けます。")
+        cancel = threading.Event()
+        watcher = threading.Thread(target=self._cancel_when_stopped, args=(job, cancel), daemon=True)
+        watcher.start()
+        try:
+            files = download_sections(url, ranges, directory, cancel_event=cancel)
+        except DownloadCancelled:
+            raise Cancelled()
+        except Exception as exc:
+            self._log(job, f"区間だけの取得に失敗したため、動画全体のダウンロードを待ちます（{exc}）"[:300])
+            shutil.rmtree(directory, ignore_errors=True)
+            with self.lock:
+                self.clip_sources.pop(job.job_id, None)
+            return False
+        finally:
+            cancel.set()  # also ends the watcher
+        with self.lock:
+            self.clip_sources[job.job_id]["files"] = {
+                output: (path, start) for (output, _start, _end), path, (start, _stop) in zip(clips, files, ranges)}
+        self._log(job, "切り抜く区間の取得が完了しました。")
+        return True
+
+    def _cancel_when_stopped(self, job: AutoJob, event: threading.Event) -> None:
+        while not event.wait(1.0):
+            if job.job_id in self.cancelled:
+                event.set()
+
+    def _complete_video_later(self, job: AutoJob, download) -> None:
+        """Let the full video finish downloading after the job, then point the library at it."""
+        from . import audio_first
+
+        def work():
+            try:
+                path = download.wait()
+                for attempt in range(30):  # another job may hold the library for a while
+                    try:
+                        audio_first.swap_to_video(job.video_id, path)
+                        break
+                    except audio_first.SwapError as exc:
+                        if "実行中" not in str(exc) or attempt == 29:
+                            raise
+                        time.sleep(20)
+                self._log(job, "動画全体のダウンロードが完了し、ライブラリを音声から動画に差し替えました。")
+            except Exception as exc:  # the audio entry stays; a later job downloads the video again
+                self._log(job, f"動画全体のダウンロードを完了できませんでした（{type(exc).__name__}）。"
+                               "次にこの動画を使うときに取得し直します。")
+
+        thread = threading.Thread(target=work, name="video-complete", daemon=True)
+        with self.lock:
+            self.background = [item for item in self.background if item.is_alive()] + [thread]
+        thread.start()
+
+    def wait_for_background_downloads(self, timeout: float | None = None) -> bool:
+        """Block until full-video downloads handed off by finished jobs are done; True if none remain."""
+        deadline = None if timeout is None else time.time() + timeout
+        with self.lock:
+            threads = list(self.background)
+        for thread in threads:
+            thread.join(None if deadline is None else max(0.0, deadline - time.time()))
+        return not any(thread.is_alive() for thread in threads)
 
     def _indexed_video_id(self, path: Path) -> str | None:
         conn = db.get_conn()
@@ -663,7 +787,11 @@ class AutoPipeline:
         before = set(self._ready_run_ids(job.video_id))
         from .signals import prompt_section
 
+        started = time.time()
         hints = self._signals(job)
+        with self.lock:  # part of "select": waveform and chat, before the AI starts
+            job.timings.append({"step": "select.signals", "started_at": round(started, 1),
+                                "seconds": round(time.time() - started, 1)})
         label = agent_runner.AGENT_LABELS[job.agent]
         from .used_ranges import for_video
 
@@ -696,6 +824,13 @@ class AutoPipeline:
             )
             return after
 
+        from .channel_performance import prompt_section as performance_section
+
+        # A requested scene wins over the channel's taste, so the hint is only for open choices.
+        performance = "" if job.focus else performance_section()
+        if performance:
+            self._log(job, "過去の投稿でよく見られた切り抜きとそうでないものを参考に選ぶよう指示します。")
+
         def register(process):
             with self.lock:
                 self.processes[job.job_id] = process
@@ -703,7 +838,9 @@ class AutoPipeline:
         output = agent_runner.run_agent(
             job.agent,
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
-                                     used_ranges=tuple(used), focus=job.focus, hints=prompt_section(hints)),
+                                     used_ranges=tuple(used), focus=job.focus,
+                                     hints=prompt_section(hints) + performance,
+                                     confirm_captions=not job.finish),
             register_process=register,
             model=job.model,
             effort=job.effort,
@@ -748,30 +885,55 @@ class AutoPipeline:
 
     def _finish(self, job: AutoJob) -> None:
         """Give each exported Short a hook title, word-timed captions and sound effects."""
-        from . import finishing
+        from concurrent.futures import ThreadPoolExecutor
 
-        self._log(job, "仕上げ（引きのタイトル・字幕のタイミング調整・効果音）を行います。")
-        for index, output in enumerate(job.outputs, start=1):
-            self._check_cancel(job)
-            try:
-                plan = finishing.finish_exported_clip(
-                    Path(output), agent=job.agent, model=job.model, focus=job.focus,
-                    log=lambda message: self._log(job, message),
-                )
-            except Exception as exc:  # an unfinished clip is still a valid Short
-                self._log(job, f"  {index}本目の仕上げを省略しました（{type(exc).__name__}）")
-                if not Path(output).is_file():  # export only recorded the range
-                    try:
-                        finishing.render_plain_clip(Path(output))
-                        self._log(job, f"  {index}本目は仕上げなしの動画を作りました。")
-                    except Exception as fallback_exc:
-                        self._log(job, f"  {index}本目の動画を作れませんでした（{type(fallback_exc).__name__}）")
-                continue
-            self._log(job, f"  {index}本目: 引き「{plan.hook_text}」・効果音{len(plan.sound_effects)}か所")
+        from . import relisten
+
+        workers = max(1, min(FINISH_WORKERS, len(job.outputs)))
+        self._log(job, "仕上げ（引きのタイトル・字幕のタイミング調整・効果音）を行います"
+                       + (f"（{workers}本ずつ並行）。" if workers > 1 else "。"))
+        # Most of a clip's finishing is waiting for the AI's plan, so clips run side by side.
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cut_finish") as pool:
+                futures = [pool.submit(self._finish_one, job, index, output)
+                           for index, output in enumerate(job.outputs, start=1)]
+                try:
+                    for future in futures:
+                        future.result()
+                except Cancelled:
+                    for future in futures:
+                        future.cancel()
+                    raise
+        finally:
+            relisten.release_model()  # give the GPU memory back to the next job's transcription
         missing = [output for output in job.outputs if not Path(output).is_file()]
         if missing:
             job.outputs = [output for output in job.outputs if output not in missing]
             self._log(job, f"  動画を作れなかった{len(missing)}本は投稿しません。")
+
+    def _finish_one(self, job: AutoJob, index: int, output: str) -> None:
+        from . import finishing
+
+        self._check_cancel(job)
+        with self.lock:
+            section = (self.clip_sources.get(job.job_id) or {}).get("files", {}).get(output)
+        try:
+            plan = finishing.finish_exported_clip(
+                Path(output), agent=job.agent, model=job.model, focus=job.focus,
+                log=lambda message: self._log(job, f"  {index}本目:{message.strip()}"
+                                              if message.startswith("  ") else message),
+                section=section,
+            )
+        except Exception as exc:  # an unfinished clip is still a valid Short
+            self._log(job, f"  {index}本目の仕上げを省略しました（{type(exc).__name__}）")
+            if not Path(output).is_file():  # export only recorded the range
+                try:
+                    finishing.render_plain_clip(Path(output), section=section)
+                    self._log(job, f"  {index}本目は仕上げなしの動画を作りました。")
+                except Exception as fallback_exc:
+                    self._log(job, f"  {index}本目の動画を作れませんでした（{type(fallback_exc).__name__}）")
+            return
+        self._log(job, f"  {index}本目: 引き「{plan.hook_text}」・効果音{len(plan.sound_effects)}か所")
 
     def _upload(self, job: AutoJob) -> None:
         from . import youtube_upload

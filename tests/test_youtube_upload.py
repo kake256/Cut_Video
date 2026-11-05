@@ -22,8 +22,12 @@ class _Request:
         self.body = body
         self.steps = [(_Status(0.5), None), (None, {"id": "abcDEF12345", "status": {"privacyStatus": "private"}})]
 
-    def next_chunk(self):
-        return self.steps.pop(0)
+    def next_chunk(self, num_retries=0):
+        self.num_retries = num_retries
+        step = self.steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
 
 
 class _Service:
@@ -152,6 +156,37 @@ class YouTubeUploadTest(unittest.TestCase):
         self.assertEqual(len(service.inserted), 1)
         self.assertIn("省略", again[0][0])
 
+    def test_a_stalled_upload_retries_then_fails_with_a_message_and_no_receipt(self):
+        import socket
+
+        service = _Service()
+        original = service.insert
+
+        def insert(part, body, media_body):
+            request = original(part, body, media_body)
+            request.steps = [socket.timeout("timed out")]
+            service.request = request
+            return request
+
+        service.insert = insert
+        with self.assertRaises(youtube_upload.UploadError) as caught:
+            list(youtube_upload.upload_private(self.video, service_factory=lambda: service))
+        self.assertIn("もう一度実行", str(caught.exception))
+        self.assertEqual(service.request.num_retries, youtube_upload.UPLOAD_RETRIES)
+        self.assertFalse(youtube_upload.receipt_path(self.video).is_file())
+
+    def test_service_has_a_network_timeout(self):
+        import httplib2
+
+        with patch.object(youtube_upload, "load_credentials", return_value=object()), \
+                patch("googleapiclient.discovery.build", side_effect=lambda *a, **k: k["http"]) as build:
+            http = youtube_upload._service(None, interactive=False)
+        self.assertIsInstance(http.http, httplib2.Http)
+        self.assertEqual(http.http.timeout, youtube_upload.HTTP_TIMEOUT_SEC)
+        # 308 "Resume Incomplete" after each chunk must not be followed as a redirect.
+        self.assertNotIn(308, http.http.redirect_codes)
+        self.assertNotIn("credentials", build.call_args.kwargs)
+
     def test_non_mp4_is_rejected(self):
         other = self.root / "notes.txt"
         other.write_text("x", encoding="utf-8")
@@ -263,36 +298,41 @@ class AutoPublishAppTest(unittest.TestCase):
                                                             encoding="utf-8")
             self.assertEqual(auto_publish_app.apply_ui_settings(), ("high", 20, 180, "blur", True, "unlisted"))
 
-    def test_publish_buttons_publish_right_away_and_summarise_failures(self):
+    def test_privacy_buttons_change_right_away_and_summarise_failures(self):
         import auto_publish_app
+        from moment_retrieval import made_clips
 
         with self.assertRaises(auto_publish_app.gr.Error):
-            auto_publish_app.publish_now("auto_a", [])
+            auto_publish_app.change_clip_privacy([], "public")
 
-        def publish(job_id, video_id):
-            if video_id != "yt1":
-                raise auto_publish_app.PipelineError("権限がありません")
-            return {"watch_url": f"https://www.youtube.com/watch?v={video_id}"}
+        def change(path, privacy):
+            if path != "a.mp4":
+                raise youtube_upload.UploadError("権限がありません")
+            return {"video_id": "yt1", "privacy_status": privacy, "watch_url": "https://www.youtube.com/watch?v=yt1"}
 
-        pipeline = SimpleNamespace(publish=Mock(side_effect=publish))
-        with patch.object(auto_publish_app, "_auto_pipeline", return_value=pipeline), \
-                patch.object(auto_publish_app, "auto_jobs_view", return_value=("jobs", "[]", None, "history")), \
+        with patch.object(made_clips, "change_privacy", side_effect=change) as changed, \
+                patch.object(auto_publish_app, "_sync_job_uploads") as synced, \
+                patch.object(auto_publish_app, "cards_signature", return_value="[]"), \
                 patch.object(auto_publish_app.gr, "Info"):
-            result = auto_publish_app.publish_now("auto_a", ["yt1", "yt2", "yt3"])
-        self.assertEqual(pipeline.publish.call_count, 3)
+            result = auto_publish_app.change_clip_privacy(["a.mp4", "b.mp4", "c.mp4"], "public")
+        self.assertEqual(changed.call_count, 3)
+        synced.assert_called_once()
         self.assertIn("watch?v=yt1", result[0])
-        self.assertIn("2本を公開できませんでした: 権限がありません", result[0])
-        self.assertEqual(len(result), 5)
+        self.assertIn("2本を公開にできませんでした: 権限がありません", result[0])
+        self.assertEqual(len(result), 2)
 
-    def test_upload_signature_ignores_progress_but_tracks_publication(self):
+    def test_card_signature_tracks_uploads_and_privacy_only(self):
         import auto_publish_app
 
-        job = SimpleNamespace(job_id="auto_a", uploads=[{"video_id": "yt1", "privacy_status": "private"}], log=["a"])
-        before = auto_publish_app.uploads_signature([job])
-        job.log.append("progress")
-        self.assertEqual(auto_publish_app.uploads_signature([job]), before)
-        job.uploads[0]["privacy_status"] = "public"
-        self.assertNotEqual(auto_publish_app.uploads_signature([job]), before)
+        clip = SimpleNamespace(path=Path("a.mp4"), receipt=None)
+        cards = [{"job_id": "auto_a", "clips": [clip]}]
+        before = auto_publish_app.cards_signature(cards)
+        self.assertEqual(auto_publish_app.cards_signature(cards), before)
+        clip.receipt = {"video_id": "yt1", "privacy_status": "private"}
+        uploaded = auto_publish_app.cards_signature(cards)
+        self.assertNotEqual(uploaded, before)
+        clip.receipt = {"video_id": "yt1", "privacy_status": "public"}
+        self.assertNotEqual(auto_publish_app.cards_signature(cards), uploaded)
 
     def test_quit_stops_running_jobs_then_exits_later(self):
         import auto_publish_app

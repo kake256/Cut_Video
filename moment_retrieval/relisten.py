@@ -36,6 +36,13 @@ def _get_model():
         return _model
 
 
+def release_model() -> None:
+    """読み込んだモデルを手放し、GPUメモリを次の文字起こしに返す。"""
+    global _model
+    with _model_lock:
+        _model = None
+
+
 def _extract_audio(media_path: Path, start_sec: float, end_sec: float, wav_path: Path) -> None:
     """範囲を16kHzモノラルwavに切り出す。"""
     result = subprocess.run(

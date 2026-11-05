@@ -156,17 +156,22 @@ def words_from_segments(segments: list[dict], clip_start: float, clip_end: float
 
 
 def words_for_clip(video_path: Path, segments: list[dict], start: float, end: float,
-                   log=None) -> tuple[list[Word], str]:
-    """字幕の元になる単語列。まず範囲の音声を聞き直し、失敗したらDBの文字起こしを使う。"""
+                   log=None, *, media_start: float | None = None) -> tuple[list[Word], str]:
+    """字幕の元になる単語列。まず範囲の音声を聞き直し、失敗したらDBの文字起こしを使う。
+
+    ``start``/``end`` は元動画の秒。``video_path`` が元動画の一部（区間ファイル）のときは、
+    そのファイル上での開始秒を ``media_start`` に渡す。返す単語はクリップ先頭からの秒。
+    """
     try:
         from . import relisten
 
-        raw = relisten.retranscribe_range(Path(video_path), start, end)
+        shift = start - (start if media_start is None else float(media_start))
+        raw = relisten.retranscribe_range(Path(video_path), start - shift, end - shift)
         words = [
-            Word(max(0.0, float(item["start"]) - start), min(end, float(item["end"])) - start,
+            Word(max(0.0, float(item["start"]) + shift - start), min(end, float(item["end"]) + shift) - start,
                  str(item["word"]).strip())
             for item in raw
-            if str(item["word"]).strip() and float(item["end"]) > start and float(item["start"]) < end
+            if str(item["word"]).strip() and float(item["end"]) + shift > start and float(item["start"]) + shift < end
         ]
         if words:
             return sorted(words, key=lambda word: word.start), "relisten"
@@ -493,11 +498,28 @@ def request_plan(agent: str, model: str, prompt: str, *, timeout: float = 600) -
         return _json_object(result.stdout)
 
 
-def render_plain_clip(clip: Path) -> Path:
+def _media(video: dict, start: float, end: float, section) -> tuple[Path, float, float]:
+    """The file to render from and the range in that file's own time.
+
+    ``section`` is ``(path, offset)`` for a downloaded section of the source video
+    whose 0 s is ``offset`` s into the source; otherwise the library video is used.
+    """
+    if section is not None:
+        path, offset = Path(section[0]), float(section[1])
+        if not path.is_file():
+            raise RuntimeError("切り抜く区間の動画が見つかりません")
+        return path, start - offset, end - offset
+    if not video or not Path(video["path"]).is_file():
+        raise RuntimeError("元動画が見つかりません")
+    return Path(video["path"]), start, end
+
+
+def render_plain_clip(clip: Path, *, section=None) -> Path:
     """Fallback when finishing fails on a clip whose export recorded only its range.
 
     Renders the source range with Whisper-timed captions and the title as hook,
     no AI plan and no sound effects; if even that fails, a caption-less Short.
+    ``section`` is an optional ``(section file, offset)`` (see ``_media``).
     """
     from . import db
     from .short_video import ShortVideoOptions, render_short_clip
@@ -513,16 +535,15 @@ def render_plain_clip(clip: Path) -> Path:
         video = db.get_video(conn, source["video_id"])
     finally:
         conn.close()
-    if not video or not Path(video["path"]).is_file():
-        raise RuntimeError("元動画が見つかりません")
+    media, media_start, media_end = _media(video, start, end, section)
     temporary = clip.with_name(f".{clip.stem}.plain.mp4")
     try:
         try:
             plan = FinishPlan(hook_text=str(meta.get("title") or clip.stem))
-            render(Path(video["path"]), start, end, words_from_segments(segments, start, end), plan, temporary)
+            render(media, media_start, media_end, words_from_segments(segments, start, end), plan, temporary)
         except Exception:
             temporary.unlink(missing_ok=True)
-            render_short_clip(Path(video["path"]), start, end, temporary,
+            render_short_clip(media, media_start, media_end, temporary,
                               options=ShortVideoOptions(burn_captions=False))
         os.replace(temporary, clip)
     finally:
@@ -531,7 +552,7 @@ def render_plain_clip(clip: Path) -> Path:
 
 
 def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str = "",
-                         log=None) -> FinishPlan:
+                         log=None, section=None) -> FinishPlan:
     """Replace an exported Short with its finished version (same file name).
 
     Needs the posting-metadata JSON written at export (it records the source range).
@@ -552,9 +573,9 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
         video = db.get_video(conn, source["video_id"])
     finally:
         conn.close()
-    if not video or not Path(video["path"]).is_file():
-        raise RuntimeError("元動画が見つかりません")
-    words, words_from = words_for_clip(Path(video["path"]), segments, start, end, log)
+    media, media_start, media_end = _media(video, start, end, section)
+    # Words are relative to the clip start, so they do not depend on which file is read.
+    words, words_from = words_for_clip(media, segments, start, end, log, media_start=media_start)
     title = str(meta.get("title") or clip.stem)
     try:
         raw = request_plan(agent, model, plan_prompt(title, captions_from_words(words), end - start, focus))
@@ -569,8 +590,10 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
         try:
             # Detect on this clip alone: the stored whole-video profile merges nearby
             # regions, which hides the onsets the captions should start on.
-            speech = speech_regions.detect(Path(video["path"]), start, end)
+            speech = speech_regions.detect(media, media_start, media_end)
         except Exception:
+            if section is not None:
+                raise
             profile = signals.ensure_audio(str(video["video_id"]), Path(video["path"]))
             speech = signals.speech_between(profile, start, end)
     except Exception as exc:  # timing falls back to Whisper's word times
@@ -580,7 +603,7 @@ def finish_exported_clip(clip: Path, *, agent: str, model: str = "", focus: str 
     ai_captions = bool(plan.caption_lines and captions_from_ai_lines(words, plan.caption_lines))
     temporary = clip.with_name(f".{clip.stem}.finishing.mp4")
     try:
-        render(Path(video["path"]), start, end, words, plan, temporary, speech=speech)
+        render(media, media_start, media_end, words, plan, temporary, speech=speech)
         os.replace(temporary, clip)
     finally:
         temporary.unlink(missing_ok=True)

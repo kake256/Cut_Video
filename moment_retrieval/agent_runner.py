@@ -51,6 +51,10 @@ class ClipRequest:
     used_ranges: tuple = ()  # source ranges already posted; the AI must avoid them
     focus: str = ""  # optional user request, e.g. "謎解きができなくてキレている箇所"
     hints: str = ""  # excitement cues (loudness jumps, chat bursts) from signals.prompt_section
+    # Proofread captions from a relisten pass.  Off when CUT's finishing step makes the
+    # captions itself (it relistens every clip, in parallel), so the agent does not spend
+    # about 1.5 minutes per clip on captions that finishing would replace anyway.
+    confirm_captions: bool = True
 
     def prompt(self) -> str:
         avoid = ""
@@ -76,11 +80,16 @@ class ClipRequest:
             f"max_duration_sec={self.max_duration_sec:g}, note='{self.note}'）。"
             "候補はまとめて1回で保存する（却下された候補の代わりを足すときは、残す候補も含めて全件で呼び直す）。"
             "タイトルは30文字以内で内容が分かるものにし、reasonに選んだ理由を書く。\n"
-            "4. 保存された各候補について、cut_relisten_range（allow_transcript_transfer=true、候補のstart_ms/end_ms）"
-            "で音声の聞き直し結果を取得し、字幕を校正して cut_set_captions で確定する。"
-            "字幕は文字起こしではなく聞き直し結果から作る。誤認識は文脈で直し、1行10文字以内、時刻は範囲先頭からの相対ms、"
-            "聞き取れない叫びは「（絶叫）」とし、話していない内容は足さない。\n"
-            "5. 最後に、保存された候補の時刻とタイトルを日本語で短く報告する。文字起こし本文は引用しない。"
+            + (
+                "4. 保存された各候補について、cut_relisten_range（allow_transcript_transfer=true、候補のstart_ms/end_ms）"
+                "で音声の聞き直し結果を取得し、字幕を校正して cut_set_captions で確定する。"
+                "字幕は文字起こしではなく聞き直し結果から作る。誤認識は文脈で直し、1行10文字以内、時刻は範囲先頭からの相対ms、"
+                "聞き取れない叫びは「（絶叫）」とし、話していない内容は足さない。\n"
+                if self.confirm_captions else ""
+            )
+            + f"{5 if self.confirm_captions else 4}. 最後に、保存された候補の時刻とタイトルを日本語で短く報告する。"
+            "文字起こし本文は引用しない。"
+            + ("" if self.confirm_captions else "字幕はCUTが後で作るので、聞き直しや字幕の確定は行わない。")
         )
 
 

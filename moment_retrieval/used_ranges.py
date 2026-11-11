@@ -141,3 +141,36 @@ def prompt_lines(used: list[dict]) -> str:
         + (f"（{item.get('by')}さんが作成）" if item.get("origin") == "ledger" else "")
         for item in used
     )
+
+
+def send_past_uploads_to_ledger() -> dict:
+    """Send the ranges this PC already uploaded (before the ledger was set up) to the ledger.
+
+    Only this PC's own uploads (origin 'upload') are sent, not ranges imported from other
+    people's share files; videos without a public origin URL cannot be matched and are counted."""
+    if not shared_ledger.enabled():
+        return {"sent": 0, "no_url": 0, "delivered": False, "enabled": False}
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        rows = conn.execute(
+            "SELECT public_video_id, start_sec, end_sec, title FROM used_clip_ranges "
+            "WHERE origin = 'upload' ORDER BY public_video_id, start_sec"
+        ).fetchall()
+        urls: dict[str, str | None] = {}
+        items, no_url = [], 0
+        for public_id, start, end, title in rows:
+            if public_id not in urls:
+                found = conn.execute(
+                    "SELECT video_id FROM videos WHERE public_video_id = ? OR video_id = ? LIMIT 1",
+                    (public_id, public_id),
+                ).fetchone()
+                urls[public_id] = shared_ledger.origin_for_video(conn, found[0]) if found else None
+            if not urls[public_id]:
+                no_url += 1
+                continue
+            items.append(("uploaded", urls[public_id], start, end, title or ""))
+    finally:
+        conn.close()
+    sent, delivered = shared_ledger.record_many(items)
+    return {"sent": sent, "no_url": no_url, "delivered": delivered, "enabled": True}

@@ -648,6 +648,21 @@ def ledger_start_folder(folder: str, name: str):
     return ledger_form_values()
 
 
+def ledger_backfill() -> str:
+    from moment_retrieval import used_ranges
+
+    result = used_ranges.send_past_uploads_to_ledger()
+    if not result["enabled"]:
+        return "先に上で共有台帳を始めてください。"
+    skipped = f"（URLの分からない動画の {result['no_url']} 件は送れませんでした）" if result["no_url"] else ""
+    if not result["sent"]:
+        return f"送れる投稿済みの切り抜きはありませんでした{skipped}。"
+    if not result["delivered"]:
+        return (f"{result['sent']} 件を送ろうとしましたが、台帳に届きませんでした。このPCにためておき、"
+                f"次につながったときに送ります{skipped}。")
+    return f"✅ これまでの投稿済みの切り抜き {result['sent']} 件を台帳に送りました{skipped}。"
+
+
 def ledger_clear():
     from moment_retrieval import shared_ledger
 
@@ -1620,6 +1635,11 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 ledger_refresh_btn = gr.Button("状態を更新", scale=1, min_width=100)
                 ledger_clear_btn = gr.Button("オフにする", scale=1, min_width=100)
             ledger_share_md = gr.Markdown("")
+            with gr.Accordion("台帳を使う前に投稿した切り抜きも送る", open=False):
+                gr.Markdown("<small>このPCでこれまでに投稿した切り抜きの範囲を、まとめて台帳に送ります。"
+                            "URLから取り込んだ動画の分だけが送れます。何度押しても結果は変わりません。</small>")
+                ledger_backfill_btn = gr.Button("これまでの投稿済みの切り抜きを送る")
+                ledger_backfill_md = gr.Markdown("")
             with gr.Accordion("送信用URLの作り方（最初の1人だけ・5分ほど）", open=False):
                 gr.Markdown(
                     "1. <a href='https://script.google.com/home/projects/create' target='_blank'>"
@@ -1745,6 +1765,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     ledger_folder_btn.click(ledger_start_folder, inputs=[ledger_folder, ledger_name], outputs=ledger_outputs)
     ledger_refresh_btn.click(ledger_form_values, outputs=ledger_outputs)
     ledger_clear_btn.click(ledger_clear, outputs=ledger_outputs)
+    ledger_backfill_btn.click(ledger_backfill, outputs=[ledger_backfill_md]).then(ledger_status, outputs=[ledger_md])
     demo.load(ai_setup_view, outputs=[ai_status_md])
     for provider, key_status, key_box, key_save, key_test, key_delete in api_key_widgets:
         demo.load(partial(api_key_status, provider), outputs=[key_status])

@@ -294,9 +294,9 @@ def status() -> dict:
     return result
 
 
-def _append(current: Settings, entry: dict) -> bool:
-    """Write the entry (and any waiting ones) to the own file; keep them pending on failure."""
-    line = json.dumps(entry, ensure_ascii=False)
+def _append(current: Settings, entries: list[dict]) -> bool:
+    """Write the entries (and any waiting ones) to the ledger; keep them pending on failure."""
+    lines = [json.dumps(entry, ensure_ascii=False) for entry in entries]
     pending = pending_path()
     try:
         waiting = [item for item in pending.read_text(encoding="utf-8").splitlines() if item.strip()]
@@ -304,20 +304,20 @@ def _append(current: Settings, entry: dict) -> bool:
         waiting = []
     try:
         if current.url:
-            _request(current.url, body={"by": current.name, "entries": [json.loads(item) for item in [*waiting, line]]})
-            if waiting:
-                pending.unlink(missing_ok=True)
-            return True
-        # A missing folder means the synced drive is not mounted; never create it in its place.
-        if not current.folder.is_dir():
-            raise OSError(f"ledger folder not found: {current.folder}")
-        with (current.folder / f"{current.name}.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write("".join(f"{item}\n" for item in [*waiting, line]))
+            items = [json.loads(item) for item in [*waiting, *lines]]
+            for start in range(0, len(items), 400):  # the web app takes up to 500 per request
+                _request(current.url, body={"by": current.name, "entries": items[start:start + 400]})
+        else:
+            # A missing folder means the synced drive is not mounted; never create it in its place.
+            if not current.folder.is_dir():
+                raise OSError(f"ledger folder not found: {current.folder}")
+            with (current.folder / f"{current.name}.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write("".join(f"{item}\n" for item in [*waiting, *lines]))
     except (OSError, ValueError):
         try:
             pending.parent.mkdir(parents=True, exist_ok=True)
             with pending.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(line + "\n")
+                handle.write("".join(f"{item}\n" for item in lines))
         except OSError:
             pass
         return False
@@ -326,21 +326,43 @@ def _append(current: Settings, entry: dict) -> bool:
     return True
 
 
-def record(kind: str, url: str, start_sec: float | None = None, end_sec: float | None = None,
-           title: str = "") -> bool:
-    """Add one entry to the own ledger file. Returns False when off, unshareable or pending."""
-    current = settings()
+def _entry(current: Settings, kind: str, url: str, start_sec=None, end_sec=None, title: str = "") -> dict | None:
     canonical = source_origin.canonical_source_url(url)
-    if current is None or canonical is None or kind not in KINDS:
-        return False
+    if canonical is None or kind not in KINDS:
+        return None
     entry: dict = {"v": 1, "kind": kind, "source": canonical, "by": current.name,
                    "at": datetime.now().astimezone().isoformat(timespec="seconds")}
     if kind != "claim":
-        start, end = round(float(start_sec), 3), round(float(end_sec), 3)
+        try:
+            start, end = round(float(start_sec), 3), round(float(end_sec), 3)
+        except (TypeError, ValueError):
+            return None
         if not (0 <= start < end <= _MAX_DURATION_SEC):
-            return False
+            return None
         entry.update(start_sec=start, end_sec=end, title=str(title or "")[:120])
-    return _append(current, entry)
+    return entry
+
+
+def record(kind: str, url: str, start_sec: float | None = None, end_sec: float | None = None,
+           title: str = "") -> bool:
+    """Add one entry to the own ledger. Returns False when off, unshareable or pending."""
+    current = settings()
+    if current is None:
+        return False
+    entry = _entry(current, kind, url, start_sec, end_sec, title)
+    return entry is not None and _append(current, [entry])
+
+
+def record_many(items: list[tuple]) -> tuple[int, bool]:
+    """Add several (kind, url, start, end, title) entries at once.
+    Returns (entries accepted, delivered now — False means they wait on this PC)."""
+    current = settings()
+    if current is None:
+        return 0, False
+    entries = [entry for entry in (_entry(current, *item) for item in items) if entry is not None]
+    if not entries:
+        return 0, True
+    return len(entries), _append(current, entries)
 
 
 def _others_entries(canonical: str) -> list[dict]:

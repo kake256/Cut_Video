@@ -107,6 +107,25 @@ class SharedLedgerTest(unittest.TestCase):
             self.assertIsNone(used_ranges.overlaps(150.0, 220.0, used))  # 10 of 60 s = 17%
             self.assertIn("（taroさんが作成）", used_ranges.prompt_lines(used))
 
+    def test_past_uploads_are_sent_once_asked(self):
+        with person(self.root, "taro", self.folder):
+            conn = db.get_conn()
+            try:
+                db.init_db(conn)
+                path = self.root / "taro" / "20261101_abcdefghijk.mp4"
+                db.insert_video(conn, "vid_taro", str(path), 3600.0)
+                db.init_db(conn)
+                source_origin.record_download(conn, path, URL)
+                db.insert_video(conn, "vid_local", str(self.root / "taro" / "local.mp4"), 600.0)
+                db.add_used_clip_range(conn, "vid_taro", 10.0, 50.0, "前に投稿した切り抜き")
+                db.add_used_clip_range(conn, "vid_local", 1.0, 5.0, "URLの分からない動画")
+            finally:
+                conn.close()
+            result = used_ranges.send_past_uploads_to_ledger()
+            self.assertEqual((result["sent"], result["no_url"], result["delivered"]), (1, 1, True))
+        with person(self.root, "hanako", self.folder):
+            self.assertEqual([(row["start_sec"], row["by"]) for row in shared_ledger.ranges(URL)], [(10.0, "taro")])
+
 
 class LedgerSettingsFormTest(unittest.TestCase):
     def setUp(self):

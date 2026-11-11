@@ -212,8 +212,13 @@ def _request(url: str, *, params: dict | None = None, body: dict | None = None) 
     try:
         result = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
+        page = raw.decode("utf-8", "ignore")
+        if "doGet" in page or "doPost" in page:
+            # The deployed version has no CUT code (saved after deploying, or still myFunction).
+            raise OSError("デプロイした版にCUTのコードが入っていません。コードを貼って保存し、"
+                          "「デプロイを管理」→ 編集 →「新バージョン」でデプロイし直してください") from exc
         # A login page instead of JSON: deployed without 「アクセスできるユーザー: 全員」.
-        raise OSError("ledger URL did not answer with the ledger (is access set to 全員?)") from exc
+        raise OSError("台帳の答えが返ってきません。デプロイの「アクセスできるユーザー」が「全員」か確認してください") from exc
     if not isinstance(result, dict) or not result.get("ok"):
         raise OSError(f"ledger URL refused: {result.get('error') if isinstance(result, dict) else result}")
     return result
@@ -237,8 +242,7 @@ def save_url(url: str, name: str) -> Settings:
         answer = ping(target)
     except OSError as exc:
         raise LedgerSettingsError(
-            "送信用URLにつながりませんでした。デプロイの「アクセスできるユーザー」が「全員」になっているか、"
-            f"URLが正しいか確認してください（{exc}）。") from exc
+            f"送信用URLにつながりませんでした: {exc}") from exc
     if answer.get("app") != "cut-ledger":
         raise LedgerSettingsError("このURLはCUTの共有台帳ではないようです。")
     target_path = settings_path()

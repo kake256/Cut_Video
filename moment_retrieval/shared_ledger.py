@@ -11,7 +11,13 @@ Entry kinds:
 - ``made``: exported a clip of a source range (not uploaded yet)
 - ``uploaded``: uploaded a clip of a source range
 
-The ledger is off unless a folder and a name are set in ``data/shared_ledger.json``
+Instead of a synced folder, the ledger can live behind a "send-to URL": a small Google Apps
+Script web app (``gas_ledger.js``) that one person deploys; everybody pastes its ``/exec`` URL,
+CUT POSTs its entries there and reads the others' entries for one video with a GET.  The
+entries then collect in a spreadsheet in the deployer's Drive.  Nobody else needs a Google
+sign-in or Google Drive for desktop; the URL itself is the shared secret.
+
+The ledger is off unless a folder (or URL) and a name are set in ``data/shared_ledger.json``
 (``{"folder": "G:\\\\マイドライブ\\\\CUT台帳", "name": "taro"}``) or in the environment
 variables ``CUT_SHARED_LEDGER_DIR`` / ``CUT_SHARED_LEDGER_NAME``.  When the folder cannot
 be reached, entries wait in ``data/shared_ledger_pending.jsonl`` and are written with the
@@ -23,6 +29,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,12 +41,22 @@ from . import config, source_origin
 KINDS = ("claim", "made", "uploaded")
 _UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\s]+')
 _MAX_DURATION_SEC = 48 * 3600
+_URL_PATTERN = re.compile(r"^https://script\.google\.com/(?:a/[^/\s]+/)?macros/s/[A-Za-z0-9_-]{20,}/exec$")
+_TIMEOUT_SEC = 15
+_urlopen = urllib.request.urlopen  # replaced in tests
 
 
 @dataclass(frozen=True)
 class Settings:
-    folder: Path
+    folder: Path | None
     name: str
+    url: str = ""
+
+
+def clean_url(url: object) -> str:
+    """The /exec URL of the ledger web app, without query or trailing spaces; "" when not one."""
+    text = str(url or "").strip().strip('"').split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return text if _URL_PATTERN.match(text) else ""
 
 
 def settings_path() -> Path:
@@ -53,18 +72,25 @@ def safe_name(name: object) -> str:
 
 
 def settings() -> Settings | None:
+    url = os.environ.get("CUT_SHARED_LEDGER_URL", "")
     folder = os.environ.get("CUT_SHARED_LEDGER_DIR", "")
     name = os.environ.get("CUT_SHARED_LEDGER_NAME", "")
-    if not (folder and name):
+    if not ((url or folder) and name):
         try:
             data = json.loads(settings_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
         if isinstance(data, dict):
-            folder = folder or str(data.get("folder") or "")
+            if not (url or folder):
+                url = str(data.get("url") or "")
+                folder = str(data.get("folder") or "")
             name = name or str(data.get("name") or "")
     name = safe_name(name)
-    if not (folder.strip() and name):
+    if not name:
+        return None
+    if clean_url(url):
+        return Settings(None, name, clean_url(url))
+    if not folder.strip():
         return None
     return Settings(Path(folder.strip()), name)
 
@@ -172,6 +198,56 @@ def save_settings(folder: str, name: str, *, create: bool = True) -> Settings:
     return Settings(path, clean)
 
 
+def _request(url: str, *, params: dict | None = None, body: dict | None = None) -> dict:
+    """GET (params) or POST (body) to the ledger web app; raises OSError on any failure."""
+    target = url + ("?" + urllib.parse.urlencode(params) if params else "")
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(target, data=data, headers={"Content-Type": "text/plain; charset=utf-8"})
+    try:
+        # Apps Script answers a POST with a redirect to the result, which urllib follows as a GET.
+        with _urlopen(request, timeout=_TIMEOUT_SEC) as response:
+            raw = response.read()
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise OSError(f"ledger URL not reachable: {exc}") from exc
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        # A login page instead of JSON: deployed without 「アクセスできるユーザー: 全員」.
+        raise OSError("ledger URL did not answer with the ledger (is access set to 全員?)") from exc
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise OSError(f"ledger URL refused: {result.get('error') if isinstance(result, dict) else result}")
+    return result
+
+
+def ping(url: str) -> dict:
+    return _request(url)
+
+
+def save_url(url: str, name: str) -> Settings:
+    """Save a send-to URL after checking that it answers like the ledger web app."""
+    clean = safe_name(name)
+    target = clean_url(url)
+    if not clean:
+        raise LedgerSettingsError("名前を入力してください（人ごとに別の名前にします）。")
+    if not target:
+        raise LedgerSettingsError(
+            "送信用URLは https://script.google.com/macros/s/…/exec の形です"
+            "（Apps Scriptの「ウェブアプリのURL」を貼ってください）。")
+    try:
+        answer = ping(target)
+    except OSError as exc:
+        raise LedgerSettingsError(
+            "送信用URLにつながりませんでした。デプロイの「アクセスできるユーザー」が「全員」になっているか、"
+            f"URLが正しいか確認してください（{exc}）。") from exc
+    if answer.get("app") != "cut-ledger":
+        raise LedgerSettingsError("このURLはCUTの共有台帳ではないようです。")
+    target_path = settings_path()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(json.dumps({"url": target, "name": clean}, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+    return Settings(None, clean, target)
+
+
 def clear_settings() -> bool:
     try:
         settings_path().unlink()
@@ -187,12 +263,23 @@ def status() -> dict:
         waiting = sum(1 for line in pending_path().read_text(encoding="utf-8").splitlines() if line.strip())
     except OSError:
         waiting = 0
-    result = {"enabled": current is not None, "folder": "", "name": "", "reachable": False,
+    result = {"enabled": current is not None, "folder": "", "url": "", "name": "", "reachable": False,
               "others": [], "waiting": waiting,
-              "from_env": bool(os.environ.get("CUT_SHARED_LEDGER_DIR") or os.environ.get("CUT_SHARED_LEDGER_NAME"))}
+              "from_env": any(os.environ.get(key) for key in (
+                  "CUT_SHARED_LEDGER_URL", "CUT_SHARED_LEDGER_DIR", "CUT_SHARED_LEDGER_NAME"))}
     if current is None:
         return result
-    result.update(folder=str(current.folder), name=current.name)
+    result["name"] = current.name
+    if current.url:
+        result["url"] = current.url
+        try:
+            people = ping(current.url).get("people") or []
+            result["reachable"] = True
+            result["others"] = sorted({safe_name(item) for item in people} - {current.name, ""})
+        except OSError:
+            pass
+        return result
+    result["folder"] = str(current.folder)
     try:
         if current.folder.is_dir():
             result["reachable"] = True
@@ -212,12 +299,17 @@ def _append(current: Settings, entry: dict) -> bool:
     except OSError:
         waiting = []
     try:
+        if current.url:
+            _request(current.url, body={"by": current.name, "entries": [json.loads(item) for item in [*waiting, line]]})
+            if waiting:
+                pending.unlink(missing_ok=True)
+            return True
         # A missing folder means the synced drive is not mounted; never create it in its place.
         if not current.folder.is_dir():
             raise OSError(f"ledger folder not found: {current.folder}")
         with (current.folder / f"{current.name}.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
             handle.write("".join(f"{item}\n" for item in [*waiting, line]))
-    except OSError:
+    except (OSError, ValueError):
         try:
             pending.parent.mkdir(parents=True, exist_ok=True)
             with pending.open("a", encoding="utf-8", newline="\n") as handle:
@@ -251,6 +343,22 @@ def _others_entries(canonical: str) -> list[dict]:
     current = settings()
     if current is None:
         return []
+    if current.url:
+        try:
+            entries = _request(current.url, params={"action": "entries", "source": canonical}).get("entries") or []
+        except OSError:
+            return []
+        found = []
+        for item in entries:
+            if not isinstance(item, dict) or item.get("kind") not in KINDS:
+                continue
+            person = safe_name(item.get("by"))
+            if not person or person == current.name:
+                continue
+            if source_origin.canonical_source_url(item.get("source")) != canonical:
+                continue
+            found.append({**item, "by": person})
+        return found
     try:
         files = sorted(current.folder.glob("*.jsonl"))
     except OSError:

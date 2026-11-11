@@ -525,7 +525,14 @@ def ai_prepare(agent: str) -> str:
     return ai_setup.prepare(agent) + "\n\n" + ai_setup_view()
 
 
-DRIVE_DOWNLOAD_URL = "https://www.google.com/drive/download/"
+LEDGER_GAS_FILE = Path(__file__).resolve().parent / "moment_retrieval" / "gas_ledger.js"
+
+
+def ledger_gas_source() -> str:
+    try:
+        return LEDGER_GAS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return "// moment_retrieval/gas_ledger.js が見つかりません"
 
 
 def ledger_status() -> str:
@@ -534,43 +541,24 @@ def ledger_status() -> str:
     state = shared_ledger.status()
     if not state["enabled"]:
         return ("### ⚪ 共有台帳はオフです\n"
-                "名前と保存先フォルダを確かめて「この設定で始める」を押すと、ほかの人が着手した動画や、"
-                "作った・投稿した場面を、自分の候補から外すようになります。")
-    folder = html.escape(state["folder"])
+                "自分の名前と、一緒に使う人と共通の「送信用URL」を入れて「この設定で始める」を押すと、"
+                "ほかの人が着手した動画や、作った・投稿した場面を、自分の候補から外すようになります。")
     name = html.escape(state["name"])
     source = "（環境変数で設定）" if state["from_env"] else ""
+    where = "送信用URL" if state["url"] else f"フォルダ `{html.escape(state['folder'])}`"
     if not state["reachable"]:
-        text = (f"### ⚠️ 保存先フォルダに届きません{source}\n"
-                f"保存先: `{folder}`　自分の名前: **{name}**\n\n"
-                "Googleドライブなどの同期アプリが起動しているか確認してください。"
-                "届かない間の記録はこのPCにためておき、届いたときにまとめて書きます。")
+        hint = ("インターネットにつながっているか、送信用URLのデプロイが残っているか確認してください。"
+                if state["url"] else "Googleドライブなどの同期アプリが起動しているか確認してください。")
+        text = (f"### ⚠️ 共有台帳に届きません{source}\n"
+                f"{where}　自分の名前: **{name}**\n\n{hint}"
+                "届かない間の記録はこのPCにためておき、届いたときにまとめて送ります。")
     else:
-        others = "、".join(f"**{html.escape(item)}**" for item in state["others"]) or "まだいません（相手が参加すると表示されます）"
+        others = "、".join(f"**{html.escape(item)}**" for item in state["others"]) or "まだいません（相手が記録すると表示されます）"
         text = (f"### ✅ 共有台帳を使っています{source}\n"
-                f"保存先: `{folder}`　自分の名前: **{name}**\n\n"
-                f"一緒に使っている人: {others}")
+                f"{where}　自分の名前: **{name}**\n\n一緒に使っている人: {others}")
     if state["waiting"]:
-        text += f"\n\nまだ保存先に書けていない記録が {state['waiting']} 件あります。"
+        text += f"\n\nまだ送れていない記録が {state['waiting']} 件あります。"
     return text
-
-
-def ledger_preview(folder: str) -> str:
-    """What pressing the start button will do, in one line."""
-    target = str(folder or "").strip().strip('"')
-    if not target:
-        return "保存先フォルダを選んでください。"
-    path = Path(target)
-    try:
-        if path.is_dir():
-            people = sorted({p.stem for p in path.glob("*.jsonl")})
-            joined = "、".join(html.escape(item) for item in people)
-            extra = f"（使っている人: {joined}）" if people else ""
-            return f"このフォルダはすでにあります。ここに参加します{extra}。"
-        if path.parent.is_dir():
-            return "このフォルダは、始めるときに新しく作ります。"
-    except OSError:
-        pass
-    return "⚠️ この場所が見つかりません。Googleドライブが起動しているか確認してください。"
 
 
 def ledger_share_guide() -> str:
@@ -579,34 +567,46 @@ def ledger_share_guide() -> str:
     state = shared_ledger.status()
     if not (state["enabled"] and state["reachable"]):
         return ""
+    if state["url"]:
+        return ("#### 相手を招待する\n"
+                "相手のCUTの「分担（共有台帳）」タブに、この送信用URLを貼ってもらいます"
+                "（名前は相手のものにします）。URLを知っている人は誰でも書き込めるので、"
+                "一緒に使う人にだけ直接渡してください。\n\n"
+                f"`{html.escape(state['url'])}`")
     folder = html.escape(Path(state["folder"]).name)
     return (
         "#### 相手を招待する\n"
-        f"1. <a href='https://drive.google.com/' target='_blank'>Googleドライブ</a>で「{folder}」フォルダを右クリックし、"
-        "「共有」から相手のGoogleアカウントを**編集者**で追加します。\n"
-        f"2. 相手は共有された「{folder}」を右クリックして「整理」→「ショートカットを追加」でマイドライブに入れます。\n"
-        "3. 相手のCUTでこのタブを開き、保存先にそのフォルダを選んで「この設定で始める」を押します。"
+        f"1. 「{folder}」フォルダを相手と共有します（Googleドライブなら右クリック→「共有」→**編集者**）。\n"
+        f"2. 相手は共有された「{folder}」を自分のPCに同期させます（Googleドライブなら「ショートカットを追加」）。\n"
+        "3. 相手のCUTでこのタブを開き、同じフォルダを選んで始めます。"
     )
 
 
-def ledger_drive_notice() -> str:
-    from moment_retrieval import shared_ledger
-
-    if shared_ledger.drive_locations():
+def ledger_preview(folder: str) -> str:
+    """For the folder option: what pressing its start button will do."""
+    target = str(folder or "").strip().strip('"')
+    if not target:
         return ""
-    return ("⚠️ このPCでパソコン版Googleドライブが見つかりません。"
-            f"<a href='{DRIVE_DOWNLOAD_URL}' target='_blank'>パソコン版Googleドライブ</a>を入れてログインしてから"
-            "「状態を更新」を押してください（OneDriveなどほかの同期フォルダを選んでも使えます）。")
+    path = Path(target)
+    try:
+        if path.is_dir():
+            return "このフォルダはすでにあります。ここに参加します。"
+        if path.parent.is_dir():
+            return "このフォルダは、始めるときに新しく作ります。"
+    except OSError:
+        pass
+    return "⚠️ この場所が見つかりません。同期アプリが起動しているか確認してください。"
 
 
 def ledger_form_values():
-    """(保存先, Googleドライブの案内, 名前, 状態, 保存先の確認, 招待の手順)"""
+    """(送信用URL, フォルダ, 名前, 状態, フォルダの確認, 招待の手順)"""
     from moment_retrieval import shared_ledger
 
     saved = shared_ledger.saved_settings()
+    url = str(saved.get("url") or "")
     folder = str(saved.get("folder") or "") or shared_ledger.suggested_folder()
     name = str(saved.get("name") or "") or shared_ledger.default_name()
-    return (folder, ledger_drive_notice(), name, ledger_status(), ledger_preview(folder), ledger_share_guide())
+    return (url, folder, name, ledger_status(), ledger_preview(folder), ledger_share_guide())
 
 
 def ledger_pick_folder(current: str) -> str:
@@ -618,15 +618,26 @@ def ledger_pick_folder(current: str) -> str:
         root = tkinter.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        chosen = filedialog.askdirectory(title="共有台帳の保存先フォルダを選ぶ（Googleドライブの中）",
-                                         initialdir=current or None, mustexist=False)
+        chosen = filedialog.askdirectory(title="共有台帳に使う同期フォルダを選ぶ", initialdir=current or None,
+                                         mustexist=False)
         root.destroy()
     except Exception:
         raise gr.Error("フォルダ選択の画面を開けませんでした。場所を直接入力してください。")
     return str(Path(chosen)) if chosen else current
 
 
-def ledger_start(folder: str, name: str):
+def ledger_start_url(url: str, name: str):
+    from moment_retrieval import shared_ledger
+
+    try:
+        shared_ledger.save_url(url, name)
+    except shared_ledger.LedgerSettingsError as exc:
+        raise gr.Error(str(exc)) from exc
+    gr.Info("共有台帳を始めました。次のジョブから使います。")
+    return ledger_form_values()
+
+
+def ledger_start_folder(folder: str, name: str):
     from moment_retrieval import shared_ledger
 
     try:
@@ -1597,23 +1608,39 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             ledger_md = gr.Markdown("")
             gr.Markdown(
                 "<small>同じ配信を何人かで切り抜くときに、ほかの人が着手した動画、作った・投稿した場面を"
-                "自分の候補から外します。全員でGoogleドライブのフォルダを1つ共有して、各自がそこに記録します"
+                "自分の候補から外します。全員が同じ「送信用URL」に記録を送り、ほかの人の記録もそこから受け取ります"
                 "（YouTube／TwitchのURLから取り込んだ動画が対象）。</small>"
             )
             ledger_name = gr.Textbox(label="自分の名前", placeholder="taro",
                                      info="一緒に使う人と重ならない名前にします（英数字がおすすめ）")
-            ledger_drive_notice_md = gr.Markdown("")
-            with gr.Row(equal_height=True):
-                ledger_folder = gr.Textbox(label="保存先フォルダ（Googleドライブの中）",
-                                           placeholder=r"G:\マイドライブ\CUT台帳", scale=4,
-                                           info="相手から共有されたフォルダを使うときは、そのフォルダを選びます")
-                ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=120)
-            ledger_preview_md = gr.Markdown("")
+            ledger_url = gr.Textbox(label="送信用URL", placeholder="https://script.google.com/macros/s/…/exec",
+                                    info="一緒に使う人から受け取ったURLを貼ります。自分が最初の1人なら、下の「送信用URLの作り方」で作ります")
             with gr.Row():
                 ledger_start_btn = gr.Button("この設定で始める", variant="primary", scale=3)
                 ledger_refresh_btn = gr.Button("状態を更新", scale=1, min_width=100)
                 ledger_clear_btn = gr.Button("オフにする", scale=1, min_width=100)
             ledger_share_md = gr.Markdown("")
+            with gr.Accordion("送信用URLの作り方（最初の1人だけ・5分ほど）", open=False):
+                gr.Markdown(
+                    "1. <a href='https://script.google.com/home/projects/create' target='_blank'>"
+                    "Google Apps Script の新しいプロジェクト</a>を開きます（自分のGoogleアカウントで）。\n"
+                    "2. 最初から入っている文字をすべて消し、下のコードを右上のボタンでコピーして貼り付け、保存します。\n"
+                    "3. 右上の「デプロイ」→「新しいデプロイ」→ 歯車から「ウェブアプリ」を選び、"
+                    "「次のユーザーとして実行: **自分**」「アクセスできるユーザー: **全員**」にして「デプロイ」を押します。"
+                    "初回は許可を求められるので、自分のアカウントで許可します"
+                    "（「このアプリは確認されていません」と出たら「詳細」→「移動」）。\n"
+                    "4. 表示された「ウェブアプリのURL」（…/exec で終わるもの）をコピーして、上の「送信用URL」に貼ります。\n\n"
+                    "記録は自分のGoogleドライブのスプレッドシート「CUT 共有台帳」にたまります。"
+                    "URLを知っている人は誰でも書き込めるので、一緒に使う人にだけ渡してください。"
+                )
+                gr.Textbox(value=ledger_gas_source(), label="Apps Script に貼るコード（右上のボタンでコピー）",
+                           interactive=False, lines=12, max_lines=12, buttons=["copy"])
+            with gr.Accordion("URLの代わりに同期フォルダを使う（パソコン版Googleドライブ・OneDriveなど）", open=False):
+                with gr.Row(equal_height=True):
+                    ledger_folder = gr.Textbox(label="同期フォルダ", placeholder=r"G:\マイドライブ\CUT台帳", scale=4)
+                    ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=120)
+                ledger_preview_md = gr.Markdown("")
+                ledger_folder_btn = gr.Button("このフォルダで始める")
         with gr.Tab("設定"):
             gr.Markdown("### 見どころを選ぶAI")
             ai_status_md = gr.Markdown("")
@@ -1706,14 +1733,14 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                          concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
     gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
     bundle_btn.click(bundle_client, outputs=[bundle_md])
-    ledger_outputs = [ledger_folder, ledger_drive_notice_md, ledger_name, ledger_md, ledger_preview_md,
-                      ledger_share_md]
+    ledger_outputs = [ledger_url, ledger_folder, ledger_name, ledger_md, ledger_preview_md, ledger_share_md]
     demo.load(ledger_form_values, outputs=ledger_outputs)
     ledger_folder.input(ledger_preview, inputs=[ledger_folder], outputs=[ledger_preview_md], show_progress="hidden")
     ledger_pick_btn.click(ledger_pick_folder, inputs=[ledger_folder], outputs=[ledger_folder],
                           concurrency_id="ledger-dialog").then(
         ledger_preview, inputs=[ledger_folder], outputs=[ledger_preview_md])
-    ledger_start_btn.click(ledger_start, inputs=[ledger_folder, ledger_name], outputs=ledger_outputs)
+    ledger_start_btn.click(ledger_start_url, inputs=[ledger_url, ledger_name], outputs=ledger_outputs)
+    ledger_folder_btn.click(ledger_start_folder, inputs=[ledger_folder, ledger_name], outputs=ledger_outputs)
     ledger_refresh_btn.click(ledger_form_values, outputs=ledger_outputs)
     ledger_clear_btn.click(ledger_clear, outputs=ledger_outputs)
     demo.load(ai_setup_view, outputs=[ai_status_md])

@@ -158,5 +158,95 @@ class LedgerSettingsFormTest(unittest.TestCase):
             self.assertEqual(shared_ledger.suggested_folder(), "")
 
 
+class _FakeLedgerWebApp:
+    """Stands in for the Apps Script web app: keeps rows, answers like gas_ledger.js."""
+
+    def __init__(self):
+        self.rows = []
+        self.down = False
+
+    def __call__(self, request, timeout=None):
+        import io
+        from urllib.parse import parse_qs, urlparse
+
+        if self.down:
+            raise OSError("offline")
+        query = parse_qs(urlparse(request.full_url).query)
+        if request.data is not None:
+            body = json.loads(request.data.decode("utf-8"))
+            for item in body["entries"]:
+                self.rows.append({**item, "by": body["by"]})
+            answer = {"ok": True, "added": len(body["entries"])}
+        elif query.get("action") == ["entries"]:
+            answer = {"ok": True, "entries": [row for row in self.rows if row["source"] == query["source"][0]]}
+        else:
+            answer = {"ok": True, "app": "cut-ledger", "people": sorted({row["by"] for row in self.rows})}
+
+        class _Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return _Response(json.dumps(answer).encode("utf-8"))
+
+
+class SendToUrlLedgerTest(unittest.TestCase):
+    URL = "https://script.google.com/macros/s/AKfycbTESTtestTESTtestTEST123/exec"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.app = _FakeLedgerWebApp()
+        env = {key: value for key, value in os.environ.items() if not key.startswith("CUT_SHARED_LEDGER_")}
+        self._patches = [patch.dict(os.environ, env, clear=True), patch.object(shared_ledger, "_urlopen", self.app)]
+        for item in self._patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self._patches):
+            item.stop()
+        self._tmp.cleanup()
+
+    def as_person(self, name):
+        return patch.object(config, "CACHE_ROOT", self.root / name)
+
+    def test_two_people_see_each_other_through_the_url(self):
+        with self.as_person("taro"):
+            shared_ledger.save_url(self.URL + "?usp=sharing", "taro")
+            self.assertEqual(shared_ledger.settings().url, self.URL)
+            self.assertTrue(shared_ledger.record("made", URL, 10, 40, "見どころ"))
+        with self.as_person("hanako"):
+            shared_ledger.save_url(self.URL, "hanako")
+            self.assertEqual(shared_ledger.claimed_by(URL), ["taro"])
+            self.assertEqual([(row["start_sec"], row["end_sec"], row["by"]) for row in shared_ledger.ranges(URL)],
+                             [(10.0, 40.0, "taro")])
+            state = shared_ledger.status()
+            self.assertTrue(state["reachable"])
+            self.assertEqual(state["others"], ["taro"])
+
+    def test_entries_wait_while_the_url_is_unreachable(self):
+        with self.as_person("taro"):
+            shared_ledger.save_url(self.URL, "taro")
+            self.app.down = True
+            self.assertFalse(shared_ledger.record("claim", URL))
+            self.assertEqual(shared_ledger.status()["waiting"], 1)
+            self.app.down = False
+            self.assertTrue(shared_ledger.record("made", URL, 1, 5))
+            self.assertEqual([row["kind"] for row in self.app.rows], ["claim", "made"])
+            self.assertEqual(shared_ledger.status()["waiting"], 0)
+
+    def test_save_url_rejects_other_urls_and_unreachable_ones(self):
+        with self.as_person("taro"):
+            for bad in ("https://drive.google.com/drive/folders/abc", ""):
+                with self.assertRaises(shared_ledger.LedgerSettingsError):
+                    shared_ledger.save_url(bad, "taro")
+            self.app.down = True
+            with self.assertRaises(shared_ledger.LedgerSettingsError):
+                shared_ledger.save_url(self.URL, "taro")
+            self.assertIsNone(shared_ledger.settings())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -113,13 +113,15 @@ def bundle_client() -> str:
         return f"**配布用:** {exc}"
     project = gcloud_setup.saved_project()
     audience = (
-        f"[テストユーザーの管理ページ](https://console.cloud.google.com/auth/audience?project={project})"
+        f"[「対象」ページ](https://console.cloud.google.com/auth/audience?project={project})"
         if project else "Google Cloud Consoleの「対象」ページ"
     )
     return (
         f"**配布用:** クライアントを `{html.escape(target.name)}` としてアプリフォルダに同梱しました。"
-        "このフォルダごと渡せば、相手は「YouTubeアカウントを連携」だけで使えます。"
-        f"審査前は、使う人のGoogleアカウントを{audience}でテストユーザー（最大100人）に追加してください。"
+        "このファイルだけを相手に渡し、CUTのフォルダ直下（start.batと同じ場所）に置いてもらえば、"
+        "相手は「YouTubeアカウントを連携」だけで使えます。"
+        f"{audience}で「アプリを公開」して本番環境にしておくと、テストユーザーの登録が不要になり、"
+        "ログインが7日で切れることもなくなります（審査前は最大100人）。"
         "このファイルは公開リポジトリ（GitHub）には載せないでください（.gitignore済み）。"
     )
 
@@ -204,7 +206,10 @@ def auto_connect_account() -> str:
     except Exception as exc:
         return (
             f"**YouTube:** 連携に失敗しました（{type(exc).__name__}: {html.escape(str(exc))[:200]}）。"
-            "OAuth同意画面のテストユーザーに、使うGoogleアカウントを追加したか確認してください。"
+            "「このアプリは確認されていません」と出た場合は「詳細」→「（安全ではないページ）に移動」で進めます。"
+            "「アクセスをブロック」と出た場合は、クライアントがテスト中のままです。配布した人に、"
+            "Google Cloud Consoleの「対象」ページで「アプリを公開」するか、このGoogleアカウントを"
+            "テストユーザーに追加してもらってください。"
         )
     return auto_account_status()
 

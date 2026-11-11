@@ -525,6 +525,72 @@ def ai_prepare(agent: str) -> str:
     return ai_setup.prepare(agent) + "\n\n" + ai_setup_view()
 
 
+def ledger_status() -> str:
+    from moment_retrieval import shared_ledger
+
+    state = shared_ledger.status()
+    if not state["enabled"]:
+        return ("**共有台帳:** オフです。同期フォルダと自分の名前を入れて「保存」を押すと、"
+                "別の人が切り抜いた動画・場面を避けるようになります。")
+    folder = html.escape(state["folder"])
+    name = html.escape(state["name"])
+    source = "（環境変数で設定）" if state["from_env"] else ""
+    if not state["reachable"]:
+        line = (f"**共有台帳:** ⚠️ フォルダに届きません — `{folder}`（名前: {name}）{source}。"
+                "Googleドライブが起動・同期しているか確認してください。記録はこのPCにためておき、届いたときに書きます。")
+    else:
+        others = "、".join(html.escape(item) for item in state["others"]) or "まだいません"
+        line = (f"**共有台帳:** ✅ 使えます — `{folder}`（自分の名前: {name}）{source}。"
+                f"フォルダにいる他の人: {others}")
+    if state["waiting"]:
+        line += f"\n\nまだフォルダに書けていない記録が {state['waiting']} 件あります。"
+    return line
+
+
+def ledger_form_values():
+    from moment_retrieval import shared_ledger
+
+    saved = shared_ledger.saved_settings()
+    folder = str(saved.get("folder") or "") or shared_ledger.suggested_folder()
+    name = str(saved.get("name") or "") or shared_ledger.default_name()
+    return folder, name, ledger_status()
+
+
+def ledger_pick_folder(current: str) -> str:
+    """Open a folder dialog on this PC (the app runs locally); keep the text when cancelled."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        chosen = filedialog.askdirectory(title="共有台帳に使う同期フォルダを選ぶ",
+                                         initialdir=current or None, mustexist=False)
+        root.destroy()
+    except Exception:
+        raise gr.Error("フォルダ選択の画面を開けませんでした。場所を直接入力してください。")
+    return str(Path(chosen)) if chosen else current
+
+
+def ledger_save(folder: str, name: str):
+    from moment_retrieval import shared_ledger
+
+    try:
+        saved = shared_ledger.save_settings(folder, name)
+    except shared_ledger.LedgerSettingsError as exc:
+        raise gr.Error(str(exc)) from exc
+    gr.Info("共有台帳の設定を保存しました。次のジョブから使います。")
+    return str(saved.folder), saved.name, ledger_status()
+
+
+def ledger_clear():
+    from moment_retrieval import shared_ledger
+
+    shared_ledger.clear_settings()
+    return ledger_form_values()
+
+
 def api_key_status(provider: str) -> str:
     return f"**{api_keys.PROVIDERS[provider]['label']}:** {html.escape(api_keys.describe(provider))}"
 
@@ -1542,6 +1608,22 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 )
                 bundle_btn = gr.Button("このクライアントをアプリに同梱する")
                 bundle_md = gr.Markdown("")
+            gr.Markdown("### 別の人と分担して切り抜く（共有台帳）")
+            ledger_md = gr.Markdown("")
+            gr.Markdown(
+                "<small>Googleドライブなど、全員のPCに同期されるフォルダを1つ共有し、各自がその場所と"
+                "自分の名前（人ごとに別の名前）を入れます。他の人が着手した動画、作った・投稿した場面は"
+                "候補から外れます。照合はYouTube／TwitchのURLで行うため、URLから取り込んだ動画だけが対象です。"
+                "設定は <code>data/shared_ledger.json</code> に保存されます。</small>"
+            )
+            with gr.Row():
+                ledger_folder = gr.Textbox(label="同期フォルダ", placeholder="G:\\マイドライブ\\CUT台帳", scale=4)
+                ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=110)
+            with gr.Row():
+                ledger_name = gr.Textbox(label="自分の名前（英数字がおすすめ）", placeholder="taro", scale=4)
+                ledger_save_btn = gr.Button("保存", variant="primary", scale=1, min_width=80)
+                ledger_refresh_btn = gr.Button("状態を更新", scale=1, min_width=80)
+                ledger_clear_btn = gr.Button("オフにする", scale=1, min_width=80)
 
     auto_job_outputs = [auto_jobs_md, auto_uploads_sig, auto_cancel_select, auto_history_md]
     demo.load(summary_status, outputs=[status_md])
@@ -1566,6 +1648,13 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                          concurrency_id="gcp-setup").then(gcp_status, outputs=[gcp_status_md])
     gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
     bundle_btn.click(bundle_client, outputs=[bundle_md])
+    demo.load(ledger_form_values, outputs=[ledger_folder, ledger_name, ledger_md])
+    ledger_pick_btn.click(ledger_pick_folder, inputs=[ledger_folder], outputs=[ledger_folder],
+                          concurrency_id="ledger-dialog")
+    ledger_save_btn.click(ledger_save, inputs=[ledger_folder, ledger_name],
+                          outputs=[ledger_folder, ledger_name, ledger_md])
+    ledger_refresh_btn.click(ledger_status, outputs=[ledger_md])
+    ledger_clear_btn.click(ledger_clear, outputs=[ledger_folder, ledger_name, ledger_md])
     demo.load(ai_setup_view, outputs=[ai_status_md])
     for provider, key_status, key_box, key_save, key_test, key_delete in api_key_widgets:
         demo.load(partial(api_key_status, provider), outputs=[key_status])

@@ -73,6 +73,100 @@ def enabled() -> bool:
     return settings() is not None
 
 
+class LedgerSettingsError(ValueError):
+    pass
+
+
+def saved_settings() -> dict:
+    """What the settings file holds (for filling the form), even when incomplete."""
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def default_name() -> str:
+    """The Windows user name, as a starting point for the name each person uses."""
+    return safe_name(os.environ.get("USERNAME") or os.environ.get("USER") or "")
+
+
+def google_drive_roots() -> list[Path]:
+    """「マイドライブ」/ My Drive folders of Google Drive for desktop on any drive letter."""
+    found = []
+    for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
+        for label in ("マイドライブ", "My Drive"):
+            path = Path(f"{letter}:\\") / label
+            try:
+                if path.is_dir():
+                    found.append(path)
+            except OSError:
+                continue
+    return found
+
+
+def suggested_folder() -> str:
+    roots = google_drive_roots()
+    return str(roots[0] / "CUT台帳") if roots else ""
+
+
+def save_settings(folder: str, name: str, *, create: bool = True) -> Settings:
+    """Save the folder and name. The folder itself is made only when its parent exists
+    (so a drive that is not mounted is never replaced by a local folder)."""
+    folder_text = str(folder or "").strip().strip('"')
+    clean = safe_name(name)
+    if not folder_text:
+        raise LedgerSettingsError("同期フォルダを入力してください。")
+    if not clean:
+        raise LedgerSettingsError("名前を入力してください（人ごとに別の名前にします）。")
+    path = Path(folder_text)
+    if not path.is_absolute():
+        raise LedgerSettingsError("同期フォルダは G:\\マイドライブ\\CUT台帳 のような完全な場所で入力してください。")
+    if not path.is_dir():
+        if not (create and path.parent.is_dir()):
+            raise LedgerSettingsError(f"フォルダが見つかりません: {path}（ドライブが同期されているか確認してください）")
+        try:
+            path.mkdir()
+        except OSError as exc:
+            raise LedgerSettingsError(f"フォルダを作れませんでした: {exc}") from exc
+    target = settings_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"folder": str(path), "name": clean}, ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+    return Settings(path, clean)
+
+
+def clear_settings() -> bool:
+    try:
+        settings_path().unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def status() -> dict:
+    """State shown in the settings tab: on/off, folder reachable, others seen, waiting entries."""
+    current = settings()
+    try:
+        waiting = sum(1 for line in pending_path().read_text(encoding="utf-8").splitlines() if line.strip())
+    except OSError:
+        waiting = 0
+    result = {"enabled": current is not None, "folder": "", "name": "", "reachable": False,
+              "others": [], "waiting": waiting,
+              "from_env": bool(os.environ.get("CUT_SHARED_LEDGER_DIR") or os.environ.get("CUT_SHARED_LEDGER_NAME"))}
+    if current is None:
+        return result
+    result.update(folder=str(current.folder), name=current.name)
+    try:
+        if current.folder.is_dir():
+            result["reachable"] = True
+            result["others"] = sorted({safe_name(p.stem) for p in current.folder.glob("*.jsonl")}
+                                      - {current.name, ""})
+    except OSError:
+        pass
+    return result
+
+
 def _append(current: Settings, entry: dict) -> bool:
     """Write the entry (and any waiting ones) to the own file; keep them pending on failure."""
     line = json.dumps(entry, ensure_ascii=False)

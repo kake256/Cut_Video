@@ -108,5 +108,45 @@ class SharedLedgerTest(unittest.TestCase):
             self.assertIn("（taroさんが作成）", used_ranges.prompt_lines(used))
 
 
+class LedgerSettingsFormTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("CUT_SHARED_LEDGER_")}
+        self._patches = [patch.dict(os.environ, env, clear=True),
+                         patch.object(config, "CACHE_ROOT", self.root / "data")]
+        for item in self._patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self._patches):
+            item.stop()
+        self._tmp.cleanup()
+
+    def test_save_creates_the_folder_only_under_an_existing_parent(self):
+        drive = self.root / "drive"
+        drive.mkdir()
+        saved = shared_ledger.save_settings(str(drive / "CUT台帳"), "taro san")
+        self.assertTrue((drive / "CUT台帳").is_dir())
+        self.assertEqual(saved.name, "taro_san")
+        self.assertEqual(shared_ledger.settings(), saved)
+        with self.assertRaises(shared_ledger.LedgerSettingsError):
+            shared_ledger.save_settings(str(self.root / "missing" / "CUT台帳"), "taro")
+        with self.assertRaises(shared_ledger.LedgerSettingsError):
+            shared_ledger.save_settings(str(drive), "  ")
+
+    def test_status_lists_other_people_and_waiting_entries(self):
+        folder = self.root / "shared"
+        folder.mkdir()
+        (folder / "hanako.jsonl").write_text("", encoding="utf-8")
+        self.assertFalse(shared_ledger.status()["enabled"])
+        shared_ledger.save_settings(str(folder), "taro")
+        state = shared_ledger.status()
+        self.assertTrue(state["enabled"] and state["reachable"])
+        self.assertEqual(state["others"], ["hanako"])
+        self.assertTrue(shared_ledger.clear_settings())
+        self.assertFalse(shared_ledger.enabled())
+
+
 if __name__ == "__main__":
     unittest.main()

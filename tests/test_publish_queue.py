@@ -105,6 +105,14 @@ class PublishQueueTest(unittest.TestCase):
         recent = publish_queue.summary(now=NOW + HOUR)["recent"]
         self.assertEqual({entry["state"] for entry in recent}, {"done", "failed"})
 
+    def test_latest_by_path_prefers_waiting_over_an_earlier_failure(self):
+        publish_queue.enqueue(self._paths("a"), interval_hours=1, now=NOW, clips=self.clips)
+        publish_queue.run_due(now=NOW, change_privacy=_FakePrivacy(fail={"a"}))
+        key = publish_queue._key(self._paths("a")[0])
+        self.assertEqual(publish_queue.latest_by_path()[key]["state"], "failed")
+        publish_queue.enqueue(self._paths("a"), interval_hours=1, now=NOW + 60, clips=self.clips)
+        self.assertEqual(publish_queue.latest_by_path()[key]["state"], "queued")
+
     def test_enqueue_after_recent_publish_waits_for_the_gap(self):
         publish_queue.enqueue(self._paths("a"), interval_hours=3, now=NOW, clips=self.clips)
         with patch.object(publish_queue.time, "time", return_value=NOW):

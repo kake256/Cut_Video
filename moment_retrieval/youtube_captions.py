@@ -252,13 +252,21 @@ def _parse_cues(payload: bytes) -> tuple[CaptionCue, ...]:
 
 def fetch_youtube_captions(url: str, preferred_language: str = "ja") -> CaptionPreview:
     canonical = normalize_youtube_url(url)
+    from . import youtube_block
+
+    if youtube_block.blocked_until():
+        raise _error("YOUTUBE_BLOCKED", youtube_block.message(youtube_block.blocked_until()))
     try:
         from yt_dlp import YoutubeDL
+        youtube_block.pace(canonical)
         with YoutubeDL(_metadata_options()) as ydl:
             info = ydl.extract_info(canonical, download=False)
     except CaptionError:
         raise
-    except Exception:
+    except Exception as exc:
+        blocked = youtube_block.note_failure(canonical, exc)
+        if blocked is not None:
+            raise _error("YOUTUBE_BLOCKED", str(blocked)) from None
         raise _error("METADATA_FETCH_FAILED", "動画情報の取得に失敗しました。") from None
     if not isinstance(info, dict) or str(info.get("id") or "") != _video_id(canonical):
         raise _error("VIDEO_MISMATCH", "指定した動画を確認できません。")

@@ -130,6 +130,28 @@ class MadeClipsTest(unittest.TestCase):
         made_clips.refresh_statuses([self.old], service_factory=lambda: self.service)
         self.assertIn("見つかりません", made_clips.status_label(made_clips.read_receipt(self.old)))
 
+    def test_status_label_tells_scheduled_and_public_apart(self):
+        receipt = {"video_id": "v", "privacy_status": "private", "publish_at": "2026-11-13T09:00:00Z"}
+        label = made_clips.status_label(receipt)
+        self.assertTrue(label.startswith("公開予約 "), label)
+        self.assertIn("今は非公開", label)
+        self.assertIsNotNone(made_clips.scheduled_publish_at(receipt))
+        public = {**receipt, "privacy_status": "public"}
+        self.assertEqual(made_clips.status_label(public), "公開済み")
+        self.assertIsNone(made_clips.scheduled_publish_at(public))
+        self.assertEqual(made_clips.status_label({**receipt, "publish_at": "broken"}), "非公開")
+
+    def test_refresh_reads_the_scheduled_time_and_privacy_change_clears_it(self):
+        youtube_upload.receipt_path(self.old).write_text(json.dumps(
+            {"video_id": "vidOLD00001", "privacy_status": "private", "title": "t",
+             "watch_url": "https://www.youtube.com/watch?v=vidOLD00001"}), encoding="utf-8")
+        self.service.items = [{"id": "vidOLD00001", "status": {
+            "privacyStatus": "private", "uploadStatus": "processed", "publishAt": "2026-11-13T09:00:00Z"}}]
+        made_clips.refresh_statuses(service_factory=lambda: self.service)
+        self.assertTrue(made_clips.status_label(made_clips.read_receipt(self.old)).startswith("公開予約"))
+        receipt = made_clips.change_privacy(self.old, "unlisted", service_factory=lambda: self.service)
+        self.assertEqual(receipt["publish_at"], "")
+
     def test_set_privacy_rejects_unknown_values_and_reports_a_locked_project(self):
         with self.assertRaises(youtube_upload.UploadError):
             youtube_upload.set_privacy("x", "everyone", service_factory=lambda: self.service)

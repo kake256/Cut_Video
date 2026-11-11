@@ -106,11 +106,19 @@ def fetch_missing(names: list[str], *, extract=None) -> int:
             options = {"quiet": True, "skip_download": True, "no_warnings": True, "logger": _QuietLogger()}
             with YoutubeDL(options) as ydl:
                 return ydl.extract_info(url, download=False, process=False)
+    from . import youtube_block
+
     found = 0
     for key in keys:
+        url = source_url(key)
+        if youtube_block.is_youtube(url) and youtube_block.blocked_until():
+            continue  # YouTube refused this PC recently; a title is not worth prolonging that
+        youtube_block.pace(url)
         try:
-            info = extract(source_url(key)) or {}
-        except Exception:  # deleted VOD, offline, rate limit: ask again after RETRY_AFTER_SEC
+            info = extract(url) or {}
+        except Exception as exc:  # deleted VOD, offline, rate limit: ask again after RETRY_AFTER_SEC
+            if youtube_block.note_failure(url, exc) is not None:
+                continue  # not a missing video: ask again once the cooldown is over
             info = {}
         if info.get("title"):
             record(source_url(key), info["title"], info.get("upload_date"))

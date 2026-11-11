@@ -135,6 +135,17 @@ class RepostTest(unittest.TestCase):
         self.assertIsNone(repost.run_due(now=NOW + 3600, service_factory=lambda: service))
         self.assertEqual(len(service.inserted), 1)
 
+    def test_slots_missed_while_closed_still_go_up_spaced(self):
+        repost.enqueue([item for item in self._candidates() if item["video_id"] in {"vidOLD", "vidB"}],
+                       interval_hours=3, now=NOW)
+        service = _Service()
+        late = NOW + 10 * 3600  # both slots passed while the app was closed
+        with patch.object(repost.time, "time", return_value=late):
+            self.assertEqual(repost.run_due(now=late, service_factory=lambda: service)["state"], "done")
+        self.assertIsNone(repost.run_due(now=late + 300, service_factory=lambda: service))
+        self.assertEqual([item["state"] for item in repost.load_queue()], ["done", "queued"])
+        self.assertEqual(repost.run_due(now=late + 3 * 3600, service_factory=lambda: service)["state"], "done")
+
     def test_old_title_still_among_newest_uploads_waits(self):
         repost.enqueue([item for item in self._candidates() if item["video_id"] == "vidBUSY"], now=NOW)
         service = _Service(newest_titles=["見出しvidBUSY"])

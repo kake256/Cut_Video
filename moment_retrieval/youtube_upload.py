@@ -633,5 +633,7 @@ def video_statuses(video_ids: list[str], *, service_factory: Callable | None = N
                 "privacy_status": str(status.get("privacyStatus") or ""),
                 "upload_status": str(status.get("uploadStatus") or ""),
                 "rejection_reason": str(status.get("rejectionReason") or status.get("failureReason") or ""),
+                # Set when a publish time is scheduled (e.g. in YouTube Studio); private until then.
+                "publish_at": str(status.get("publishAt") or ""),
             }
     return result

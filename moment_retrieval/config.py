@@ -69,8 +69,20 @@ EXTEND_FWD_MAX_SEC = 20.0
 
 # faster-whisper
 ASR_MODEL_SIZE = "large-v3"
-ASR_DEVICE = "cuda"
-ASR_COMPUTE_TYPE = "float16"
+def _default_asr_device() -> str:
+    """cuda when an NVIDIA GPU is usable, otherwise cpu (so a PC without one still works)."""
+    try:
+        import ctranslate2
+
+        return "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    except Exception:
+        return "cpu"
+
+
+ASR_DEVICE = os.environ.get("CUT_VIDEO_ASR_DEVICE") or _default_asr_device()
+ASR_COMPUTE_TYPE = os.environ.get("CUT_VIDEO_ASR_COMPUTE_TYPE") or (
+    "float16" if ASR_DEVICE == "cuda" else "int8"
+)
 
 # テキスト埋め込み (BGE-M3)
 EMBED_MODEL_NAME = "BAAI/bge-m3"

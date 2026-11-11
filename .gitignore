@@ -38,3 +38,12 @@ youtube_oauth_client.json
 
 # App-local binaries (e.g. an ffmpeg build matching the GPU driver)
 tools/
+
+# 配信者の写真・GB素材・計測用の音声 (配布物に含めない)
+reference/
+_haas_bench/
+.claude/*.tgz
+# 配信から作った生成物・個人の試行スクリプト
+docs/digests/
+assets/otomad/
+.claude/try_finish_one.py

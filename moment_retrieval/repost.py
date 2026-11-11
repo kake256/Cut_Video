@@ -148,6 +148,11 @@ def run_due(*, now: float | None = None, service_factory: Callable | None = None
             return None
         if any(item.get("state") == "running" for item in items):
             return None
+        # Slots that passed while the app was closed must not go up back to back.
+        last = max([float(item.get("finished_at") or 0) for item in items
+                    if item.get("state") in {"done", "failed"}] + [0.0])
+        if now - last < float(due.get("interval_hours") or DEFAULT_INTERVAL_HOURS) * 3600:
+            return None
         due["state"] = "running"
         _save_queue(items)
     old = due["video_id"]

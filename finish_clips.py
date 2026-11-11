@@ -4,6 +4,7 @@
     venv\\Scripts\\python.exe finish_clips.py [--job auto_xxx] [--agent codex] [--model gpt-6-luna]
 
 Writes ``<name>_finished.mp4`` (+ ``.finish.json`` with the plan) next to each clip.
+A ``<name>.subtitle.json`` next to a clip (hand-written title, notes, captions) is used too.
 The transcript lines of each clip are sent to the selected AI.  Nothing is uploaded.
 """
 from __future__ import annotations
@@ -45,10 +46,13 @@ def main() -> None:
         copy = original.with_name(f"{original.stem}_finished.mp4")
         shutil.copyfile(original, copy)
         shutil.copyfile(original.with_suffix(".metadata.json"), copy.with_suffix(".metadata.json"))
+        manual = original.with_suffix(".subtitle.json")  # hand-written title / notes / captions
+        if manual.is_file():
+            shutil.copyfile(manual, copy.with_suffix(".subtitle.json"))
         plan = finishing.finish_exported_clip(copy, agent=args.agent, model=model, focus=job.get("focus", ""),
                                               log=print)
         effects = ", ".join(f"{at:g}s {kind}" for at, kind in plan.sound_effects) or "なし"
-        print(f"- {copy.name}: 引き「{plan.hook_text}」/ 字幕 {plan.caption_preset} / 効果音 {effects}"
+        print(f"- {copy.name}: タイトル「{plan.hook_text}」/ 補足 {len(plan.notes)}件 / 効果音 {effects}"
               f" / 詰め {plan.trim_start:g}s・{plan.trim_end:g}s")
 
 

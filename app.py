@@ -29,6 +29,7 @@ import gradio as gr
 from moment_retrieval import config, db, utils
 from cut_clip import cut_clip, cut_clips
 from moment_retrieval.downloader import DownloadCancelled, DownloadError, download_video
+from moment_retrieval.youtube_block import YouTubeBlocked
 from moment_retrieval.embedder import TextEmbedder
 from moment_retrieval.highlight_analysis import (
     QUERY_PROMPT_VERSION,
@@ -4287,8 +4288,8 @@ def do_index(
                         ):
                             yield text, gr.update()
                             local_path = path or local_path
-                    except DownloadCancelled:
-                        raise
+                    except (DownloadCancelled, YouTubeBlocked):
+                        raise  # ボット判定は動画全体で取り直さない（YouTubeへの問い合わせを増やすだけ）
                     except DownloadError as audio_error:
                         log_lines.append(
                             f"音声だけの先行取得はできませんでした（{audio_error}）。動画をダウンロードします。"

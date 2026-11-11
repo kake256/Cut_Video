@@ -108,7 +108,9 @@ class LibraryTools:
         conn = self._open()
         try:
             video, revision, segments = self._transcript(conn, video_id)
-            used = db.list_used_clip_ranges(conn, video_id)
+            from .used_ranges import combined
+
+            used = combined(conn, video_id)  # incl. scenes others clipped (shared ledger)
         finally:
             conn.close()
         if start_index >= len(segments):
@@ -260,15 +262,15 @@ class LibraryTools:
                     "boundary_expanded": anchor_duration is not None and duration > anchor_duration + 1e-6,
                     "boundary_warning": duration < min_duration_sec,
                 })
-            from .used_ranges import overlaps
+            from .used_ranges import clash_reason, combined, overlaps
 
-            used = db.list_used_clip_ranges(conn, video_id)
+            used = combined(conn, video_id)
             fresh = []
             for candidate in fitted:
                 clash = overlaps(candidate["start_sec"], candidate["end_sec"], used)
                 if clash:
                     rejected.append({"index": None, "title": candidate["title"],
-                                     "reason": f"投稿済みの範囲（{clash.get('title') or '無題'}）と重なっています"})
+                                     "reason": clash_reason(clash)})
                 else:
                     fresh.append(candidate)
             fitted = fresh

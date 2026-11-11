@@ -107,6 +107,9 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
     音声だけの形式が無い動画では DownloadError になる。
     cancel_event が立つと、次の進捗通知で中断して DownloadCancelled を送出する。
     """
+    from . import youtube_block
+
+    youtube_block.check(url)  # refused recently: do not ask YouTube again yet
     try:
         from yt_dlp import YoutubeDL
     except ImportError as e:
@@ -114,6 +117,11 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = _existing_youtube_file(url, save_dir, audio_only=audio_only)
+    if existing is not None:  # already here: no need to ask YouTube at all
+        yield f"既にダウンロード済みです: {existing}", existing
+        return
 
     yield f"URLから動画情報を取得中... ({url})", None
 
@@ -130,11 +138,20 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
     # by default; also allow a supported Node.js already installed on PATH.
     # Runtime availability/version checks remain owned by yt-dlp.
     runtime_options = {"js_runtimes": {"deno": {}, "node": {}}}
-    try:
-        with YoutubeDL({"noplaylist": True, "quiet": True, **runtime_options}) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise DownloadError(f"動画情報の取得に失敗しました: {e}")
+    polite = youtube_block.polite_options(url)
+    info = youtube_block.cached_info(url)  # an earlier step of the same job may have asked already
+    if info is None:
+        youtube_block.pace(url)
+        try:
+            with YoutubeDL({"noplaylist": True, "quiet": True, **runtime_options, **polite}) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            blocked = youtube_block.note_failure(url, e)
+            if blocked is not None:
+                raise blocked from e
+            raise DownloadError(f"動画情報の取得に失敗しました: {e}")
+        youtube_block.note_success(url)
+        youtube_block.remember_info(url, info)
 
     # 投稿日時ベースの分かりやすいファイル名にする
     basename = _build_basename(info)
@@ -162,6 +179,7 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
         # once is much faster than one by one.
         "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
         "progress_hooks": [_hook],
+        **polite,  # YouTube: one connection, fewer retries with waits in between
     }
 
     title = info.get("title", basename)
@@ -181,6 +199,8 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
 
     def _worker():
         try:
+            youtube_block.check(url)
+            youtube_block.pace(url)
             with YoutubeDL(ydl_opts) as ydl:
                 result["info"] = ydl.extract_info(url, download=True)
         except Exception as e:
@@ -212,6 +232,9 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
         error = result["error"]
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled("ダウンロードを中断しました") from error
+        blocked = youtube_block.note_failure(url, error)
+        if blocked is not None:
+            raise blocked from error
         raise DownloadError(f"ダウンロードに失敗しました: {error}")
 
     if audio_only:
@@ -237,7 +260,27 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
 
 # 区間ダウンロードの同時実行数。YouTubeは1接続あたり1〜2MB/sに絞られるため並行で取る
 # （実測: 2分の区間4本を並行で91秒、1本ずつなら約80秒/本）。
+# ただしYouTubeには過剰に問い合わせないよう、常に1本ずつ取る（youtube_block.pace で間隔も空ける）。
 SECTION_WORKERS = 4
+
+
+def _existing_youtube_file(url: str, save_dir: Path, *, audio_only: bool) -> Optional[Path]:
+    """A finished download of this YouTube video in ``save_dir`` (found by its ID, without asking YouTube)."""
+    from . import youtube_block
+
+    vid = youtube_block.video_id(url)
+    if not vid:
+        return None
+    for video in sorted(save_dir.glob(f"*{vid}.mp4")):
+        if video.stem == vid or video.stem.endswith("_" + vid):
+            return video
+    if audio_only:
+        for video_stem in sorted({p.name.split(AUDIO_SUFFIX)[0] for p in save_dir.glob(f"*{vid}{AUDIO_SUFFIX}.*")}):
+            if video_stem == vid or video_stem.endswith("_" + vid):
+                found = audio_proxy_for(save_dir / f"{video_stem}.mp4")
+                if found:
+                    return found[0]
+    return None
 
 
 def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = SECTION_WORKERS,
@@ -251,6 +294,9 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    from . import youtube_block
+
+    youtube_block.check(url)
     try:
         from yt_dlp import YoutubeDL
         from yt_dlp.utils import download_range_func
@@ -266,6 +312,8 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
 
     def _one(item):
         index, (start, end) = item
+        youtube_block.check(url)  # another section may have just been refused
+        youtube_block.pace(url)
         target = save_dir / f"section_{index:02d}.mp4"
         options = {
             "js_runtimes": {"deno": {}, "node": {}},
@@ -274,6 +322,7 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
             "outtmpl": str(save_dir / f"section_{index:02d}.%(ext)s"),
             "noplaylist": True, "quiet": True, "noprogress": True, "retries": 10,
             "progress_hooks": [_hook],
+            **youtube_block.polite_options(url),
         }
         try:
             with YoutubeDL(options) as ydl:
@@ -281,10 +330,15 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
         except Exception as e:
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled("ダウンロードを中断しました") from e
+            blocked = youtube_block.note_failure(url, e)
+            if blocked is not None:
+                raise blocked from e
             raise DownloadError(f"区間のダウンロードに失敗しました（{start:.0f}〜{end:.0f}秒）: {e}") from e
         if not target.is_file():
             raise DownloadError(f"区間のダウンロード後にファイルが見つかりません: {target.name}")
         return target
 
+    if youtube_block.is_youtube(url):
+        workers = 1
     with ThreadPoolExecutor(max_workers=max(1, int(workers)), thread_name_prefix="section") as pool:
         return list(pool.map(_one, enumerate(ranges)))

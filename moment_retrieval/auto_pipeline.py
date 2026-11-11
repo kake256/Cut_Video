@@ -319,6 +319,10 @@ class AutoPipeline:
         job.state = "running"
         try:
             self._check_cancel(job)
+            from .source_origin import canonical_source_url
+
+            # Claim a pasted URL before the long download so others' daily batches skip it.
+            claimed = not job.link_only and self._claim_shared(job, canonical_source_url(job.source) or "")
             job.step = STEPS[0]
             info, channel, local_path = self._call(job, "metadata")
             if channel is not None:
@@ -338,6 +342,8 @@ class AutoPipeline:
                 self._log(job, "ダウンロードと文字起こしが完了しました（切り抜きはしていません）。"
                                "「文字起こし済みの動画から選ぶ」から切り抜けます。")
                 return
+            if not claimed:
+                self._claim_shared(job)
             self._check_cancel(job)
             job.step = STEPS[2]
             job.highlight_run_id = self._call(job, "select")
@@ -385,6 +391,35 @@ class AutoPipeline:
             if sections:
                 shutil.rmtree(sections["dir"], ignore_errors=True)
 
+    def _claim_shared(self, job: AutoJob, url: str | None = None) -> bool:
+        """Put this video in the shared ledger and say who else already clips it.
+
+        ``url`` None looks up the indexed video's origin; "" means there is none yet.
+        """
+        from . import shared_ledger
+
+        try:
+            if not shared_ledger.enabled():
+                return False
+            if url is None and job.video_id:
+                conn = db.get_conn()
+                try:
+                    db.init_db(conn)
+                    url = shared_ledger.origin_for_video(conn, job.video_id)
+                finally:
+                    conn.close()
+            if not url:
+                return False
+            others = shared_ledger.claimed_by(url)
+            if others:
+                self._log(job, f"共有台帳: {'・'.join(others)}さんもこの動画を切り抜いています。その場面は避けて選びます。")
+            if not shared_ledger.record("claim", url):
+                self._log(job, "共有台帳のフォルダに書き込めないため、記録を保留しました（次に書き込めたときに反映します）。")
+            return True
+        except Exception as exc:  # the ledger is a courtesy to others; never stop the job for it
+            self._log(job, f"共有台帳を使えませんでした（{type(exc).__name__}）。")
+            return False
+
     def _call(self, job: AutoJob, name: str, *args):
         """Run one step and record how long it took, so daily jobs can be compared."""
         started = time.time()
@@ -413,10 +448,25 @@ class AutoPipeline:
             return None, None, job.source
         from yt_dlp import YoutubeDL
 
+        from . import youtube_block
+
+        youtube_block.check(job.source)  # refused recently: fail now without asking YouTube again
         self._log(job, "動画情報を取得しています。")
-        with YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
-                        "js_runtimes": {"deno": {}, "node": {}}}) as ydl:
-            info = ydl.extract_info(job.source, download=False)
+        info = youtube_block.cached_info(job.source)
+        if info is None:
+            youtube_block.pace(job.source)
+            try:
+                with YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
+                                "js_runtimes": {"deno": {}, "node": {}},
+                                **youtube_block.polite_options(job.source)}) as ydl:
+                    info = ydl.extract_info(job.source, download=False)
+            except Exception as exc:
+                blocked = youtube_block.note_failure(job.source, exc)
+                if blocked is not None:
+                    raise blocked from exc
+                raise
+            youtube_block.note_success(job.source)
+            youtube_block.remember_info(job.source, info)
         channel = channel_policy.channel_from_info(info or {})
         self._log(job, f"動画: {info.get('title', '')} / チャンネル: {channel.name if channel else '不明'}")
         return info, channel, None
@@ -881,6 +931,13 @@ class AutoPipeline:
             raise PipelineError(str(status.get("log") or f"書き出しに失敗しました（exit {code}）。")[-300:])
         outputs = [str(item) for item in status.get("outputs") or []]
         self._log(job, f"{len(outputs)}本を書き出しました。")
+        from .used_ranges import record_made
+
+        for output in outputs:
+            try:  # others avoid these ranges even before they are uploaded
+                record_made(Path(output))
+            except Exception:
+                pass
         return outputs
 
     def _finish(self, job: AutoJob) -> None:
@@ -890,7 +947,7 @@ class AutoPipeline:
         from . import relisten
 
         workers = max(1, min(FINISH_WORKERS, len(job.outputs)))
-        self._log(job, "仕上げ（引きのタイトル・字幕のタイミング調整・効果音）を行います"
+        self._log(job, "仕上げ（2行タイトル・発話単位の字幕・補足字幕・無音カット・音量調整・効果音）を行います"
                        + (f"（{workers}本ずつ並行）。" if workers > 1 else "。"))
         # Most of a clip's finishing is waiting for the AI's plan, so clips run side by side.
         try:
@@ -933,7 +990,7 @@ class AutoPipeline:
                 except Exception as fallback_exc:
                     self._log(job, f"  {index}本目の動画を作れませんでした（{type(fallback_exc).__name__}）")
             return
-        self._log(job, f"  {index}本目: 引き「{plan.hook_text}」・効果音{len(plan.sound_effects)}か所")
+        self._log(job, f"  {index}本目: タイトル「{plan.hook_text}」・補足字幕{len(plan.notes)}件・効果音{len(plan.sound_effects)}か所")
 
     def _upload(self, job: AutoJob) -> None:
         from . import youtube_upload

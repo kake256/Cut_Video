@@ -21,6 +21,7 @@ from typing import Callable, Optional
 
 from . import db, signals, source_origin
 from .downloader import DownloadCancelled, DownloadError, download_video, video_path_for_proxy
+from .youtube_block import YouTubeBlocked
 
 DURATION_TOLERANCE_SEC = 2.0
 
@@ -90,8 +91,8 @@ def fetch_audio(url: str, save_dir: Path, *, log: Callable[[str], None] | None =
                 log(message)
             if result is not None:
                 path = Path(result)
-    except DownloadCancelled:
-        raise
+    except (DownloadCancelled, YouTubeBlocked):
+        raise  # a bot check is not a missing audio format: falling back would ask YouTube again
     except DownloadError as exc:
         if log:
             log(f"音声だけの先行取得はできませんでした（{exc}）。動画をダウンロードしてから処理します。")

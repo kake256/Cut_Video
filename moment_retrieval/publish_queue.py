@@ -140,6 +140,20 @@ def pending_by_path() -> dict[str, dict]:
     return {_key(item["path"]): item for item in load_queue() if item.get("state") in PENDING}
 
 
+def latest_by_path() -> dict[str, dict]:
+    """Each clip's queue item to show: the waiting/publishing one, else the last finished one."""
+    latest: dict[str, dict] = {}
+    for item in load_queue():
+        key = _key(item["path"])
+        current = latest.get(key)
+        if current is not None and current.get("state") in PENDING:
+            continue
+        if (item.get("state") in PENDING or current is None
+                or float(item.get("finished_at") or 0) >= float(current.get("finished_at") or 0)):
+            latest[key] = item
+    return latest
+
+
 def run_due(*, now: float | None = None, change_privacy: Callable | None = None,
             on_published: Callable[[dict], None] | None = None,
             log: Callable[[str], None] = lambda message: None) -> dict | None:

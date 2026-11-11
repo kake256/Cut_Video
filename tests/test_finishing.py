@@ -2,25 +2,35 @@
 import json
 import unittest
 
-from moment_retrieval import finishing
+from moment_retrieval import finishing, short_style
 from moment_retrieval.finishing import Caption, FinishPlan, Word
 
 
 class PlanTest(unittest.TestCase):
     def test_plan_is_clamped_and_effects_are_spaced(self):
         plan = finishing.validate_plan({
-            "hook_text": "とても長い引きのタイトルはここで切れるはず", "caption_preset": "huge",
-            "caption_position": "top", "trim_start": 9, "trim_end": -1,
+            "title_top": "外国人に道を聞かれて", "title_emphasis": "とりあえず「Yes」と答えたらこうなった",
+            "trim_start": 9, "trim_end": -1,
             "sound_effects": [{"at": 5, "type": "pop"}, {"at": 5.5, "type": "ding"},
                               {"at": 12, "type": "laser"}, {"at": 20, "type": "thud"},
                               {"at": 59.9, "type": "rise"}],
+            "notes": [{"start": 2, "end": 8, "text": "※渋谷には行きません"}, {"start": 9, "end": 9.2, "text": "短すぎ"},
+                      {"start": 10, "end": 90, "text": "あ" * 30}, {"start": 20, "end": 30, "text": "3つ目"}],
         }, 60.0)
-        self.assertEqual(len(plan.hook_text), 14)
-        self.assertTrue(plan.hook_text.endswith("…"))
-        self.assertEqual((plan.caption_preset, plan.caption_position), ("large", "bottom"))
+        self.assertEqual(plan.title_lines[0], ("外国人に道を聞かれて", False))
+        self.assertTrue(plan.title_lines[1][1])
+        self.assertTrue(plan.title_lines[1][0].endswith("…"))
+        self.assertLessEqual(short_style.display_units(plan.title_lines[1][0]), short_style.TITLE_LINE_UNITS)
         self.assertEqual((plan.trim_start, plan.trim_end), (3.0, 0.0))
         self.assertEqual(plan.sound_effects, [(2.0, "pop"), (17.0, "thud")])
+        self.assertEqual(plan.notes, [(2.0, 8.0, "※渋谷には行きません"), (10.0, 60.0, "あ" * 20)])
         self.assertEqual(finishing.validate_plan("not a dict", 30).sound_effects, [])
+
+    def test_posting_title_becomes_a_two_line_title(self):
+        plan = finishing.validate_plan({"hook_text": "【ゲラサブロウ】外国人に道を聞かれてとりあえず「Yes」 #shorts"}, 30)
+        self.assertEqual([yellow for _text, yellow in plan.title_lines], [False, True])
+        self.assertNotIn("【", plan.hook_text)
+        self.assertNotIn("#shorts", plan.hook_text)
 
     def test_effects_snap_to_the_nearest_spoken_word(self):
         words = [Word(1.0, 1.3, "え"), Word(4.2, 4.6, "は"), Word(9.0, 9.4, "?")]
@@ -84,7 +94,7 @@ class AiCaptionTest(unittest.TestCase):
 
     def test_plan_keeps_caption_lines_trimmed(self):
         plan = finishing.validate_plan({"captions": ["  電池ね。 ", "", "あ" * 40]}, 30)
-        self.assertEqual(plan.caption_lines, ["電池ね。", "あ" * 24])
+        self.assertEqual(plan.caption_lines, ["電池ね。", "あ" * 30])
 
 
 class SpeechSnapTest(unittest.TestCase):
@@ -117,16 +127,91 @@ class SpeechSnapTest(unittest.TestCase):
 
 class RenderPlanTest(unittest.TestCase):
     def test_effect_line_pops_and_audio_is_mixed_with_a_limiter(self):
-        plan = FinishPlan(hook_text="引き", sound_effects=[(1.0, "thud")])
+        plan = FinishPlan(hook_text="引き", sound_effects=[(1.0, "thud")], notes=[(0.5, 3.0, "※補足")],
+                          footer="ゲラサブロウ 配信（2026/07/16）より")
         ass = finishing.build_ass([Caption(0.5, 1.5, "キレた"), Caption(2.0, 3.0, "落ち着く")], plan, 1080, 1920, 4.0)
         self.assertIn(r"\fscx118", ass.split("キレた")[0].splitlines()[-1])
         self.assertNotIn(r"\fscx118", [line for line in ass.splitlines() if "落ち着く" in line][0])
-        self.assertIn("Hook,,0,0,0,,引き", ass)
+        self.assertIn(r"Title,,0,0,0,,{\an5\pos(540,150)\c&H3CDCFF&}引き", ass)
+        self.assertIn(r"Note,,0,0,0,,{\an5\pos(540,1597)}※補足", ass)
+        self.assertIn(r"Footer,,0,0,0,,{\an5\pos(540,1870)}ゲラサブロウ", ass)
+        self.assertIn(r"{\an5\pos(540,1725)}落ち着く", ass)
+        self.assertIn("Style: Default,Yu Gothic UI,74,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,"
+                      "100,100,0,0,1,9,0,5", ass)
         graph = finishing.build_filter(1080, 1920, plan.sound_effects)
         self.assertIn("adelay=1000|1000", graph)
         self.assertIn("alimiter", graph)
+        self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11", graph)
         self.assertNotIn("zoompan", graph)
-        self.assertIn("[0:a]anull[aout]", finishing.build_filter(1080, 1920, []))
+        self.assertNotIn("loudnorm", finishing.build_filter(1080, 1920, [], loudnorm=False))
+
+    def test_kept_segments_are_joined_in_the_graph(self):
+        graph = finishing.build_filter(1080, 1920, [], segments=[(0.0, 2.0), (3.5, 6.0)])
+        self.assertIn("[vs1]trim=start=3.500:end=6.000", graph)
+        self.assertIn("concat=n=2:v=1:a=1[cv][ca]", graph)
+        self.assertIn("[cv]split=2[bg_src][fg_src]", graph)
+
+    def test_captions_keep_a_short_breath_as_a_space(self):
+        words = [Word(0.0, 0.3, "嘘"), Word(0.3, 0.6, "だろ"), Word(0.9, 1.2, "嘘か"), Word(1.2, 1.5, "これ。")]
+        self.assertEqual([c.text for c in finishing.captions_from_words(words)], ["嘘だろ 嘘かこれ"])
+
+
+class StyleTest(unittest.TestCase):
+    def test_wrap_prefers_spaces_and_stays_inside_the_canvas(self):
+        self.assertEqual(short_style.wrap_caption("クロール 背泳ぎ 平泳ぎ バタフライ 全部できる"),
+                         ["クロール 背泳ぎ 平泳ぎ", "バタフライ 全部できる"])
+        lines = short_style.wrap_caption("「どうやったら渋谷に行くの？」って聞かれそうじゃん")
+        self.assertTrue(all(short_style.display_units(line) <= 32 for line in lines))
+        self.assertFalse(lines[1].startswith("」"))
+        self.assertEqual("".join(lines), "「どうやったら渋谷に行くの？」って聞かれそうじゃん")
+        self.assertEqual(short_style.wrap_caption("待って待って。"), ["待って待って"])
+        self.assertEqual(short_style.wrap_caption("はいどうもゲラサブローでございます"),
+                         ["はいどうも", "ゲラサブローでございます"])
+
+    def test_pauses_are_cut_but_speech_is_kept(self):
+        segments = short_style.keep_segments(20.0, [(0.2, 3.0), (3.3, 5.0), (9.0, 12.0), (12.4, 14.0)])
+        self.assertEqual(segments, [(0.0, 5.25), (8.75, 14.5)])
+        timeline = short_style.TimeMap(segments)
+        self.assertAlmostEqual(timeline.duration, 11.0)
+        self.assertEqual(timeline.span(9.0, 10.0), (5.5, 6.5))
+        self.assertEqual(timeline.span(6.0, 8.0), None)  # a line inside a cut disappears
+        self.assertEqual(timeline.span(4.0, 7.0), (4.0, 5.25))
+        self.assertEqual(short_style.keep_segments(10.0, []), [(0.0, 10.0)])
+
+    def test_footer_and_overrides(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        self.assertEqual(short_style.footer_text("ゲラサブロウ", "20260716"), "ゲラサブロウ 配信（2026/07/16）より")
+        self.assertEqual(short_style.footer_text("", ""), "")
+        self.assertEqual(short_style.streamer_from_title("【ゲラサブロウ】道を聞かれて"), "ゲラサブロウ")
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp, "a.mp4")
+            clip.with_suffix(".subtitle.json").write_text(json.dumps({
+                "title": ["butterfly が", "読めない男"],
+                "notes": [{"start": 1, "end": 4, "text": "※チャット「バターフライ」"}],
+                "captions": [[0.0, 1.0, "待って待って"], [1.0, 0.5, "壊れた行"]],
+            }), encoding="utf-8")
+            overrides = short_style.load_overrides(clip)
+            self.assertEqual(overrides.title, [("butterfly が", False), ("読めない男", True)])
+            self.assertEqual(overrides.notes, [(1.0, 4.0, "※チャット「バターフライ」")])
+            self.assertEqual(overrides.captions, [(0.0, 1.0, "待って待って")])
+            self.assertIsNone(overrides.footer)
+            self.assertEqual(short_style.load_overrides(Path(tmp, "none.mp4")).title, None)
+
+    def test_settings_fall_back_to_defaults(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "s.json")
+            path.write_text('{"streamer_name": "ゲラサブロウ", "cut_silence": "yes", "silence_min_sec": 0.01}',
+                            encoding="utf-8")
+            settings = short_style.load_settings(path)
+        self.assertEqual(settings["streamer_name"], "ゲラサブロウ")
+        self.assertTrue(settings["cut_silence"])
+        self.assertEqual(settings["silence_min_sec"], 0.3)
 
 
 if __name__ == "__main__":

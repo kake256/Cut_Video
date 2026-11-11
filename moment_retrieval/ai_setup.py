@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-from . import agent_runner, config
+from . import agent_runner, api_keys, config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OLLAMA_TAGS_URL = "http://127.0.0.1:11434/api/tags"
@@ -44,6 +44,8 @@ def codex_status(*, runner: Callable = subprocess.run) -> dict:
     exe = agent_runner.find_executable("codex")
     if not exe:
         return {"installed": False, "ready": False, "detail": "未インストール"}
+    if api_keys.has_key("codex"):
+        return {"installed": True, "ready": True, "detail": "APIキーで利用"}
     result = _quiet([exe, "login", "status"], runner)
     ready = bool(result and result.returncode == 0 and "logged in" in (result.stdout + result.stderr).lower())
     return {"installed": True, "ready": ready, "detail": "ログイン済み" if ready else "未ログイン"}
@@ -53,6 +55,8 @@ def claude_status(*, runner: Callable = subprocess.run) -> dict:
     exe = agent_runner.find_executable("claude")
     if not exe:
         return {"installed": False, "ready": False, "detail": "未インストール"}
+    if api_keys.has_key("claude"):
+        return {"installed": True, "ready": True, "detail": "APIキーで利用"}
     result = _quiet([exe, "auth", "status", "--json"], runner)
     try:
         ready = bool(result and json.loads(result.stdout).get("loggedIn"))

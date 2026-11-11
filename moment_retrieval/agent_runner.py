@@ -199,6 +199,8 @@ def run_agent(
     effort: str = "",
 ) -> str:
     """Run the agent to completion and return its combined output text."""
+    from . import api_keys  # lazy: importing config here would fix DATA_DIR too early
+
     executable = find_executable(agent)
     if not executable:
         raise AgentError(f"{AGENT_LABELS.get(agent, agent)} が見つかりません。インストールとログインを確認してください。")
@@ -207,6 +209,7 @@ def run_agent(
         process = runner(
             command, cwd=str(REPO_ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            env=api_keys.agent_env(agent),
         )
         if register_process:
             register_process(process)
@@ -227,6 +230,11 @@ def run_agent(
     if code != 0:
         # The CLI's own last words (e.g. an expired login) tell the user what to fix.
         detail = " / ".join(lines[-3:])[-300:]
+        if _LOGIN_PROBLEM.search(detail) and api_keys.has_key(agent):
+            raise AgentError(
+                f"{AGENT_LABELS.get(agent, agent)} がAPIキーを受け付けませんでした。「設定」タブのAPIキーを"
+                f"「接続テスト」で確かめ、必要なら入れ直してください（{detail}）"
+            )
         if _LOGIN_PROBLEM.search(detail):
             raise AgentError(
                 f"{AGENT_LABELS.get(agent, agent)} のログインが切れています。設定タブのボタンでログインし直してください"

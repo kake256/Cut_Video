@@ -3,13 +3,15 @@
 A range is recorded when a clip is uploaded (from the posting-metadata JSON
 written next to the mp4) or imported from a share zip.  The AI is told to
 avoid these ranges, and proposals that still overlap them are rejected.
+When the shared ledger is set up (``shared_ledger``), ranges other people
+exported or uploaded from the same public video are avoided the same way.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from . import db
+from . import db, shared_ledger
 
 # Same rule as candidate overlap suppression: overlapping 30% of the shorter clip.
 OVERLAP_THRESHOLD = 0.30
@@ -25,17 +27,26 @@ def overlaps(start: float, end: float, used: list[dict], threshold: float = OVER
     return None
 
 
+def combined(conn, video_id: str) -> list[dict]:
+    """This PC's used ranges plus the ranges other people put in the shared ledger."""
+    used = db.list_used_clip_ranges(conn, video_id)
+    if shared_ledger.enabled():
+        url = shared_ledger.origin_for_video(conn, video_id)
+        if url:
+            used = sorted([*used, *shared_ledger.ranges(url)], key=lambda item: float(item["start_sec"]))
+    return used
+
+
 def for_video(video_id: str) -> list[dict]:
     conn = db.get_conn()
     try:
         db.init_db(conn)
-        return db.list_used_clip_ranges(conn, video_id)
+        return combined(conn, video_id)
     finally:
         conn.close()
 
 
-def record_from_clip(clip_path: Path, title: str = "") -> bool:
-    """Record the source range stored in a clip's posting-metadata JSON after upload."""
+def _sidecar_range(clip_path: Path) -> tuple[dict, str, float, float] | None:
     sidecar = Path(clip_path).with_suffix(".metadata.json")
     try:
         data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -43,13 +54,46 @@ def record_from_clip(clip_path: Path, title: str = "") -> bool:
         video_id = str(source["video_id"])
         start, end = float(source["start_sec"]), float(source["end_sec"])
     except (OSError, ValueError, KeyError, TypeError):
-        return False
+        return None
     if not video_id:
+        return None
+    return data, video_id, start, end
+
+
+def _to_ledger(conn, kind: str, video_id: str, start: float, end: float, title: str) -> bool:
+    if not shared_ledger.enabled():
         return False
+    url = shared_ledger.origin_for_video(conn, video_id)
+    return bool(url) and shared_ledger.record(kind, url, start, end, title)
+
+
+def record_from_clip(clip_path: Path, title: str = "") -> bool:
+    """Record the source range stored in a clip's posting-metadata JSON after upload."""
+    found = _sidecar_range(clip_path)
+    if found is None:
+        return False
+    data, video_id, start, end = found
+    title = title or str(data.get("title") or "")
     conn = db.get_conn()
     try:
         db.init_db(conn)
-        return db.add_used_clip_range(conn, video_id, start, end, title or str(data.get("title") or ""))
+        added = db.add_used_clip_range(conn, video_id, start, end, title)
+        _to_ledger(conn, "uploaded", video_id, start, end, title)
+        return added
+    finally:
+        conn.close()
+
+
+def record_made(clip_path: Path) -> bool:
+    """Tell the shared ledger that this clip was exported (this PC can still pick it again)."""
+    found = _sidecar_range(clip_path)
+    if found is None or not shared_ledger.enabled():
+        return False
+    data, video_id, start, end = found
+    conn = db.get_conn()
+    try:
+        db.init_db(conn)
+        return _to_ledger(conn, "made", video_id, start, end, str(data.get("title") or ""))
     finally:
         conn.close()
 
@@ -78,6 +122,14 @@ def backfill_from_jobs(jobs: list) -> int:
     return added
 
 
+def clash_reason(item: dict) -> str:
+    """Why a proposal was rejected, for the AI's feedback."""
+    title = item.get("title") or "無題"
+    if item.get("origin") == "ledger":
+        return f"{item.get('by')}さんが切り抜いた範囲（{title}）と重なっています"
+    return f"投稿済みの範囲（{title}）と重なっています"
+
+
 def prompt_lines(used: list[dict]) -> str:
     """Human-readable list for AI prompts (times only plus the clip title)."""
     def clock(seconds: float) -> str:
@@ -85,5 +137,7 @@ def prompt_lines(used: list[dict]) -> str:
         return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
     return "\n".join(
-        f"- {clock(item['start_sec'])}〜{clock(item['end_sec'])}「{item.get('title') or ''}」" for item in used
+        f"- {clock(item['start_sec'])}〜{clock(item['end_sec'])}「{item.get('title') or ''}」"
+        + (f"（{item.get('by')}さんが作成）" if item.get("origin") == "ledger" else "")
+        for item in used
     )

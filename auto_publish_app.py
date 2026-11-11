@@ -31,7 +31,7 @@ except ImportError:
 import gradio as gr  # noqa: E402
 
 from moment_retrieval import (  # noqa: E402
-    agent_runner, ai_setup, config, gcloud_setup, youtube_auto_reply, youtube_gas, youtube_upload,
+    agent_runner, ai_setup, api_keys, config, gcloud_setup, youtube_auto_reply, youtube_gas, youtube_upload,
 )
 from moment_retrieval.auto_pipeline import (  # noqa: E402
     LIBRARY_PREFIX, SHORTS_MAX_SEC, AutoPipeline, PipelineError, library_videos,
@@ -507,6 +507,37 @@ def ai_prepare(agent: str) -> str:
     return ai_setup.prepare(agent) + "\n\n" + ai_setup_view()
 
 
+def api_key_status(provider: str) -> str:
+    return f"**{api_keys.PROVIDERS[provider]['label']}:** {html.escape(api_keys.describe(provider))}"
+
+
+def api_key_save(provider: str, key: str):
+    """Save the typed key; the box is cleared so the key is never shown again."""
+    if not str(key or "").strip():
+        raise gr.Error("APIキーを入力してから「保存」を押してください。")
+    try:
+        api_keys.save_key(provider, key)
+    except api_keys.ApiKeyError as exc:
+        raise gr.Error(str(exc)) from exc
+    gr.Info(f"{api_keys.PROVIDERS[provider]['label']} のAPIキーを保存しました。")
+    return "", api_key_status(provider), ai_setup_view()
+
+
+def api_key_test(provider: str, key: str) -> str:
+    """Test the typed key, or the saved / environment key when the box is empty."""
+    try:
+        ok, message = api_keys.test_key(provider, key)
+    except api_keys.ApiKeyError as exc:
+        ok, message = False, str(exc)
+    return api_key_status(provider) + f"\n\n{'✅' if ok else '⚠️'} {html.escape(message)}"
+
+
+def api_key_delete(provider: str):
+    removed = api_keys.delete_key(provider)
+    note = "保存したキーを削除しました。" if removed else "保存したキーはありません。"
+    return "", api_key_status(provider) + f"\n\n{note}", ai_setup_view()
+
+
 def on_agent_change(agent: str):
     return (
         gr.update(choices=model_choices(agent), value=default_model(agent)),
@@ -661,13 +692,64 @@ def save_ui_settings(effort: str, min_sec, max_sec, layout: str, finish: bool = 
         raise gr.Error(f"長さは 5秒 <= 最短 <= 最長 <= {SHORTS_MAX_SEC}秒 で指定してください。")
     if layout not in {"blur", "crop"} or effort not in agent_runner.EFFORTS:
         raise gr.Error("レイアウトと推論の強さを選んでください。")
-    path = _ui_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort,
-                                "finish": bool(finish),
-                                "upload": upload if upload in {"private", "unlisted", "none"} else "private"},
-                               ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_ui_settings({"min_sec": min_sec, "max_sec": max_sec, "layout": layout, "effort": effort,
+                        "finish": bool(finish),
+                        "upload": upload if upload in {"private", "unlisted", "none"} else "private"})
     return "保存しました。次回からこの設定で開きます。"
+
+
+def _write_ui_settings(updates: dict) -> None:
+    """Merge into the saved defaults, so saving one part keeps the others (e.g. the last AI)."""
+    path = _ui_settings_path()
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved = {**(saved if isinstance(saved, dict) else {}), **updates}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _saved_agent() -> tuple[str, str]:
+    """The AI and model chosen last time, or Codex with its default model."""
+    try:
+        saved = json.loads(_ui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    agent = saved.get("agent") if isinstance(saved, dict) else None
+    if agent not in agent_runner.AGENTS:
+        return "codex", default_model("codex")
+    model = saved.get("model")
+    try:
+        model, _effort = agent_runner.validate_model(agent, model if isinstance(model, str) else "", "")
+    except agent_runner.AgentError:
+        model = default_model(agent)
+    return agent, model
+
+
+def remember_agent(agent: str, model: str) -> None:
+    """Keep the AI and model picked on the main tab as next time's default."""
+    if agent not in agent_runner.AGENTS:
+        return
+    try:
+        model, _effort = agent_runner.validate_model(agent, model, "")
+    except agent_runner.AgentError:
+        return
+    try:
+        _write_ui_settings({"agent": agent, "model": model})
+    except OSError:
+        pass  # a read-only folder only loses the remembered choice
+
+
+def apply_agent_settings():
+    agent, model = _saved_agent()
+    choices = model_choices(agent)
+    if model not in {value for _label, value in choices}:
+        # e.g. an Ollama model that was removed; keep the saved name selectable rather than drop it silently
+        choices = choices + [(model, model)] if model and agent == "local" else choices
+        model = model if model and agent == "local" else default_model(agent)
+    return (gr.update(value=agent), gr.update(choices=choices, value=model),
+            gr.update(visible=agent == "codex"))
 
 
 def on_mode_change(mode: str):
@@ -941,6 +1023,29 @@ def change_clip_privacy(paths, privacy: str):
     return "\n".join(lines), cards_signature()
 
 
+def clip_publish_status(receipt: dict | None, item: dict | None) -> str:
+    """The clip list's state badge: the publish queue's state first, then YouTube's."""
+    from moment_retrieval import made_clips
+
+    label = made_clips.status_label(receipt)
+    public = bool(receipt) and receipt.get("privacy_status") == "public"
+    state = (item or {}).get("state")
+    if not public and state == "queued":
+        return f"**[公開待ち {datetime.fromtimestamp(float(item['not_before'])):%m/%d %H:%M}]**（今は{label}）"
+    if not public and state == "running":
+        return f"**[公開中…]**（今は{label}）"
+    if not public and state == "failed":
+        reason = html.escape(str(item.get("message") or "")[:80])
+        return f"**[公開に失敗]**（今は{label}{'・' + reason if reason else ''}）"
+    scheduled = made_clips.scheduled_publish_at(receipt)
+    if scheduled is not None:
+        current = youtube_upload.PRIVACY_LABELS.get(str(receipt.get("privacy_status")), "非公開")
+        return f"**[公開予約 {scheduled:%m/%d %H:%M}]**（YouTubeで設定・今は{current}）"
+    if public:
+        return f"**[{label}]**"
+    return f"[{label}]"
+
+
 def refresh_clip_statuses():
     from moment_retrieval import made_clips
 
@@ -1162,7 +1267,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             def render_clip_cards(signature):
                 from moment_retrieval import made_clips, publish_queue
 
-                queued = publish_queue.pending_by_path()
+                queued = publish_queue.latest_by_path()
 
                 cards = clip_cards()
                 if not cards:
@@ -1178,11 +1283,12 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     with gr.Group():
                         how = "（書き出しのみ・毎日の自動処理など）" if card["batch"] else ""
                         lines = [f"**{html.escape(job_id)}**{how} — 元動画: {html.escape(card['source'])}"]
+                        waiting_paths = set()
                         for clip in clips:
-                            status = made_clips.status_label(clip.receipt)
-                            waiting = queued.get(publish_queue._key(clip.path))
-                            if waiting:
-                                status += f"・公開待ち {datetime.fromtimestamp(waiting['not_before']):%m/%d %H:%M}"
+                            item = queued.get(publish_queue._key(clip.path))
+                            status = clip_publish_status(clip.receipt, item)
+                            if item is not None and item.get("state") in publish_queue.PENDING:
+                                waiting_paths.add(str(clip.path))
                             if clip.receipt:
                                 video_id = html.escape(str(clip.receipt["video_id"]))
                                 links = (f"[ショートで見る](https://www.youtube.com/shorts/{video_id})・"
@@ -1190,7 +1296,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                             else:
                                 links = (f'<a href="/gradio_api/file={quote(str(clip.path))}" target="_blank">'
                                          "再生して確認</a>")
-                            lines.append(f"- [{status}] {html.escape(clip.title)} — {links}")
+                            lines.append(f"- {status} {html.escape(clip.title)} — {links}")
                         gr.Markdown("\n".join(lines), padding=True)
                         unposted = [(clip.title, str(clip.path)) for clip in clips if not clip.receipt]
                         if unposted:
@@ -1211,7 +1317,10 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                             )
                         private = [(clip.title, str(clip.path)) for clip in clips
                                    if clip.receipt and clip.receipt.get("privacy_status") != "public"
-                                   and not clip.receipt.get("missing_on_youtube")]
+                                   and not clip.receipt.get("missing_on_youtube")
+                                   # Waiting in the app's queue or scheduled on YouTube: not offered again.
+                                   and str(clip.path) not in waiting_paths
+                                   and made_clips.scheduled_publish_at(clip.receipt) is None]
                         if private:
                             picked = gr.CheckboxGroup(choices=private, label="公開する動画")
                             with gr.Row():
@@ -1359,6 +1468,25 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 ai_codex_btn = gr.Button("Codex")
                 ai_claude_btn = gr.Button("Claude")
                 ai_local_btn = gr.Button("ローカル")
+            with gr.Accordion("APIキーで使う（ログインの代わり）", open=False):
+                gr.Markdown(
+                    "<small>ChatGPTやClaudeのアカウントでログインする代わりに、自分のAPIキーで"
+                    "Codex／Claude Codeを動かせます（CLIのインストールは必要、ログインは不要）。"
+                    "キーはこのパソコンの <code>data/api_keys.json</code> にだけ保存され、gitには入りません。"
+                    "保存したキーは環境変数（ANTHROPIC_API_KEY・CODEX_API_KEY・OPENAI_API_KEY）より優先され、"
+                    "利用料金はキーの持ち主のAPIアカウントにかかります。</small>"
+                )
+                api_key_widgets = []
+                for provider, item in api_keys.PROVIDERS.items():
+                    key_status = gr.Markdown("")
+                    with gr.Row():
+                        key_box = gr.Textbox(label=f"{item['label']} のAPIキー", type="password",
+                                             placeholder="貼り付けて「保存」（保存済みのキーは表示しません）",
+                                             scale=4)
+                        key_save = gr.Button("保存", variant="primary", scale=1, min_width=80)
+                        key_test = gr.Button("接続テスト", scale=1, min_width=80)
+                        key_delete = gr.Button("削除", scale=1, min_width=80)
+                    api_key_widgets.append((provider, key_status, key_box, key_save, key_test, key_delete))
             gr.Markdown("### YouTubeアカウント")
             auto_account_md = gr.Markdown("")
             auto_agents_md = gr.Markdown("")
@@ -1407,7 +1535,11 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     demo.load(gcp_status, outputs=[gcp_status_md])
     auto_timer.tick(auto_jobs_view, outputs=auto_job_outputs, show_progress="hidden")
     auto_timer.tick(publish_queue_markdown, outputs=[publish_queue_md], show_progress="hidden")
-    auto_agent.change(on_agent_change, inputs=[auto_agent], outputs=[auto_model, auto_effort])
+    # .input (user picks only): the saved choice restored on load must not be reset to the default model.
+    auto_agent.input(on_agent_change, inputs=[auto_agent], outputs=[auto_model, auto_effort]).then(
+        remember_agent, inputs=[auto_agent, auto_model], show_progress="hidden")
+    auto_model.input(remember_agent, inputs=[auto_agent, auto_model], show_progress="hidden")
+    demo.load(apply_agent_settings, outputs=[auto_agent, auto_model, auto_effort])
     auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
     gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
     gcp_code_btn.click(gcp_submit_code, inputs=[gcp_code], outputs=[gcp_status_md, gcp_code],
@@ -1417,6 +1549,13 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     gcp_pages_btn.click(gcp_open_pages, outputs=[gcp_result_md])
     bundle_btn.click(bundle_client, outputs=[bundle_md])
     demo.load(ai_setup_view, outputs=[ai_status_md])
+    for provider, key_status, key_box, key_save, key_test, key_delete in api_key_widgets:
+        demo.load(partial(api_key_status, provider), outputs=[key_status])
+        key_save.click(partial(api_key_save, provider), inputs=[key_box],
+                       outputs=[key_box, key_status, ai_status_md]).then(summary_status, outputs=[status_md])
+        key_test.click(partial(api_key_test, provider), inputs=[key_box], outputs=[key_status])
+        key_delete.click(partial(api_key_delete, provider), outputs=[key_box, key_status, ai_status_md]).then(
+            summary_status, outputs=[status_md])
     for button, agent in ((ai_codex_btn, "codex"), (ai_claude_btn, "claude"), (ai_local_btn, "local")):
         button.click(lambda agent=agent: ai_prepare(agent), outputs=[ai_status_md]).then(
             summary_status, outputs=[status_md])

@@ -61,12 +61,24 @@ def parse_youtube_live_chat(lines) -> list[list]:
 def fetch_youtube(url: str, *, log: Callable | None = None) -> list[list]:
     from yt_dlp import YoutubeDL
 
+    from . import youtube_block
+
+    youtube_block.check(url)
+    youtube_block.pace(url)
+
     with tempfile.TemporaryDirectory(prefix="cut_chat_") as tmp:
         options = {"quiet": True, "no_warnings": True, "noprogress": True, "skip_download": True, "noplaylist": True,
                    "writesubtitles": True, "subtitleslangs": ["live_chat"],
-                   "outtmpl": str(Path(tmp, "chat.%(ext)s")), "js_runtimes": {"deno": {}, "node": {}}}
+                   "outtmpl": str(Path(tmp, "chat.%(ext)s")), "js_runtimes": {"deno": {}, "node": {}},
+                   **youtube_block.polite_options(url)}
         with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as exc:
+                blocked = youtube_block.note_failure(url, exc)
+                if blocked is not None:
+                    raise blocked from exc
+                raise
             if "live_chat" not in (info.get("subtitles") or {}):
                 raise ChatUnavailable("この動画にはチャットのリプレイがありません")
             if log:

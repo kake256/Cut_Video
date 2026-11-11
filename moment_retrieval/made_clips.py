@@ -12,6 +12,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -102,12 +103,28 @@ def find_clip(path: str | Path) -> MadeClip:
     raise youtube_upload.UploadError(f"作成済みの動画の一覧に見つかりません: {Path(str(path)).name}")
 
 
+def scheduled_publish_at(receipt: dict | None) -> datetime | None:
+    """Local time of a publish scheduled on YouTube (``status.publishAt``) while the clip is not public yet."""
+    if not receipt or receipt.get("privacy_status") == "public" or not receipt.get("publish_at"):
+        return None
+    try:
+        return datetime.fromisoformat(str(receipt["publish_at"]).replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
 def status_label(receipt: dict | None) -> str:
     if not receipt:
         return "未投稿"
     if receipt.get("missing_on_youtube"):
         return "YouTubeに見つかりません（削除済み？）"
-    label = youtube_upload.PRIVACY_LABELS.get(str(receipt.get("privacy_status")), "非公開")
+    if receipt.get("privacy_status") == "public":
+        label = "公開済み"
+    else:
+        label = youtube_upload.PRIVACY_LABELS.get(str(receipt.get("privacy_status")), "非公開")
+        scheduled = scheduled_publish_at(receipt)
+        if scheduled is not None:
+            label = f"公開予約 {scheduled:%m/%d %H:%M}（YouTubeで設定・今は{label}）"
     upload_status = receipt.get("upload_status")
     if upload_status == "uploaded":
         label += "・処理中"
@@ -161,7 +178,8 @@ def change_privacy(path: str | Path, privacy: str, *, service_factory: Callable 
     if not receipt:
         raise youtube_upload.UploadError(f"まだアップロードしていません: {clip.title}")
     status = youtube_upload.set_privacy(receipt["video_id"], privacy, service_factory=service_factory)
-    receipt.update(privacy_status=status, missing_on_youtube=False)
+    # Setting privacy directly replaces a publish time scheduled on YouTube.
+    receipt.update(privacy_status=status, missing_on_youtube=False, publish_at="")
     _write_receipt(clip.path, receipt)
     return receipt
 

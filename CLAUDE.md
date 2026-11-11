@@ -43,3 +43,10 @@
 - 責務境界と実施順序: `docs/ARCHITECTURE_IMPLEMENTATION_PLAN.md`
 - `docs/INTUITIVE_EDITOR_ROADMAP.md` は過去の統合経緯であり、今後の判断では上記2文書を優先する。
 - 現行実装と仕様が異なる場合は、バグ修正・意図的な仕様移行・保留要件のどれかを明記してから実装する。
+
+## ショート動画の字幕方針
+
+- 自動作成の仕上げ（`moment_retrieval/finishing.py`）の字幕は `docs/SHORT_CAPTION_POLICY.md` に従う。見た目の定数・設定の読み込みは `moment_retrieval/short_style.py` に集める。
+- 要点：発話単位の短い1行（言い間違いもそのまま、「。」なし、区切りは半角スペース）／白74px・黒縁9px・y≈1725固定／黄色の補足字幕46px・y≈1597／上部2行タイトル92px（2行目黄）／フッター「配信者 配信（日付）より」／1秒以上の無音カット＋loudnorm。
+- 手書きが要る部分は `data/short_style.json`（全体）と `<クリップ名>.subtitle.json`（1本ごと）で指定する。AIの案より手書きを優先する。
+- 字幕まわりを変えるときは、この方針を変えずに直せるかを先に確かめ、変える場合は文書も同時に更新する。

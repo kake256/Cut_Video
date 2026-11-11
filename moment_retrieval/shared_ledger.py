@@ -105,9 +105,58 @@ def google_drive_roots() -> list[Path]:
     return found
 
 
+def _shared_drive_roots() -> list[Path]:
+    found = []
+    for root in google_drive_roots():
+        for label in ("共有ドライブ", "Shared drives"):
+            base = root.parent / label
+            try:
+                if base.is_dir():
+                    found.extend(path for path in sorted(base.iterdir()) if path.is_dir())
+            except OSError:
+                continue
+    return found
+
+
+def existing_ledger_folders() -> list[Path]:
+    """Folders named like a ledger (…台帳 / CUT ledger) right under My Drive or a shared drive,
+    including one shared by someone else and added to My Drive as a shortcut."""
+    found = []
+    for root in [*google_drive_roots(), *_shared_drive_roots()]:
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for path in children:
+            name = path.name.casefold()
+            try:
+                if ("台帳" in path.name or "ledger" in name) and path.is_dir():
+                    found.append(path)
+            except OSError:
+                continue
+    return found
+
+
+def folder_choices() -> list[str]:
+    """Existing ledger folders first, then the default place to make one."""
+    choices = [str(path) for path in existing_ledger_folders()]
+    choices += [str(root / "CUT台帳") for root in google_drive_roots()]
+    return list(dict.fromkeys(choices))
+
+
 def suggested_folder() -> str:
-    roots = google_drive_roots()
-    return str(roots[0] / "CUT台帳") if roots else ""
+    choices = folder_choices()
+    return choices[0] if choices else ""
+
+
+def auto_setup(name: str) -> Settings:
+    """One click: use an existing ledger folder on Google Drive, or make マイドライブ\\CUT台帳."""
+    folder = suggested_folder()
+    if not folder:
+        raise LedgerSettingsError(
+            "パソコン版Googleドライブ（マイドライブ）が見つかりません。インストールしてログインするか、"
+            "同期フォルダを直接選んでください。")
+    return save_settings(folder, name or default_name())
 
 
 def save_settings(folder: str, name: str, *, create: bool = True) -> Settings:

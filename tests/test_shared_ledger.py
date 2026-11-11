@@ -147,6 +147,21 @@ class LedgerSettingsFormTest(unittest.TestCase):
         self.assertTrue(shared_ledger.clear_settings())
         self.assertFalse(shared_ledger.enabled())
 
+    def test_auto_setup_reuses_a_shared_ledger_folder_or_makes_one(self):
+        drive = self.root / "G" / "マイドライブ"
+        drive.mkdir(parents=True)
+        with patch.object(shared_ledger, "google_drive_roots", return_value=[drive]):
+            saved = shared_ledger.auto_setup("taro")
+            self.assertEqual(saved.folder, drive / "CUT台帳")
+            self.assertTrue(saved.folder.is_dir())
+            shared_ledger.clear_settings()
+            (drive / "CUT台帳").rmdir()
+            (drive / "配信CUT台帳").mkdir()  # a folder someone shared, added as a shortcut
+            self.assertEqual(shared_ledger.auto_setup("hanako").folder, drive / "配信CUT台帳")
+        with patch.object(shared_ledger, "google_drive_roots", return_value=[]):
+            with self.assertRaises(shared_ledger.LedgerSettingsError):
+                shared_ledger.auto_setup("taro")
+
 
 if __name__ == "__main__":
     unittest.main()

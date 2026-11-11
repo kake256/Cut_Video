@@ -551,9 +551,24 @@ def ledger_form_values():
     from moment_retrieval import shared_ledger
 
     saved = shared_ledger.saved_settings()
-    folder = str(saved.get("folder") or "") or shared_ledger.suggested_folder()
+    choices = shared_ledger.folder_choices()
+    folder = str(saved.get("folder") or "") or (choices[0] if choices else "")
+    if folder and folder not in choices:
+        choices = [folder, *choices]
     name = str(saved.get("name") or "") or shared_ledger.default_name()
-    return folder, name, ledger_status()
+    return gr.update(choices=choices, value=folder or None), name, ledger_status()
+
+
+def ledger_auto(name: str):
+    from moment_retrieval import shared_ledger
+
+    try:
+        saved = shared_ledger.auto_setup(name)
+    except shared_ledger.LedgerSettingsError as exc:
+        raise gr.Error(str(exc)) from exc
+    gr.Info(f"共有台帳を {saved.folder} に設定しました。")
+    folder, name, status = ledger_form_values()
+    return folder, name, status
 
 
 def ledger_pick_folder(current: str) -> str:
@@ -581,7 +596,7 @@ def ledger_save(folder: str, name: str):
     except shared_ledger.LedgerSettingsError as exc:
         raise gr.Error(str(exc)) from exc
     gr.Info("共有台帳の設定を保存しました。次のジョブから使います。")
-    return str(saved.folder), saved.name, ledger_status()
+    return ledger_form_values()
 
 
 def ledger_clear():
@@ -1611,17 +1626,23 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             gr.Markdown("### 別の人と分担して切り抜く（共有台帳）")
             ledger_md = gr.Markdown("")
             gr.Markdown(
-                "<small>Googleドライブなど、全員のPCに同期されるフォルダを1つ共有し、各自がその場所と"
-                "自分の名前（人ごとに別の名前）を入れます。他の人が着手した動画、作った・投稿した場面は"
-                "候補から外れます。照合はYouTube／TwitchのURLで行うため、URLから取り込んだ動画だけが対象です。"
-                "設定は <code>data/shared_ledger.json</code> に保存されます。</small>"
+                "<small>他の人が着手した動画、作った・投稿した場面を候補から外します"
+                "（URLから取り込んだ動画が対象）。<b>使い方:</b> 1人目が「Googleドライブで自動設定」を押すと"
+                "マイドライブに「CUT台帳」フォルダができるので、"
+                "<a href='https://drive.google.com/' target='_blank'>Googleドライブ</a>でそのフォルダを相手と共有します"
+                "（編集者）。相手は共有されたフォルダを「ショートカットをドライブに追加」でマイドライブに入れてから、"
+                "同じボタンを押します。名前は人ごとに別にしてください。</small>"
             )
             with gr.Row():
-                ledger_folder = gr.Textbox(label="同期フォルダ", placeholder="G:\\マイドライブ\\CUT台帳", scale=4)
-                ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=110)
+                ledger_name = gr.Textbox(label="自分の名前（英数字がおすすめ）", placeholder="taro", scale=3)
+                ledger_auto_btn = gr.Button("Googleドライブで自動設定", variant="primary", scale=2)
+            with gr.Accordion("フォルダを自分で選ぶ（Googleドライブ以外・別の場所）", open=False):
+                with gr.Row():
+                    ledger_folder = gr.Dropdown(label="同期フォルダ（見つかった候補から選ぶか、直接入力）",
+                                                choices=[], allow_custom_value=True, scale=4)
+                    ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=110)
             with gr.Row():
-                ledger_name = gr.Textbox(label="自分の名前（英数字がおすすめ）", placeholder="taro", scale=4)
-                ledger_save_btn = gr.Button("保存", variant="primary", scale=1, min_width=80)
+                ledger_save_btn = gr.Button("この内容で保存", scale=1, min_width=80)
                 ledger_refresh_btn = gr.Button("状態を更新", scale=1, min_width=80)
                 ledger_clear_btn = gr.Button("オフにする", scale=1, min_width=80)
 
@@ -1651,6 +1672,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     demo.load(ledger_form_values, outputs=[ledger_folder, ledger_name, ledger_md])
     ledger_pick_btn.click(ledger_pick_folder, inputs=[ledger_folder], outputs=[ledger_folder],
                           concurrency_id="ledger-dialog")
+    ledger_auto_btn.click(ledger_auto, inputs=[ledger_name], outputs=[ledger_folder, ledger_name, ledger_md])
     ledger_save_btn.click(ledger_save, inputs=[ledger_folder, ledger_name],
                           outputs=[ledger_folder, ledger_name, ledger_md])
     ledger_refresh_btn.click(ledger_status, outputs=[ledger_md])

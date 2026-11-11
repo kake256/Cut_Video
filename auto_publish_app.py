@@ -421,11 +421,24 @@ def clip_cards() -> list[dict]:
 
 def cards_signature(cards=None) -> str:
     """Changes only when clips are added, uploaded or change privacy, so the cards
-    (and any ticked checkboxes) are not rebuilt on every progress refresh."""
+    (and any ticked checkboxes) are not rebuilt on every progress refresh.
+
+    The publish queue's state per clip is part of it too, so queuing, publishing
+    or failing shows up in the list (and the queued ones leave the checkboxes)."""
+    from moment_retrieval import publish_queue
+
     cards = clip_cards() if cards is None else cards
+    queued = publish_queue.latest_by_path()
+
+    def queue_state(clip):
+        item = queued.get(publish_queue._key(clip.path)) or {}
+        return [item.get("state"), item.get("not_before")]
+
     return json.dumps([
         [card["job_id"], [[str(clip.path)] + [(clip.receipt or {}).get(key) for key in
-                                              ("video_id", "privacy_status", "upload_status", "missing_on_youtube")]
+                                              ("video_id", "privacy_status", "upload_status", "missing_on_youtube",
+                                               "publish_at")]
+                          + queue_state(clip)
                           for clip in card["clips"]]]
         for card in cards
     ], ensure_ascii=False)

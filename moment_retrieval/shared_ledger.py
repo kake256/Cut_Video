@@ -92,17 +92,60 @@ def default_name() -> str:
 
 
 def google_drive_roots() -> list[Path]:
-    """「マイドライブ」/ My Drive folders of Google Drive for desktop on any drive letter."""
+    """「マイドライブ」/ My Drive of Google Drive for desktop: a drive letter (streaming mode)
+    or a folder in the user's home (mirroring mode)."""
+    candidates = [Path(f"{letter}:\\") / label for letter in "GHIJKLMNOPQRSTUVWXYZDEF"
+                  for label in ("マイドライブ", "My Drive")]
+    home = Path.home()
+    candidates += [home / "マイドライブ", home / "My Drive", home / "Google Drive" / "My Drive",
+                   home / "Google ドライブ" / "マイドライブ"]
     found = []
-    for letter in "GHIJKLMNOPQRSTUVWXYZDEF":
-        for label in ("マイドライブ", "My Drive"):
-            path = Path(f"{letter}:\\") / label
-            try:
-                if path.is_dir():
-                    found.append(path)
-            except OSError:
-                continue
+    for path in candidates:
+        try:
+            if path.is_dir():
+                found.append(path)
+        except OSError:
+            continue
     return found
+
+
+def drive_locations() -> list[str]:
+    """Places offered in the 「Googleドライブの場所」 box: My Drive first, then shared drives."""
+    return list(dict.fromkeys(str(path) for path in [*google_drive_roots(), *_shared_drive_roots()]))
+
+
+def ledger_folder_name(drive: str) -> str:
+    """The ledger folder already in that place (e.g. shared by someone else), else CUT台帳."""
+    try:
+        for path in sorted(Path(drive).iterdir()):
+            if ("台帳" in path.name or "ledger" in path.name.casefold()) and path.is_dir():
+                return path.name
+    except (OSError, ValueError):
+        pass
+    return "CUT台帳"
+
+
+def split_folder(folder: str) -> tuple[str, str]:
+    """A saved folder as (place, folder name) when it sits in a Google Drive place."""
+    path = Path(folder)
+    for drive in drive_locations():
+        if path.parent == Path(drive):
+            return drive, path.name
+    return "", ""
+
+
+def save_in_drive(drive: str, folder_name: str, name: str) -> Settings:
+    drive_text = str(drive or "").strip().strip('"')
+    folder_text = str(folder_name or "").strip().strip("\\/") or "CUT台帳"
+    if not drive_text:
+        raise LedgerSettingsError(
+            "Googleドライブの場所を入れてください（パソコン版Googleドライブの「マイドライブ」など）。")
+    if not Path(drive_text).is_dir():
+        raise LedgerSettingsError(
+            f"Googleドライブの場所が見つかりません: {drive_text}（パソコン版Googleドライブが起動しているか確認してください）")
+    if any(ch in folder_text for ch in '\\/:*?"<>|'):
+        raise LedgerSettingsError('台帳フォルダ名に \\ / : * ? " < > | は使えません。')
+    return save_settings(str(Path(drive_text) / folder_text), name)
 
 
 def _shared_drive_roots() -> list[Path]:
@@ -116,47 +159,6 @@ def _shared_drive_roots() -> list[Path]:
             except OSError:
                 continue
     return found
-
-
-def existing_ledger_folders() -> list[Path]:
-    """Folders named like a ledger (…台帳 / CUT ledger) right under My Drive or a shared drive,
-    including one shared by someone else and added to My Drive as a shortcut."""
-    found = []
-    for root in [*google_drive_roots(), *_shared_drive_roots()]:
-        try:
-            children = sorted(root.iterdir())
-        except OSError:
-            continue
-        for path in children:
-            name = path.name.casefold()
-            try:
-                if ("台帳" in path.name or "ledger" in name) and path.is_dir():
-                    found.append(path)
-            except OSError:
-                continue
-    return found
-
-
-def folder_choices() -> list[str]:
-    """Existing ledger folders first, then the default place to make one."""
-    choices = [str(path) for path in existing_ledger_folders()]
-    choices += [str(root / "CUT台帳") for root in google_drive_roots()]
-    return list(dict.fromkeys(choices))
-
-
-def suggested_folder() -> str:
-    choices = folder_choices()
-    return choices[0] if choices else ""
-
-
-def auto_setup(name: str) -> Settings:
-    """One click: use an existing ledger folder on Google Drive, or make マイドライブ\\CUT台帳."""
-    folder = suggested_folder()
-    if not folder:
-        raise LedgerSettingsError(
-            "パソコン版Googleドライブ（マイドライブ）が見つかりません。インストールしてログインするか、"
-            "同期フォルダを直接選んでください。")
-    return save_settings(folder, name or default_name())
 
 
 def save_settings(folder: str, name: str, *, create: bool = True) -> Settings:

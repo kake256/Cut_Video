@@ -125,27 +125,12 @@ def ledger_folder_name(drive: str) -> str:
     return "CUT台帳"
 
 
-def split_folder(folder: str) -> tuple[str, str]:
-    """A saved folder as (place, folder name) when it sits in a Google Drive place."""
-    path = Path(folder)
-    for drive in drive_locations():
-        if path.parent == Path(drive):
-            return drive, path.name
-    return "", ""
-
-
-def save_in_drive(drive: str, folder_name: str, name: str) -> Settings:
-    drive_text = str(drive or "").strip().strip('"')
-    folder_text = str(folder_name or "").strip().strip("\\/") or "CUT台帳"
-    if not drive_text:
-        raise LedgerSettingsError(
-            "Googleドライブの場所を入れてください（パソコン版Googleドライブの「マイドライブ」など）。")
-    if not Path(drive_text).is_dir():
-        raise LedgerSettingsError(
-            f"Googleドライブの場所が見つかりません: {drive_text}（パソコン版Googleドライブが起動しているか確認してください）")
-    if any(ch in folder_text for ch in '\\/:*?"<>|'):
-        raise LedgerSettingsError('台帳フォルダ名に \\ / : * ? " < > | は使えません。')
-    return save_settings(str(Path(drive_text) / folder_text), name)
+def suggested_folder() -> str:
+    """CUT台帳 in My Drive, or the ledger folder already there (e.g. one shared by someone else)."""
+    locations = drive_locations()
+    if not locations:
+        return ""
+    return str(Path(locations[0]) / ledger_folder_name(locations[0]))
 
 
 def _shared_drive_roots() -> list[Path]:

@@ -147,22 +147,15 @@ class LedgerSettingsFormTest(unittest.TestCase):
         self.assertTrue(shared_ledger.clear_settings())
         self.assertFalse(shared_ledger.enabled())
 
-    def test_save_in_drive_makes_the_folder_and_splits_it_back(self):
+    def test_suggested_folder_prefers_a_shared_ledger_folder_in_my_drive(self):
         drive = self.root / "G" / "マイドライブ"
         drive.mkdir(parents=True)
         with patch.object(shared_ledger, "google_drive_roots", return_value=[drive]):
-            self.assertEqual(shared_ledger.drive_locations(), [str(drive)])
-            self.assertEqual(shared_ledger.ledger_folder_name(str(drive)), "CUT台帳")
-            saved = shared_ledger.save_in_drive(str(drive), "", "taro")
-            self.assertEqual(saved.folder, drive / "CUT台帳")
-            self.assertTrue(saved.folder.is_dir())
-            self.assertEqual(shared_ledger.split_folder(str(saved.folder)), (str(drive), "CUT台帳"))
-            (drive / "CUT台帳").rmdir()
+            self.assertEqual(shared_ledger.suggested_folder(), str(drive / "CUT台帳"))
             (drive / "配信CUT台帳").mkdir()  # a folder someone shared, added as a shortcut
-            self.assertEqual(shared_ledger.ledger_folder_name(str(drive)), "配信CUT台帳")
-        for bad_drive, bad_name in ((str(self.root / "missing"), "CUT台帳"), ("", "CUT台帳"), (str(drive), "a/b")):
-            with self.assertRaises(shared_ledger.LedgerSettingsError):
-                shared_ledger.save_in_drive(bad_drive, bad_name, "taro")
+            self.assertEqual(shared_ledger.suggested_folder(), str(drive / "配信CUT台帳"))
+        with patch.object(shared_ledger, "google_drive_roots", return_value=[]):
+            self.assertEqual(shared_ledger.suggested_folder(), "")
 
 
 if __name__ == "__main__":

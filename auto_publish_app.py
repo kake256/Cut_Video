@@ -1653,7 +1653,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             with gr.Accordion("Googleドライブ以外の同期フォルダを使う（OneDrive・Dropboxなど）", open=False):
                 with gr.Row():
                     ledger_folder = gr.Textbox(label="同期フォルダ（台帳フォルダそのものの場所）",
-                                               placeholder=r"C:\Users\taro\OneDrive\CUT台帳", scale=4)
+                                               placeholder=r"D:\OneDrive\CUT台帳", scale=4)
                     ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=110)
                 ledger_save_btn = gr.Button("この場所で保存して使う")
             with gr.Row():

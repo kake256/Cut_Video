@@ -133,14 +133,15 @@ class RenderPlanTest(unittest.TestCase):
         self.assertIn(r"\fscx118", ass.split("キレた")[0].splitlines()[-1])
         self.assertNotIn(r"\fscx118", [line for line in ass.splitlines() if "落ち着く" in line][0])
         self.assertIn(r"Title,,0,0,0,,{\an5\pos(540,150)\c&H3CDCFF&}引き", ass)
-        self.assertIn(r"Note,,0,0,0,,{\an5\pos(540,1597)}※補足", ass)
+        self.assertIn(r"Note,,0,0,0,,{\an5\pos(540,1300)}※補足", ass)
         self.assertIn(r"Footer,,0,0,0,,{\an5\pos(540,1870)}ゲラサブロウ", ass)
-        self.assertIn(r"{\an5\pos(540,1725)}落ち着く", ass)
+        self.assertIn(r"{\an5\pos(540,1430)}落ち着く", ass)
         self.assertIn("Style: Default,Yu Gothic UI,74,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,"
                       "100,100,0,0,1,9,0,5", ass)
         graph = finishing.build_filter(1080, 1920, plan.sound_effects)
         self.assertIn("adelay=1000|1000", graph)
-        self.assertIn("alimiter", graph)
+        # The limiter must neither turn the mix back up to 0 dBFS nor delay it against the picture.
+        self.assertIn("alimiter=limit=0.95:level=disabled:latency=enabled", graph)
         self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11", graph)
         self.assertNotIn("zoompan", graph)
         self.assertNotIn("loudnorm", finishing.build_filter(1080, 1920, [], loudnorm=False))
@@ -150,6 +151,73 @@ class RenderPlanTest(unittest.TestCase):
         self.assertIn("[vs1]trim=start=3.500:end=6.000", graph)
         self.assertIn("concat=n=2:v=1:a=1[cv][ca]", graph)
         self.assertIn("[cv]split=2[bg_src][fg_src]", graph)
+
+    def test_two_pass_loudnorm_is_linear_and_keeps_the_true_peak(self):
+        quiet = {"input_i": -30.0, "input_tp": -20.0, "input_lra": 6.0, "input_thresh": -40.0, "target_offset": 0.3}
+        level = finishing.loudnorm_filter(quiet)
+        self.assertTrue(level.startswith("loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-30.00:measured_TP=-20.00"))
+        self.assertIn(":linear=true", level)
+        # +14 dB would push a -3 dBTP peak far over -1.5: limit it first, LRA never below the clip's own.
+        peaky = dict(quiet, input_tp=-3.0, input_lra=14.2)
+        level = finishing.loudnorm_filter(peaky)
+        self.assertTrue(level.startswith("alimiter=limit=0.1"))
+        self.assertIn("LRA=14.3:", level)
+        self.assertIn("measured_TP=-16.00", level)  # -1.5 - 14 - 0.5
+        graph = finishing.build_filter(1080, 1920, [], loudnorm=quiet)
+        self.assertIn("measured_I=-30.00", graph)
+
+    def test_audio_only_join_for_the_measuring_pass(self):
+        parts, label = finishing.audio_join_filter([(0.0, 2.0), (3.5, 6.0)])
+        self.assertEqual("[ca]", label)
+        self.assertEqual("[a0][a1]concat=n=2:v=0:a=1[ca]", parts[-1])
+        self.assertEqual(([], "[0:a]"), finishing.audio_join_filter(None))
+
+    def test_clip_start_moves_to_the_nearest_pause(self):
+        import numpy as np
+
+        rate = 16000
+        rng = np.random.default_rng(0)
+
+        def clip(*spans, seconds=1.6):
+            x = rng.normal(0, 0.0005, int(seconds * rate))  # room noise
+            for a, b in spans:
+                x[int(a * rate):int(b * rate)] += 0.3 * np.sin(np.arange(int((b - a) * rate)) * 0.2)
+            return x
+
+        zero = rate  # the start is 1.0 s into the samples
+        # A word that began 0.3 s before the start: open just before it.
+        shift = finishing.quiet_start_shift(clip((0.7, 1.5)), rate, zero)
+        self.assertTrue(-0.35 <= shift <= -0.29, shift)
+        # Only the last 0.15 s of the previous sentence: skip it.
+        shift = finishing.quiet_start_shift(clip((0.2, 1.15), (1.45, 1.6)), rate, zero)
+        self.assertTrue(0.15 <= shift <= 0.2, shift)
+        # Already in a pause: unchanged.
+        self.assertEqual(0.0, finishing.quiet_start_shift(clip((1.2, 1.5)), rate, zero))
+        self.assertEqual(0.0, finishing.quiet_start_shift(np.zeros(10), rate, 0))
+
+    def test_moved_start_moves_effects_notes_and_captions_with_it(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        plan = FinishPlan(hook_text="引き", sound_effects=[(2.0, "pop")], notes=[(1.0, 3.0, "※補足")])
+        words = [Word(0.1, 0.5, "最初"), Word(2.0, 2.4, "ポン")]
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(finishing, "speech_start_shift", return_value=-0.5), \
+                patch.object(finishing, "measure_loudness", return_value=None), \
+                patch.object(finishing.subprocess, "run",
+                             side_effect=lambda command, cwd, **_: calls.append(
+                                 (command, Path(cwd, "finish.ass").read_text(encoding="utf-8")))):
+            result = finishing.render(Path(tmp, "src.mp4"), 10.0, 20.0, words, plan, Path(tmp, "out.mp4"),
+                                      settings={"cut_silence": False})
+        command, ass = calls[0]
+        self.assertEqual("9.500", command[command.index("-ss") + 1])  # opens 0.5 s earlier
+        self.assertEqual(10.5, result.duration)
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("adelay=2500|2500", graph)  # the effect stays on its word
+        self.assertIn("Dialogue: 1,0:00:01.50,0:00:03.50,Note", ass)
+        self.assertIn("Dialogue: 0,0:00:00.55,", ass)  # the first caption starts with the first word
 
     def test_captions_keep_a_short_breath_as_a_space(self):
         words = [Word(0.0, 0.3, "嘘"), Word(0.3, 0.6, "だろ"), Word(0.9, 1.2, "嘘か"), Word(1.2, 1.5, "これ。")]

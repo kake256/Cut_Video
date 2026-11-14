@@ -152,8 +152,9 @@ def pace(url: str) -> None:
         _last_request = time.monotonic()
 
 
-def _backoff(attempt: int) -> float:
-    return min(5.0 * (2 ** max(0, attempt)), 120.0)  # 5, 10, 20, 40, 80, 120 s
+def _backoff(n: int) -> float:
+    # yt-dlp calls retry sleep functions with the keyword ``n`` (attempts so far).
+    return min(5.0 * (2 ** max(0, n)), 120.0)  # 5, 10, 20, 40, 80, 120 s
 
 
 def polite_options(url: str) -> dict:

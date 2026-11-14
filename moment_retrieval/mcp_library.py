@@ -19,7 +19,7 @@ import unicodedata
 from pathlib import Path
 from typing import Callable
 
-from moment_retrieval import config, db, relisten
+from moment_retrieval import config, db, js_suitability, relisten
 from moment_retrieval.highlight_analysis import (
     AnalysisValidationError,
     fit_boundary,
@@ -261,6 +261,8 @@ class LibraryTools:
                     "tags": [str(tag).strip() for tag in item.get("tags", []) if str(tag).strip()],
                     "boundary_expanded": anchor_duration is not None and duration > anchor_duration + 1e-6,
                     "boundary_warning": duration < min_duration_sec,
+                    # js_score / js_reason when the JS-drawn Short asked for them; {} otherwise.
+                    "metadata": js_suitability.clean(item),
                 })
             from .used_ranges import clash_reason, combined, overlaps
 

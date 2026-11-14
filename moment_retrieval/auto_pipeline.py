@@ -64,6 +64,9 @@ class AutoJob:
     # Make each clip as a JS-drawn Short (jsdraw_short, Claude API) instead of the normal finish.
     jsdraw: bool = False
     jsdraw_model: str = "fable"
+    # How many of the picked clips get JS drawing (top js_score); the rest get the normal
+    # finish.  0 = every clip (job files saved before this setting existed).
+    jsdraw_count: int = 0
     model: str = ""
     effort: str = ""
     state: str = "queued"
@@ -260,7 +263,7 @@ class AutoPipeline:
                max_duration_sec: float = SHORTS_MAX_SEC, layout: str = "blur", upload: bool = True,
                model: str = "", effort: str = "", link_only: bool = False, focus: str = "",
                finish: bool = False, privacy: str = "private", preload_transcript: bool = True,
-               jsdraw: bool = False, jsdraw_model: str = "fable") -> AutoJob:
+               jsdraw: bool = False, jsdraw_model: str = "fable", jsdraw_count: int = 3) -> AutoJob:
         if agent not in agent_runner.PIPELINE_AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
         if agent == agent_runner.API_AGENT:
@@ -284,6 +287,8 @@ class AutoPipeline:
             finish = True  # the JS-drawn Short is made in the finishing step, clip by clip
         if not 1 <= int(clip_count) <= 10:
             raise PipelineError("切り抜き本数は1〜10本で指定してください。")
+        # At least one, never more than the clips asked for.
+        jsdraw_count = max(1, min(int(jsdraw_count or 1), int(clip_count)))
         if not 5 <= float(min_duration_sec) <= float(max_duration_sec) <= SHORTS_MAX_SEC:
             raise PipelineError(f"長さは 5秒 <= 最短 <= 最長 <= {SHORTS_MAX_SEC}秒（ショートの上限）で指定してください。")
         if layout not in {"blur", "crop"}:
@@ -296,7 +301,7 @@ class AutoPipeline:
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
             model=model, effort=effort, link_only=bool(link_only), focus=clean_focus(focus), finish=bool(finish),
             privacy=privacy, preload_transcript=bool(preload_transcript),
-            jsdraw=bool(jsdraw) and not link_only, jsdraw_model=jsdraw_model,
+            jsdraw=bool(jsdraw) and not link_only, jsdraw_model=jsdraw_model, jsdraw_count=jsdraw_count,
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -798,7 +803,8 @@ class AutoPipeline:
                         picks.append({"start_segment_id": int(candidate["start_segment_id"]),
                                       "end_segment_id": int(candidate["end_segment_id"]),
                                       "title": str(candidate["title"]), "reason": str(candidate["reason"] or "-"),
-                                      "summary": str(candidate.get("summary") or "")})
+                                      "summary": str(candidate.get("summary") or ""),
+                                      **(candidate.get("metadata") or {})})
         finally:
             conn.close()
         try:
@@ -939,7 +945,8 @@ class AutoPipeline:
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
                                      used_ranges=tuple(used), focus=job.focus,
                                      hints=prompt_section(hints) + performance,
-                                     confirm_captions=not job.finish, want_summary=job.jsdraw, **preloaded),
+                                     confirm_captions=not job.finish, want_summary=job.jsdraw,
+                                     want_js_score=job.jsdraw, **preloaded),
             register_process=register,
             model=job.model,
             effort=job.effort,
@@ -972,6 +979,7 @@ class AutoPipeline:
                 job.video_id, clip_count=job.clip_count, focus=job.focus, hints=hints,
                 min_duration_sec=job.min_duration_sec, max_duration_sec=job.max_duration_sec,
                 log=lambda message: self._log(job, message, replace_progress=True), want_summary=job.jsdraw,
+                want_js_score=job.jsdraw,
             )
             self._log(job, f"API料金: 約{result['cost_usd']:.3f}ドル（入力{result['usage'].get('input_tokens', 0)}"
                            f"・出力{result['usage'].get('output_tokens', 0)}トークン、{result['seconds']:g}秒"
@@ -1036,10 +1044,12 @@ class AutoPipeline:
         workers = max(1, min(limit, len(job.outputs)))
         self._log(job, "仕上げ（2行タイトル・発話単位の字幕・補足字幕・無音カット・音量調整・効果音）を行います"
                        + (f"（{workers}本ずつ並行）。" if workers > 1 else "。"))
+        js_picks = self._jsdraw_picks(job) if job.jsdraw else {}
         # Most of a clip's finishing is waiting for the AI's plan, so clips run side by side.
         try:
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cut_finish") as pool:
-                futures = [pool.submit(self._finish_one, job, index, output)
+                futures = [pool.submit(self._finish_one, job, index, output,
+                                       **({"js_pick": js_picks.get(output)} if job.jsdraw else {}))
                            for index, output in enumerate(job.outputs, start=1)]
                 try:
                     for future in futures:
@@ -1055,13 +1065,41 @@ class AutoPipeline:
             job.outputs = [output for output in job.outputs if output not in missing]
             self._log(job, f"  動画を作れなかった{len(missing)}本は投稿しません。")
 
-    def _finish_one(self, job: AutoJob, index: int, output: str) -> None:
+    def _jsdraw_picks(self, job: AutoJob) -> dict[str, dict]:
+        """{output: {"js_score", "js_reason"}} for the clips JS drawing gets (top jsdraw_count by
+        the picking AI's js_score; proposal order on ties or without scores).  Logged once."""
+        from . import js_suitability, jsdraw_pipeline
+
+        infos = []
+        for output in job.outputs:
+            try:
+                candidate = jsdraw_pipeline.candidate_for(Path(output), job.highlight_run_id)
+            except Exception:  # unreadable metadata: no score, proposal order decides
+                candidate = None
+            infos.append({"js_score": js_suitability.score_of(candidate),
+                          "js_reason": str(((candidate or {}).get("metadata") or {}).get("js_reason") or "")})
+        chosen = js_suitability.pick([info["js_score"] for info in infos], job.jsdraw_count)
+        if not chosen:
+            return {}
+        scored = any(info["js_score"] is not None for info in infos)
+        self._log(job, f"JS描画は{len(chosen)}/{len(job.outputs)}本"
+                       + ("（js_scoreの高い順）:" if scored else "（スコアがないため提案順）:"))
+        for i in chosen:
+            info = infos[i]
+            score = "スコアなし" if info["js_score"] is None else f"{info['js_score']}点"
+            self._log(job, f"  {i + 1}本目 {Path(job.outputs[i]).stem}: {score}"
+                           + (f"・{info['js_reason']}" if info["js_reason"] else ""))
+        return {job.outputs[i]: infos[i] for i in chosen}
+
+    def _finish_one(self, job: AutoJob, index: int, output: str, js_pick: dict | None | bool = True) -> None:
+        """``js_pick``: this clip's score info when JS drawing got it, None when it did not;
+        the default (True) keeps the old every-clip behaviour for direct callers."""
         from . import finishing
 
         self._check_cancel(job)
         with self.lock:
             section = (self.clip_sources.get(job.job_id) or {}).get("files", {}).get(output)
-        if job.jsdraw:
+        if job.jsdraw and js_pick:
             from . import jsdraw_pipeline
 
             try:
@@ -1069,6 +1107,7 @@ class AutoPipeline:
                     Path(output), model=job.jsdraw_model, highlight_run_id=job.highlight_run_id, section=section,
                     backend=jsdraw_pipeline.backend_for(job.agent), codex_model=job.model if job.agent == "codex" else "",
                     log=lambda message: self._log(job, f"  {index}本目（JS描画）: {message}", replace_progress=True),
+                    suitability=js_pick if isinstance(js_pick, dict) else None,
                 )
                 cost = (f"API料金 約{record['usd']}ドル" if record.get("backend", "api") == "api" else
                         "ログインの枠" + (f"・API換算 約{record['usd_equivalent']}ドル"

@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from . import db
+from . import db, js_suitability
 from .highlight_analysis import AnalysisValidationError, fit_boundary, suppress_overlaps, valid_source_segments
 from .used_ranges import clash_reason, overlaps, prompt_lines
 
@@ -58,13 +58,21 @@ OUTPUT_SCHEMA = {
 }
 
 
-def output_schema(want_summary: bool = False) -> dict:
-    """``OUTPUT_SCHEMA``, plus a required ``summary`` (synopsis) when the JS-drawn Short needs one."""
-    if not want_summary:
+def output_schema(want_summary: bool = False, want_js_score: bool = False) -> dict:
+    """``OUTPUT_SCHEMA``, plus a required ``summary`` (synopsis) when the JS-drawn Short needs one,
+    and a required ``js_score`` / ``js_reason`` (how well the clip suits JS drawing) when asked."""
+    if not want_summary and not want_js_score:
         return OUTPUT_SCHEMA
     item = OUTPUT_SCHEMA["properties"]["clips"]["items"]
-    item = {**item, "properties": {**item["properties"], "summary": {"type": "string"}},
-            "required": [*item["required"], "summary"]}
+    properties, required = dict(item["properties"]), list(item["required"])
+    if want_summary:
+        properties["summary"] = {"type": "string"}
+        required.append("summary")
+    if want_js_score:
+        properties["js_score"] = {"type": "integer", "description": "JS描画への向き具合 0〜100"}
+        properties["js_reason"] = {"type": "string"}
+        required += ["js_score", "js_reason"]
+    item = {**item, "properties": properties, "required": required}
     return {**OUTPUT_SCHEMA, "properties": {"clips": {"type": "array", "items": item}}}
 
 
@@ -175,7 +183,8 @@ def system_prompt() -> str:
 
 
 def user_prompt(transcript: str, *, clip_count: int, min_sec: float, max_sec: float,
-                used: Sequence[dict] = (), focus: str = "", hints: str = "", want_summary: bool = False) -> str:
+                used: Sequence[dict] = (), focus: str = "", hints: str = "", want_summary: bool = False,
+                want_js_score: bool = False) -> str:
     task = (
         f"利用者が探している場面: 「{focus}」。これに当てはまる場面だけを、単体で意味が通り冒頭で引き込めるものから"
         f"最大{clip_count}件選んでください。当てはまる場面が少なければ件数未満でよく、当てはまらない場面で数を埋めないでください。\n"
@@ -193,7 +202,8 @@ def user_prompt(transcript: str, *, clip_count: int, min_sec: float, max_sec: fl
         "- start は切り抜きの最初の行の時刻、end は最後に使う行の『次の行』の時刻を、行に書かれた h:mm:ss のまま書く。\n"
         "- 話の前提が分かる位置から始め、オチや区切りまで含める。\n"
         f"- title は{PROMPT_TITLE_CHARS}文字以内で内容が分かる日本語、reason は選んだ理由を1〜2文で。\n"
-        + ("- summary に話の流れが分かる1〜2文のあらすじを書く（JS描画ショートの台本に使う）。\n" if want_summary else "") +
+        + ("- summary に話の流れが分かる1〜2文のあらすじを書く（JS描画ショートの台本に使う）。\n" if want_summary else "")
+        + (f"- {js_suitability.PROMPT_RULE}\n" if want_js_score else "") +
         "- 良い順に並べる。文字起こし本文はそのまま長く引用しない。\n"
     )
 
@@ -251,6 +261,7 @@ def check_proposals(segments: Sequence[dict], items: Sequence[dict], *, used: Se
         duration = boundary["end_sec"] - boundary["start_sec"]
         clip = {
             **boundary, "title": title, "reason": reason, "summary": str(item.get("summary") or "").strip()[:300],
+            **js_suitability.clean(item),
             "asked_start": item.get("start"), "asked_end": item.get("end"),
             "boundary_expanded": duration > anchor + 1e-6,
             "boundary_warning": duration < min_sec,
@@ -363,7 +374,8 @@ def select_clips(video_id: str, clip_count: int = 3, used_ranges: Sequence[dict]
                  hints: str | None = None, *, min_duration_sec: float = MIN_DURATION_SEC,
                  max_duration_sec: float = MAX_DURATION_SEC, client=None,
                  segments: Sequence[dict] | None = None,
-                 log: Callable[[str], None] | None = None, want_summary: bool = False) -> dict:
+                 log: Callable[[str], None] | None = None, want_summary: bool = False,
+                 want_js_score: bool = False) -> dict:
     """One API call (plus at most one retry). ``hints=None`` fills in stored excitement cues.
 
     The already-posted ranges in the library are always checked, as in cut_propose_clips;
@@ -380,7 +392,7 @@ def select_clips(video_id: str, clip_count: int = 3, used_ranges: Sequence[dict]
     client = client or _client()
     messages = [{"role": "user", "content": user_prompt(
         transcript, clip_count=clip_count, min_sec=min_duration_sec, max_sec=max_duration_sec,
-        used=used, focus=focus, hints=hints, want_summary=want_summary)}]
+        used=used, focus=focus, hints=hints, want_summary=want_summary, want_js_score=want_js_score)}]
     attempts, total = [], {}
     kept: list[dict] = []
     for attempt in (1, 2):
@@ -389,7 +401,7 @@ def select_clips(video_id: str, clip_count: int = 3, used_ranges: Sequence[dict]
         call_started = time.time()
         response = client.messages.create(
             model=MODEL, max_tokens=MAX_TOKENS, system=system_prompt(), messages=messages,
-            output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": output_schema(want_summary)}},
+            output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": output_schema(want_summary, want_js_score)}},
         )
         usage = _usage(response)
         for key, value in usage.items():
@@ -415,7 +427,8 @@ def select_clips(video_id: str, clip_count: int = 3, used_ranges: Sequence[dict]
         "effort": EFFORT,
         "clips": [{key: clip[key] for key in (
             "start_sec", "end_sec", "start_segment_id", "end_segment_id", "title", "reason", "summary",
-            "boundary_expanded", "boundary_warning", "title_over_prompt_limit")} for clip in kept],
+            "boundary_expanded", "boundary_warning", "title_over_prompt_limit", "js_score", "js_reason")
+            if key in clip} for clip in kept],
         "attempts": attempts,
         "retried": len(attempts) > 1,
         "usage": total,
@@ -445,7 +458,8 @@ def save_proposals(video_id: str, result: dict, *, min_duration_sec: float = MIN
         return library.propose_clips(
             video_id, revision,
             [{"start_segment_id": int(clip["start_segment_id"]), "end_segment_id": int(clip["end_segment_id"]),
-              "title": clip["title"], "reason": clip["reason"], "summary": clip.get("summary") or ""}
+              "title": clip["title"], "reason": clip["reason"], "summary": clip.get("summary") or "",
+              **js_suitability.clean(clip)}
              for clip in result["clips"]],
             min_duration_sec=min_duration_sec, max_duration_sec=max_duration_sec,
             note=f"API 1回呼び出し（{result.get('model', MODEL)}・約{result.get('cost_usd', 0):.3f}ドル）",

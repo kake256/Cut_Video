@@ -102,9 +102,10 @@ TOOLS = [
 
 _TRANSFER_FLAG = {"type": "boolean", "const": True}
 _VIDEO_ID = {"type": "string", "maxLength": 80}
-_PROPOSAL = {
-    "type": "object",
-    "properties": {
+def proposal_schema(js_score: bool = False) -> dict:
+    """One cut_propose_clips candidate.  ``js_score`` / ``js_reason`` (how well the clip suits a
+    JS-drawn Short) exist only when the auto-publish run asked for them (CUT_VIDEO_JS_SCORE=1)."""
+    properties = {
         "start_segment_id": {"type": "integer", "minimum": 0, "maximum": 2_000_000_000},
         "end_segment_id": {"type": "integer", "minimum": 0, "maximum": 2_000_000_000},
         "title": {"type": "string", "maxLength": 60},
@@ -112,10 +113,17 @@ _PROPOSAL = {
         "summary": {"type": "string", "maxLength": 300},
         "category": {"type": "string", "maxLength": 30},
         "tags": {"type": "array", "maxItems": 5, "items": {"type": "string", "maxLength": 30}},
-    },
-    "required": ["start_segment_id", "end_segment_id", "title", "reason"],
-    "additionalProperties": False,
-}
+    }
+    required = ["start_segment_id", "end_segment_id", "title", "reason"]
+    if js_score:
+        properties["js_score"] = {"type": "integer", "minimum": 0, "maximum": 100,
+                                  "description": "JS描画ショートへの向き具合（0〜100）"}
+        properties["js_reason"] = {"type": "string", "maxLength": 120}
+        required += ["js_score", "js_reason"]
+    return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+
+
+_PROPOSAL = proposal_schema(os.environ.get("CUT_VIDEO_JS_SCORE") == "1")
 LIBRARY_TOOLS = [
     {
         "name": "cut_list_videos",

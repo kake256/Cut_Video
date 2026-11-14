@@ -60,6 +60,11 @@ _LIBRARY_CLOSE_JS = """() => {
 # Operable panels get a light gray fill; fields inside stay white so they read as inputs.
 APP_CSS = """
 #auto-library .icon-wrap { cursor: pointer; }
+/* 「JS本数」 sits on the checkbox's line: label and a small box side by side, no tall card. */
+#auto-jsdraw-count { padding: 4px 8px; }
+#auto-jsdraw-count label { display: flex; align-items: center; gap: 8px; }
+#auto-jsdraw-count label > span { margin: 0; white-space: nowrap; }
+#auto-jsdraw-count input { width: 52px; min-width: 0; padding: 4px 6px; }
 .gradio-container {
     --body-background-fill: #ffffff;
     --block-background-fill: #f1f3f5;
@@ -1009,6 +1014,54 @@ def remember_jsdraw(enabled: bool, model: str) -> None:
         pass
 
 
+JSDRAW_DEFAULT_COUNT = 3
+
+
+def _clamp_jsdraw_count(count, clip_count=10) -> int:
+    """1 <= JS本数 <= 本数 (a bad value falls back to the default)."""
+    try:
+        clip_count = max(1, min(10, int(float(clip_count))))
+    except (TypeError, ValueError):
+        clip_count = 10
+    try:
+        count = int(float(count))
+    except (TypeError, ValueError):
+        count = JSDRAW_DEFAULT_COUNT
+    return max(1, min(count, clip_count))
+
+
+def _saved_jsdraw_count() -> int:
+    try:
+        saved = json.loads(_ui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    return _clamp_jsdraw_count((saved if isinstance(saved, dict) else {}).get("jsdraw_count", JSDRAW_DEFAULT_COUNT))
+
+
+def remember_jsdraw_count(count, clip_count=10) -> None:
+    try:
+        _write_ui_settings({"jsdraw_count": _clamp_jsdraw_count(count, clip_count)})
+    except OSError:
+        pass
+
+
+def jsdraw_count_update(enabled: bool, count, clip_count):
+    """「JS本数」: shown only while the box is checked, never above 本数."""
+    return gr.update(visible=bool(enabled), maximum=_clamp_jsdraw_count(clip_count),
+                     value=_clamp_jsdraw_count(count, clip_count))
+
+
+def apply_jsdraw_count_settings(clip_count=3):
+    enabled = _saved_jsdraw()[0] and _jsdraw_available(_saved_agent()[0])
+    return jsdraw_count_update(enabled, _saved_jsdraw_count(), clip_count)
+
+
+def _jsdraw_available(agent: str) -> bool:
+    from moment_retrieval import jsdraw_pipeline
+
+    return jsdraw_pipeline.available_for(agent)
+
+
 def jsdraw_controls(agent: str, enabled: bool):
     """(checkbox, 描画モデル, note) for the chosen highlight AI: the drawing follows that AI.
 
@@ -1119,7 +1172,8 @@ def _require_agent_ready(agent: str) -> None:
 
 def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
                 min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False,
-                preload_transcript: bool = True, jsdraw: bool = False, jsdraw_model: str = JSDRAW_DEFAULT_MODEL):
+                preload_transcript: bool = True, jsdraw: bool = False, jsdraw_model: str = JSDRAW_DEFAULT_MODEL,
+                jsdraw_count=JSDRAW_DEFAULT_COUNT):
     # Only the input that is shown counts; a leftover value in the hidden one is ignored.
     if mode == "library":
         lines = [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
@@ -1142,6 +1196,7 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
                 model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
                 finish=bool(finish), preload_transcript=bool(preload_transcript),
                 jsdraw=bool(jsdraw), jsdraw_model=jsdraw_model or JSDRAW_DEFAULT_MODEL,
+                jsdraw_count=_clamp_jsdraw_count(jsdraw_count, clip_count),
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -1165,7 +1220,7 @@ def export_shared_index(video_id: str, include_url: bool):
 def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
                         min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False,
                         preload_transcript: bool = True, jsdraw: bool = False,
-                        jsdraw_model: str = JSDRAW_DEFAULT_MODEL):
+                        jsdraw_model: str = JSDRAW_DEFAULT_MODEL, jsdraw_count=JSDRAW_DEFAULT_COUNT):
     """Import a share zip; optionally start a job that downloads, relinks and clips it."""
     from moment_retrieval import db, source_origin
     from moment_retrieval.share import ShareError, import_index
@@ -1199,6 +1254,7 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
                 link_only=not start_clipping, focus=focus or "", finish=bool(finish),
                 preload_transcript=bool(preload_transcript),
                 jsdraw=bool(jsdraw) and bool(start_clipping), jsdraw_model=jsdraw_model or JSDRAW_DEFAULT_MODEL,
+                jsdraw_count=_clamp_jsdraw_count(jsdraw_count, clip_count),
             )
         except PipelineError as exc:
             log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
@@ -1588,6 +1644,11 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 auto_jsdraw_model = gr.Radio(
                     choices=JSDRAW_MODEL_CHOICES, value=JSDRAW_DEFAULT_MODEL, show_label=False, container=False,
                     visible="hidden", scale=4, min_width=360,
+                )
+                # How many of the picks get JS drawing (the AI's js_score decides which).
+                auto_jsdraw_count = gr.Number(
+                    value=JSDRAW_DEFAULT_COUNT, minimum=1, maximum=3, step=1, precision=0, label="JS本数",
+                    visible=False, scale=0, min_width=140, elem_id="auto-jsdraw-count",
                 )
             auto_jsdraw_note = gr.Markdown("", visible=False, container=False, elem_id="auto-jsdraw-note")
             auto_focus = gr.Textbox(
@@ -2003,13 +2064,22 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         remember_agent, inputs=[auto_agent, auto_model], show_progress="hidden")
     auto_model.input(remember_agent, inputs=[auto_agent, auto_model], show_progress="hidden")
     demo.load(apply_agent_settings, outputs=[auto_agent, auto_model, auto_effort])
+    jsdraw_count_args = {"inputs": [auto_jsdraw, auto_jsdraw_count, auto_clip_count],
+                         "outputs": [auto_jsdraw_count], "show_progress": "hidden"}
     auto_jsdraw.input(on_jsdraw_change, inputs=[auto_jsdraw, auto_agent],
                       outputs=[auto_jsdraw_model, auto_jsdraw_note]).then(
-        remember_jsdraw, inputs=[auto_jsdraw, auto_jsdraw_model], show_progress="hidden")
+        remember_jsdraw, inputs=[auto_jsdraw, auto_jsdraw_model], show_progress="hidden").then(
+        jsdraw_count_update, **jsdraw_count_args)
     auto_agent.input(jsdraw_controls, inputs=[auto_agent, auto_jsdraw],
-                     outputs=[auto_jsdraw, auto_jsdraw_model, auto_jsdraw_note])
+                     outputs=[auto_jsdraw, auto_jsdraw_model, auto_jsdraw_note]).then(
+        jsdraw_count_update, **jsdraw_count_args)
     auto_jsdraw_model.input(remember_jsdraw, inputs=[auto_jsdraw, auto_jsdraw_model], show_progress="hidden")
     demo.load(apply_jsdraw_settings, outputs=[auto_jsdraw, auto_jsdraw_model, auto_jsdraw_note])
+    demo.load(apply_jsdraw_count_settings, inputs=[auto_clip_count], outputs=[auto_jsdraw_count])
+    # Only what the user types is saved; lowering 本数 caps the shown value without forgetting it.
+    auto_jsdraw_count.input(remember_jsdraw_count, inputs=[auto_jsdraw_count, auto_clip_count],
+                            show_progress="hidden")
+    auto_clip_count.change(jsdraw_count_update, **jsdraw_count_args)
     auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
     gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
     gcp_code_btn.click(gcp_submit_code, inputs=[gcp_code], outputs=[gcp_status_md, gcp_code],
@@ -2053,7 +2123,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         auto_submit,
         inputs=[auto_mode, auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
                 auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish, auto_preload, auto_jsdraw,
-                auto_jsdraw_model],
+                auto_jsdraw_model, auto_jsdraw_count],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
     auto_mode.change(on_mode_change, inputs=[auto_mode],
@@ -2077,7 +2147,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         import_shared_index,
         inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
                 auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish, auto_preload, auto_jsdraw,
-                auto_jsdraw_model],
+                auto_jsdraw_model, auto_jsdraw_count],
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)

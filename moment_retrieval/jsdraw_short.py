@@ -432,14 +432,34 @@ def render(workdir: Path, scene: Path, out_mp4: Path, progress: Progress) -> flo
     finally:
         sc.close()
     off = json.loads((workdir / "meta.json").read_text(encoding="utf-8"))["off"]
-    parts = [f"[1:a]atrim={a - off:.3f}:{b - off:.3f},asetpts=PTS-STARTPTS,afade=t=in:d=0.03,"
-             f"afade=t=out:st={b - a - 0.04:.3f}:d=0.04[a{i}]" for i, (a, b) in enumerate(segs)]
-    fc = ";".join(parts) + ";" + "".join(f"[a{i}]" for i in range(len(segs))) + \
-        f"concat=n={len(segs)}:v=0:a=1,loudnorm=I=-16:TP=-1.5,apad=whole_dur={tend:.3f}[a]"
-    _ffmpeg("-i", str(vtmp), "-i", str(workdir / "src.wav"), "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest", str(out_mp4))
+    mux_audio(vtmp, workdir / "src.wav", segs, off, tend, out_mp4)
     vtmp.unlink(missing_ok=True)
     return tend
+
+
+def audio_filter(segs, off: float, tend: float) -> str:
+    """Join the spoken segments of input 1, normalise loudness and pad to the video length.
+
+    loudnorm leaves broken audio timestamps on this ffmpeg build (YouTube then garbles the
+    sound), so the chain ends with ``av_check.AUDIO_RETIME`` like the other renders do.
+    The audio is cut to exactly the rendered video's length (``round(tend * FPS)`` frames):
+    with only ``-shortest`` it overran the video by up to 0.13 s, which the upload check refuses.
+    The timestamps are fixed before padding too, or apad/atrim measure the broken ones.
+    """
+    from .av_check import AUDIO_RETIME
+
+    length = round(tend * FPS) / FPS
+    parts = [f"[1:a]atrim={a - off:.3f}:{b - off:.3f},asetpts=PTS-STARTPTS,afade=t=in:d=0.03,"
+             f"afade=t=out:st={b - a - 0.04:.3f}:d=0.04[a{i}]" for i, (a, b) in enumerate(segs)]
+    return (";".join(parts) + ";" + "".join(f"[a{i}]" for i in range(len(segs)))
+            + f"concat=n={len(segs)}:v=0:a=1,loudnorm=I=-16:TP=-1.5,aresample=48000,{AUDIO_RETIME},"
+            f"apad=whole_dur={length:.6f},atrim=end={length:.6f},{AUDIO_RETIME}[a]")
+
+
+def mux_audio(video: Path, wav: Path, segs, off: float, tend: float, out_mp4: Path) -> None:
+    _ffmpeg("-i", str(video), "-i", str(wav), "-filter_complex", audio_filter(segs, off, tend),
+            "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            str(out_mp4))
 
 
 # ---------------------------------------------------------------- 問い合わせ先（API / Claude Code / Codex）

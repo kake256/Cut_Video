@@ -3,14 +3,17 @@
 All sizes are for a 1080x1920 canvas and are scaled to the actual canvas.
 
 * Spoken captions: one short line per utterance, white with a thick black outline
-  (74 px, outline 9), always centred at y=1725.  A line wraps at about 15
-  full-width characters, preferring a space or punctuation.
-* Notes: optional yellow supplementary text (46 px) on its own layer above the
-  captions (centre y=1597), e.g. "※渋谷には行きません".
+  (74 px, outline 9), always centred at y=1430: just under the 16:9 picture
+  (y 656-1264), clear of the channel name and title YouTube draws over the
+  bottom ~350 px even with two lines.  A line wraps at about 15 full-width
+  characters, preferring a space or punctuation.
+* Notes: optional yellow supplementary text (46 px) on its own layer between the
+  picture and the captions (centre y=1300), e.g. "※渋谷には行きません".
 * Title: two lines at the top (92 px, centre y=150); the second line is the
   emphasised part and is yellow.
 * Footer: "<配信者> 配信（YYYY/MM/DD）より" in small grey text at the bottom.
-* Audio: long pauses are cut out and the clips joined; loudness is normalised.
+* Audio: the clip opens at the nearest pause, long pauses are cut out and the
+  clips joined; loudness is normalised in two passes (one gain for the clip).
 
 Global settings live in ``<data>/short_style.json``; hand-written parts for one
 clip (title, notes, captions, footer) in ``<clip>.subtitle.json`` next to it.
@@ -25,9 +28,11 @@ from pathlib import Path
 
 BASE_W, BASE_H = 1080, 1920
 
-CAPTION_SIZE, CAPTION_OUTLINE, CAPTION_Y = 74, 9, 1725
-NOTE_SIZE, NOTE_OUTLINE, NOTE_Y = 46, 5, 1597
-TITLE_SIZE, TITLE_OUTLINE, TITLE_Y = 92, 8, 150
+CAPTION_SIZE, CAPTION_OUTLINE, CAPTION_Y = 74, 9, 1430
+NOTE_SIZE, NOTE_OUTLINE, NOTE_Y = 46, 5, 1300
+# TITLE_Y is the centre of the last title line: just above the source picture (y≈656 for 16:9),
+# clear of YouTube's top player buttons; a first line stacks above it.
+TITLE_SIZE, TITLE_OUTLINE, TITLE_Y = 92, 8, 580
 FOOTER_SIZE, FOOTER_OUTLINE, FOOTER_Y = 34, 3, 1870
 LINE_HEIGHT = 1.18
 CAPTION_LINE_UNITS = 28  # 14 full-width characters (74 px each) fit inside 1080 px
@@ -48,6 +53,7 @@ DEFAULT_SETTINGS = {
     "silence_min_sec": 1.0,  # pauses at least this long are shortened
     "silence_keep_sec": 0.25,  # silence kept on each side of a cut
     "loudnorm": True,
+    "snap_start": True,  # move the clip start to the nearest pause (not inside a word)
 }
 
 
@@ -391,7 +397,7 @@ def title_events(layout: Layout, lines: list[tuple[str, bool]], duration_text: s
 
     lines = lines[:2]
     step = TITLE_SIZE * LINE_HEIGHT
-    first = TITLE_Y - step * (len(lines) - 1) / 2
+    first = TITLE_Y - step * (len(lines) - 1)
     events = []
     for index, (text, emphasis) in enumerate(lines):
         colour = r"\c&H3CDCFF&" if emphasis else ""

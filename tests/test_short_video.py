@@ -33,6 +33,13 @@ from moment_retrieval.subtitles import SubtitleCue
 
 
 class ShortVideoUnitTests(unittest.TestCase):
+    def setUp(self):
+        # ffmpeg is mocked in these tests, so there is no output file to probe.
+        from unittest.mock import patch
+        patcher = patch("moment_retrieval.short_video.verify_audio_timing")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_legacy_short_options_round_trip_through_output_profile(self):
         legacy = ShortVideoOptions(720, 1280, "crop", False)
         profile = legacy.to_output_profile()

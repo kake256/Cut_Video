@@ -124,7 +124,7 @@ def status_label(receipt: dict | None) -> str:
         label = youtube_upload.PRIVACY_LABELS.get(str(receipt.get("privacy_status")), "非公開")
         scheduled = scheduled_publish_at(receipt)
         if scheduled is not None:
-            label = f"公開予約 {scheduled:%m/%d %H:%M}（YouTubeで設定・今は{label}）"
+            label = f"公開予約 {scheduled:%m/%d %H:%M}"
     upload_status = receipt.get("upload_status")
     if upload_status == "uploaded":
         label += "・処理中"
@@ -180,6 +180,18 @@ def change_privacy(path: str | Path, privacy: str, *, service_factory: Callable 
     status = youtube_upload.set_privacy(receipt["video_id"], privacy, service_factory=service_factory)
     # Setting privacy directly replaces a publish time scheduled on YouTube.
     receipt.update(privacy_status=status, missing_on_youtube=False, publish_at="")
+    _write_receipt(clip.path, receipt)
+    return receipt
+
+
+def schedule_publish(path: str | Path, publish_at: float, *, service_factory: Callable | None = None) -> dict:
+    """Register a YouTube publish time for one uploaded clip (it becomes private until then)."""
+    clip = find_clip(path)
+    receipt = dict(clip.receipt or {})
+    if not receipt:
+        raise youtube_upload.UploadError(f"まだアップロードしていません: {clip.title}")
+    when = youtube_upload.schedule_publish(receipt["video_id"], publish_at, service_factory=service_factory)
+    receipt.update(privacy_status="private", publish_at=when, missing_on_youtube=False)
     _write_receipt(clip.path, receipt)
     return receipt
 

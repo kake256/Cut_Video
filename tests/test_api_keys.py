@@ -69,6 +69,7 @@ class ApiKeysTest(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_API_KEY", api_keys.agent_env("claude"))
         api_keys.save_key("anthropic", KEY_A)
         api_keys.save_key("openai", KEY_O)
+        api_keys.set_claude_cli_uses_key(True)
         claude = api_keys.agent_env("claude", base={})
         codex = api_keys.agent_env("codex", base={})
         self.assertEqual(claude, {"ANTHROPIC_API_KEY": KEY_A})
@@ -80,8 +81,56 @@ class ApiKeysTest(unittest.TestCase):
         os.environ["ANTHROPIC_API_KEY"] = KEY_A
         self.assertNotIn(KEY_A, json.dumps(agent_runner._mcp_server()))
 
+    def test_claude_code_uses_its_login_unless_opted_in(self):
+        api_keys.save_key("anthropic", KEY_A)
+        api_keys.save_key("openai", KEY_O)
+        self.assertFalse(api_keys.claude_cli_uses_key())  # off by default
+        inherited = {"ANTHROPIC_API_KEY": "sk-env-" + "e" * 30, "ANTHROPIC_AUTH_TOKEN": "t" * 30, "PATH": "x"}
+        self.assertEqual(api_keys.agent_env("claude", base=inherited), {"PATH": "x"})
+        self.assertFalse(api_keys.has_key("claude"))
+        # Codex is unchanged, and the app's own API features still find the key.
+        self.assertEqual(api_keys.agent_env("codex", base={})["CODEX_API_KEY"], KEY_O)
+        self.assertEqual(api_keys.resolve("anthropic"), (KEY_A, "saved"))
+        api_keys.set_claude_cli_uses_key(True)
+        self.assertTrue(api_keys.claude_cli_uses_key())
+        self.assertEqual(api_keys.agent_env("claude", base={"PATH": "x"})["ANTHROPIC_API_KEY"], KEY_A)
+        self.assertTrue(api_keys.has_key("claude"))
+        api_keys.set_claude_cli_uses_key(False)
+        self.assertNotIn("ANTHROPIC_API_KEY", api_keys.agent_env("claude", base={}))
+        self.assertNotIn(KEY_A, (Path(self.tmp.name) / api_keys.OPTIONS_FILE).read_text(encoding="utf-8"))
+
+    def test_run_agent_keeps_the_key_from_the_cli_by_default(self):
+        api_keys.save_key("anthropic", KEY_A)
+        seen = {}
+        process = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO("ok\n"), wait=lambda timeout=None: 0)
+
+        def runner(command, **kwargs):
+            seen.update(kwargs)
+            return process
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": KEY_A}), \
+                patch.object(agent_runner, "find_executable", return_value="claude"):
+            agent_runner.run_agent("claude", agent_runner.ClipRequest("vid_x"), runner=runner)
+        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
+
+    def test_finishing_plan_keeps_the_key_from_the_cli_by_default(self):
+        from moment_retrieval import finishing
+
+        api_keys.save_key("anthropic", KEY_A)
+        seen = {}
+
+        def run(command, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(stdout='{"hook_text": "x"}')
+
+        with patch.object(agent_runner, "find_executable", return_value="claude"), \
+                patch.object(finishing.subprocess, "run", side_effect=run):
+            finishing.request_plan("claude", "", "prompt")
+        self.assertNotIn("ANTHROPIC_API_KEY", seen["env"])
+
     def test_run_agent_passes_key_to_cli(self):
         api_keys.save_key("anthropic", KEY_A)
+        api_keys.set_claude_cli_uses_key(True)
         seen = {}
         process = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO("ok\n"), wait=lambda timeout=None: 0)
 
@@ -95,6 +144,7 @@ class ApiKeysTest(unittest.TestCase):
 
     def test_status_is_ready_with_key_even_when_signed_out(self):
         api_keys.save_key("anthropic", KEY_A)
+        api_keys.set_claude_cli_uses_key(True)
         with patch.object(agent_runner, "find_executable", return_value="claude"):
             status = ai_setup.claude_status(runner=lambda *a, **k: SimpleNamespace(stdout='{"loggedIn": false}'))
         self.assertTrue(status["ready"])

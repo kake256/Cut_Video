@@ -490,7 +490,12 @@ def auto_jobs_view():
     )
 
 
+API_AGENT_CHOICE = "API 1回呼び出し"
+
+
 def model_choices(agent: str) -> list[tuple[str, str]]:
+    if agent == agent_runner.API_AGENT:
+        return [("Sonnet 5.5（固定・約0.1ドル）", "")]
     if agent == "claude":
         return list(agent_runner.CLAUDE_MODELS)
     if agent == "local":
@@ -701,6 +706,94 @@ def api_key_delete(provider: str):
     return "", api_key_status(provider) + f"\n\n{note}", ai_setup_view()
 
 
+def save_claude_uses_key(enabled: bool) -> str:
+    """Opt in (or back out) of starting Claude Code with the saved Anthropic key."""
+    api_keys.set_claude_cli_uses_key(bool(enabled))
+    gr.Info("Claude Code をAPIキー（従量課金）で動かします。" if enabled
+            else "Claude Code はログインの枠で動かします（キーはAPI 1回呼び出しとJS描画だけに使います）。")
+    return ai_setup_view()
+
+
+
+# ---------------------------------------------------------------- JS描画ショート（Claude API）
+
+def jsdraw_video_choices() -> list[tuple[str, str]]:
+    """文字起こし済みで、元の動画ファイルがこのPCにあるもの（新しい順）。"""
+    from moment_retrieval import db
+
+    conn = db.get_conn()
+    try:
+        videos = db.list_videos(conn)
+    finally:
+        conn.close()
+    return [(Path(str(v["path"])).name, str(v["path"])) for v in reversed(videos) if Path(str(v["path"])).is_file()]
+
+
+def _jsdraw_seconds(text: str) -> float:
+    """「38:50」「0:38:50」「2330」を秒にする。"""
+    parts = str(text or "").strip().split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        raise gr.Error(f"時刻の形式が正しくありません: {text}（例 0:38:50）") from None
+    if not nums or len(nums) > 3:
+        raise gr.Error(f"時刻の形式が正しくありません: {text}（例 0:38:50）")
+    sec = 0.0
+    for n in nums:
+        sec = sec * 60 + n
+    return sec
+
+
+def jsdraw_run(video: str, start: str, end: str, title: str, story: str, model: str):
+    """1本作る。進み具合を流しながら、最後に動画を返す。"""
+    import queue
+
+    from moment_retrieval import jsdraw_short
+
+    if not video:
+        raise gr.Error("動画を選んでください。")
+    a, b = _jsdraw_seconds(start), _jsdraw_seconds(end)
+    if b <= a:
+        raise gr.Error("終わりは始めより後にしてください。")
+    if not api_keys.resolve("anthropic")[0]:
+        raise gr.Error("AnthropicのAPIキーがありません。「設定」タブの「APIキーで使う」で保存してください。")
+    lines: list[str] = []
+    done: "queue.Queue[tuple[str, object]]" = queue.Queue()
+
+    def progress(msg: str) -> None:
+        if lines and lines[-1].split("（")[0] == msg.split("（")[0]:
+            lines[-1] = msg  # 同じ工程の待ち時間表示は上書き
+        else:
+            lines.append(msg)
+
+    def work() -> None:
+        try:
+            done.put(("ok", jsdraw_short.make_short(video, a, b, model=model, title=title.strip(),
+                                                     story=story.strip(), progress=progress)))
+        except Exception as exc:  # noqa: BLE001 — 画面に出して終える
+            done.put(("error", exc))
+
+    threading.Thread(target=work, daemon=True).start()
+    while True:
+        try:
+            kind, value = done.get(timeout=2)
+            break
+        except queue.Empty:
+            yield "\n".join(f"- {line}" for line in lines[-8:]), None
+    if kind == "error":
+        yield "\n".join(f"- {line}" for line in lines[-8:]) + f"\n\n⚠️ {html.escape(str(value))}", None
+        return
+    result = value
+    yield (f"✅ できました：`{result['mp4']}`\n\nAPIの費用：約 {result['usd']} ドル"
+           f"（生成 {result['usage'][0]['usd']} ＋ 直し {result['usage'][1]['usd']}）", result["mp4"])
+
+
+def jsdraw_short_labels() -> dict:
+    from moment_retrieval import jsdraw_short
+
+    return jsdraw_short.MODEL_LABELS
+
+
 def on_agent_change(agent: str):
     return (
         gr.update(choices=model_choices(agent), value=default_model(agent)),
@@ -880,7 +973,7 @@ def _saved_agent() -> tuple[str, str]:
     except (OSError, ValueError):
         saved = {}
     agent = saved.get("agent") if isinstance(saved, dict) else None
-    if agent not in agent_runner.AGENTS:
+    if agent not in agent_runner.PIPELINE_AGENTS:
         return "codex", default_model("codex")
     model = saved.get("model")
     try:
@@ -890,9 +983,73 @@ def _saved_agent() -> tuple[str, str]:
     return agent, model
 
 
+JSDRAW_DEFAULT_MODEL = "fable"
+# The cost depends on the route (login CLI or API), so the note under the box states it, not these labels.
+JSDRAW_MODEL_CHOICES = [("Fable 5.2", "fable"), ("Opus 5.5", "opus"), ("Sonnet 5.5", "sonnet")]
+
+
+def _saved_jsdraw() -> tuple[bool, str]:
+    """Whether the JS-drawn Short was on last time, and its drawing model."""
+    try:
+        saved = json.loads(_ui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    model = saved.get("jsdraw_model")
+    return (saved.get("jsdraw") is True,
+            model if model in {value for _label, value in JSDRAW_MODEL_CHOICES} else JSDRAW_DEFAULT_MODEL)
+
+
+def remember_jsdraw(enabled: bool, model: str) -> None:
+    if model not in {value for _label, value in JSDRAW_MODEL_CHOICES}:
+        model = JSDRAW_DEFAULT_MODEL
+    try:
+        _write_ui_settings({"jsdraw": bool(enabled), "jsdraw_model": model})
+    except OSError:
+        pass
+
+
+def jsdraw_controls(agent: str, enabled: bool):
+    """(checkbox, 描画モデル, note) for the chosen highlight AI: the drawing follows that AI.
+
+    The note says how the Short will be drawn; the model choice is hidden for Codex (it uses
+    the Codex model picked above) and the box is unavailable for the local AI without a key.
+    """
+    from moment_retrieval import jsdraw_pipeline
+
+    available = jsdraw_pipeline.available_for(agent)
+    enabled = bool(enabled) and available
+    note = jsdraw_pipeline.note_for(agent)
+    return (gr.update(value=enabled, interactive=available),
+            gr.update(visible=enabled and jsdraw_pipeline.backend_for(agent) != "codex"),
+            gr.update(value=f'<small style="color: var(--body-text-color-subdued)">{html.escape(note)}</small>',
+                      visible=enabled or not available))
+
+
+def apply_jsdraw_settings():
+    enabled, model = _saved_jsdraw()
+    box, radio, note = jsdraw_controls(_saved_agent()[0], enabled)
+    return box, {**radio, "value": model}, note
+
+
+def on_jsdraw_change(enabled: bool, agent: str = "claude"):
+    _box, radio, note = jsdraw_controls(agent, enabled)
+    return radio, note
+
+
+def _require_jsdraw_ready(enabled: bool, agent: str = "api") -> None:
+    """Only drawing through the Claude API needs a saved key; the login CLIs draw on their plan."""
+    if not enabled:
+        return
+    from moment_retrieval import jsdraw_pipeline
+
+    if not jsdraw_pipeline.available_for(agent):
+        raise gr.Error(jsdraw_pipeline.NO_KEY_MESSAGE)
+
+
 def remember_agent(agent: str, model: str) -> None:
     """Keep the AI and model picked on the main tab as next time's default."""
-    if agent not in agent_runner.AGENTS:
+    if agent not in agent_runner.PIPELINE_AGENTS:
         return
     try:
         model, _effort = agent_runner.validate_model(agent, model, "")
@@ -939,6 +1096,12 @@ def auto_download_only(sources: str):
 
 def _require_agent_ready(agent: str) -> None:
     """Stop before queueing when the chosen CLI is missing or signed out (its jobs would fail later)."""
+    if agent == agent_runner.API_AGENT:
+        from moment_retrieval import oneshot_selector
+
+        if not oneshot_selector.has_key():
+            raise gr.Error(oneshot_selector.NO_KEY_MESSAGE)
+        return
     checks = {"codex": ai_setup.codex_status, "claude": ai_setup.claude_status}
     if agent not in checks:
         return
@@ -955,7 +1118,8 @@ def _require_agent_ready(agent: str) -> None:
 
 
 def auto_submit(mode: str, sources: str, library_selection, agent: str, model: str, clip_count, effort: str,
-                min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
+                min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False,
+                preload_transcript: bool = True, jsdraw: bool = False, jsdraw_model: str = JSDRAW_DEFAULT_MODEL):
     # Only the input that is shown counts; a leftover value in the hidden one is ignored.
     if mode == "library":
         lines = [LIBRARY_PREFIX + video_id for video_id in (library_selection or [])]
@@ -968,6 +1132,7 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
                 raise gr.Error("URLが「探したい場面」の欄に入っています。上の「動画のURL」の欄に入れ直してください。")
             raise gr.Error("動画のURLを入力してください。")
     _require_agent_ready(agent)
+    _require_jsdraw_ready(jsdraw, agent)
     submitted = []
     for line in lines[:10]:
         try:
@@ -975,7 +1140,8 @@ def auto_submit(mode: str, sources: str, library_selection, agent: str, model: s
                 line, agent, clip_count=int(clip_count), min_duration_sec=float(min_sec),
                 max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "", focus=focus or "",
-                finish=bool(finish),
+                finish=bool(finish), preload_transcript=bool(preload_transcript),
+                jsdraw=bool(jsdraw), jsdraw_model=jsdraw_model or JSDRAW_DEFAULT_MODEL,
             )
         except PipelineError as exc:
             raise gr.Error(f"{line}: {exc}") from exc
@@ -997,7 +1163,9 @@ def export_shared_index(video_id: str, include_url: bool):
 
 
 def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, clip_count, effort: str,
-                        min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False):
+                        min_sec, max_sec, layout: str, upload: bool, focus: str = "", finish: bool = False,
+                        preload_transcript: bool = True, jsdraw: bool = False,
+                        jsdraw_model: str = JSDRAW_DEFAULT_MODEL):
     """Import a share zip; optionally start a job that downloads, relinks and clips it."""
     from moment_retrieval import db, source_origin
     from moment_retrieval.share import ShareError, import_index
@@ -1029,6 +1197,8 @@ def import_shared_index(uploaded, start_clipping: bool, agent: str, model: str, 
                 max_duration_sec=float(max_sec), layout=layout, **_upload_args(upload),
                 model=model or "", effort=(effort or "") if agent == "codex" else "",
                 link_only=not start_clipping, focus=focus or "", finish=bool(finish),
+                preload_transcript=bool(preload_transcript),
+                jsdraw=bool(jsdraw) and bool(start_clipping), jsdraw_model=jsdraw_model or JSDRAW_DEFAULT_MODEL,
             )
         except PipelineError as exc:
             log += f"\n元動画のダウンロードを開始できませんでした: {exc}"
@@ -1099,7 +1269,10 @@ def upload_clips(paths, privacy: str):
 
 
 def publish_clips_from_ui(paths, interval_hours=None):
-    """Queue the checked clips to go public one at a time, ``interval_hours`` apart (not all at once)."""
+    """Schedule the checked clips on YouTube to go public one at a time, ``interval_hours`` apart.
+
+    The first one is published by the app right away; the rest get a YouTube publish time
+    (private until then), so they go public even while the app or the PC is off."""
     from moment_retrieval import publish_queue
 
     picked = [str(item) for item in (paths or []) if item]
@@ -1111,11 +1284,20 @@ def publish_clips_from_ui(paths, interval_hours=None):
         hours = None
     hours = hours or publish_queue.DEFAULT_INTERVAL_HOURS
     added, skipped = publish_queue.enqueue(picked, interval_hours=hours)
+    scheduled, kept = publish_queue.schedule_waiting(paths=[item["path"] for item in added]) if added else ([], [])
     lines = []
     if added:
         first = datetime.fromtimestamp(added[0]["not_before"])
-        lines.append(f"- {len(added)}本を公開待ちに入れました。アプリを開いている間に、{hours:g}時間おきに1本ずつ公開します"
+        lines.append(f"- {len(added)}本を公開待ちに入れました。{hours:g}時間おきに1本ずつ公開します"
                      f"（最初は{first:%m/%d %H:%M}ごろ、全部終わるまで約{max(0, len(added) - 1) * hours:g}時間）。")
+        if scheduled:
+            lines.append(f"- {len(scheduled)}本はYouTubeに公開予約しました。予定時刻まで非公開になり、"
+                         "アプリやPCを止めていても予定時刻に公開されます。")
+        now_count = len(added) - len(scheduled) - len(kept)
+        if now_count:
+            lines.append(f"- {now_count}本はすぐ公開の順番なので、アプリがこのまま公開します。")
+        lines += [f"- YouTubeに予約できず、アプリを開いている間に公開します: {html.escape(item['title'])}"
+                  f"（{html.escape(item['message'])}）" for item in kept]
         gr.Info(f"{len(added)}本を公開待ちに入れました。")
     lines += [f"- 公開待ちに入れませんでした: {html.escape(name)}: {html.escape(reason)}" for name, reason in skipped]
     return "\n".join(lines), cards_signature()
@@ -1129,8 +1311,11 @@ def publish_queue_markdown() -> str:
         return "公開待ちの動画はありません。"
     lines = []
     if info["remaining"]:
+        by_app = sum(1 for item in info["pending"] if item.get("state") != "scheduled")
+        note = ("YouTubeに公開予約済みなので、アプリを閉じていても公開されます" if not by_app else
+                f"うち{by_app}本はYouTubeに予約しておらず、アプリを開いている間だけ進みます")
         lines.append(f"**公開待ち 残り{info['remaining']}本**・次の公開予定 "
-                     f"{datetime.fromtimestamp(info['next_at']):%m/%d %H:%M}ごろ（アプリを開いている間だけ進みます）")
+                     f"{datetime.fromtimestamp(info['next_at']):%m/%d %H:%M}ごろ（{note}）")
         for item in info["pending"]:
             label = publish_queue.STATE_LABELS.get(item.get("state"), item.get("state"))
             lines.append(f"- {label} {datetime.fromtimestamp(item['not_before']):%m/%d %H:%M} "
@@ -1148,9 +1333,24 @@ def publish_queue_markdown() -> str:
 
 
 def publish_queue_cancel():
+    """Cancel the waiting clips; ones scheduled on YouTube get their publish time removed."""
     from moment_retrieval import publish_queue
 
-    return f"公開待ちの{publish_queue.cancel_waiting()}本を取り消しました。", publish_queue_markdown()
+    count, failed = publish_queue.cancel_waiting()
+    lines = [f"- 公開待ちの{count}本を取り消しました（YouTubeの公開予約も外しました）。"]
+    lines += [f"- 取り消せませんでした: {html.escape(title)}: {html.escape(reason)}" for title, reason in failed]
+    return "\n".join(lines), publish_queue_markdown(), cards_signature()
+
+
+def publish_queue_move_to_youtube():
+    """Register clips still waiting in the app's queue as YouTube publish times."""
+    from moment_retrieval import publish_queue
+
+    scheduled, kept = publish_queue.schedule_waiting()
+    lines = [f"- {len(scheduled)}本をYouTubeに公開予約しました（予定時刻まで非公開）。" if scheduled else
+             "- YouTubeに移す公開待ちはありません（すぐ公開の順番の1本はアプリが公開します）。"]
+    lines += [f"- 予約できませんでした: {html.escape(item['title'])}（{html.escape(item['message'])}）" for item in kept]
+    return "\n".join(lines), publish_queue_markdown(), cards_signature()
 
 
 def change_clip_privacy(paths, privacy: str):
@@ -1195,6 +1395,8 @@ def clip_publish_status(receipt: dict | None, item: dict | None) -> str:
     state = (item or {}).get("state")
     if not public and state == "queued":
         return f"**[公開待ち {datetime.fromtimestamp(float(item['not_before'])):%m/%d %H:%M}]**（今は{label}）"
+    if not public and state == "scheduled":
+        return f"**[公開予約 {datetime.fromtimestamp(float(item['not_before'])):%m/%d %H:%M}]**"
     if not public and state == "running":
         return f"**[公開中…]**（今は{label}）"
     if not public and state == "failed":
@@ -1202,8 +1404,7 @@ def clip_publish_status(receipt: dict | None, item: dict | None) -> str:
         return f"**[公開に失敗]**（今は{label}{'・' + reason if reason else ''}）"
     scheduled = made_clips.scheduled_publish_at(receipt)
     if scheduled is not None:
-        current = youtube_upload.PRIVACY_LABELS.get(str(receipt.get("privacy_status")), "非公開")
-        return f"**[公開予約 {scheduled:%m/%d %H:%M}]**（YouTubeで設定・今は{current}）"
+        return f"**[公開予約 {scheduled:%m/%d %H:%M}]**"
     if public:
         return f"**[{label}]**"
     return f"[{label}]"
@@ -1370,14 +1571,25 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     auto_library_refresh = gr.Button("一覧を更新", scale=1)
             with gr.Row():
                 auto_agent = gr.Radio(
-                    choices=[("Codex", "codex"), ("Claude Code", "claude"), ("ローカルAI", "local")], value="codex",
-                    label="見どころを選ぶAI", scale=2,
+                    choices=[("Codex", "codex"), ("Claude Code", "claude"), ("ローカルAI", "local"),
+                             (API_AGENT_CHOICE, agent_runner.API_AGENT)], value="codex",
+                    label="見どころを選ぶAI", scale=5,
                 )
                 auto_model = gr.Dropdown(
                     choices=model_choices("codex"), value=agent_runner.DEFAULT_CODEX_MODEL,
                     label="モデル", scale=2,
                 )
                 auto_clip_count = gr.Slider(1, 10, value=3, step=1, label="本数", scale=2)
+            # One line: the box, the drawing model (only when checked, not for Codex) and a short note.
+            with gr.Row(equal_height=True, elem_id="auto-jsdraw-row"):
+                auto_jsdraw = gr.Checkbox(
+                    value=False, label="JS描画ショート", container=False, scale=1, min_width=170,
+                )
+                auto_jsdraw_model = gr.Radio(
+                    choices=JSDRAW_MODEL_CHOICES, value=JSDRAW_DEFAULT_MODEL, show_label=False, container=False,
+                    visible="hidden", scale=4, min_width=360,
+                )
+            auto_jsdraw_note = gr.Markdown("", visible=False, container=False, elem_id="auto-jsdraw-note")
             auto_focus = gr.Textbox(
                 label="探したい場面（任意）　空欄なら見どころ全般から選びます",
                 placeholder="例: 謎解きができなくてキレている箇所",
@@ -1403,6 +1615,10 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     )
                     auto_upload = gr.Radio(choices=UPLOAD_CHOICES, value="unlisted", label="YouTube")
                 with gr.Row():
+                    auto_preload = gr.Checkbox(
+                        value=True, label="文字起こしを最初に渡す（往復を減らす・Claude Code/Codex）",
+                    )
+                with gr.Row():
                     auto_settings_save = gr.Button("長さ・レイアウト・仕上げ・推論の強さ・YouTubeを既定として保存", scale=1)
                     auto_settings_md = gr.Markdown("", scale=2)
             with gr.Row():
@@ -1417,14 +1633,20 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             auto_jobs_md = gr.Markdown("実行中のジョブはありません。")
             auto_uploads_sig = gr.State("[]")
             publish_result_md = gr.Markdown("")
-            with gr.Accordion("公開待ち（チェックした動画を1本ずつ間隔をあけて公開します）", open=True):
+            with gr.Accordion("公開待ち（チェックした動画をYouTubeに公開予約し、1本ずつ間隔をあけて公開します）", open=True):
                 with gr.Row():
-                    publish_interval = gr.Number(value=3, minimum=0.1, label="公開の間隔（時間）", scale=1)
+                    publish_interval = gr.Number(value=1, minimum=0.1, label="公開の間隔（時間）", scale=1)
                     publish_queue_refresh_btn = gr.Button("公開待ちを更新", size="sm", scale=1)
+                    publish_queue_move_btn = gr.Button("アプリの公開待ちをYouTubeの予約に移す", size="sm", scale=1)
                     publish_queue_cancel_btn = gr.Button("公開待ちを取り消す", size="sm", scale=1)
                 publish_queue_md = gr.Markdown(publish_queue_markdown)
             publish_queue_refresh_btn.click(publish_queue_markdown, outputs=[publish_queue_md])
-            publish_queue_cancel_btn.click(publish_queue_cancel, outputs=[publish_result_md, publish_queue_md])
+            publish_queue_move_btn.click(publish_queue_move_to_youtube,
+                                         outputs=[publish_result_md, publish_queue_md, auto_uploads_sig],
+                                         concurrency_id="youtube-publish", concurrency_limit=1)
+            publish_queue_cancel_btn.click(publish_queue_cancel,
+                                           outputs=[publish_result_md, publish_queue_md, auto_uploads_sig],
+                                           concurrency_id="youtube-publish", concurrency_limit=1)
 
             @gr.render(inputs=[auto_uploads_sig])
             def render_clip_cards(signature):
@@ -1663,6 +1885,34 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                     ledger_pick_btn = gr.Button("フォルダを選ぶ", scale=1, min_width=120)
                 ledger_preview_md = gr.Markdown("")
                 ledger_folder_btn = gr.Button("このフォルダで始める")
+        with gr.Tab("JS描画ショート"):
+            gr.Markdown(
+                "配信の一区間から、絵をJavaScriptで描いた縦型ショート（約55秒）をClaude APIで作ります。"
+                "話の要約・場面の絵・字幕・音声の切り詰めまで自動です。「設定」タブで保存した**Anthropic**のAPIキーを使い、"
+                "費用はキーの持ち主にかかります（1本 Fable 約0.5ドル／Sonnet 約0.1ドル。半額のBatch処理で、1本10〜15分ほど）。"
+            )
+            with gr.Row():
+                jsdraw_video = gr.Dropdown(choices=[], label="動画（文字起こし済み・このPCにあるもの）", scale=5)
+                jsdraw_reload = gr.Button("一覧を更新", scale=1, min_width=100)
+            with gr.Row():
+                jsdraw_start = gr.Textbox(label="区間の始め（元配信の時刻）", placeholder="0:38:50")
+                jsdraw_end = gr.Textbox(label="区間の終わり", placeholder="0:40:40",
+                                        info="1〜5分の区間から、話の流れが伝わる約55秒をAIが選びます")
+            jsdraw_title = gr.Textbox(label="題材（任意）", placeholder="借金ルート突入")
+            jsdraw_story = gr.Textbox(label="話のあらすじ（任意）", lines=2,
+                                      placeholder="空欄ならAIが文字起こしから流れを読み取ります")
+            jsdraw_model = gr.Radio(
+                choices=[(label, key) for key, label in jsdraw_short_labels().items()],
+                value="fable", label="モデル",
+            )
+            jsdraw_btn = gr.Button("作る", variant="primary")
+            jsdraw_log = gr.Markdown("")
+            jsdraw_out = gr.Video(label="できた動画", height=480)
+            jsdraw_reload.click(lambda: gr.update(choices=jsdraw_video_choices()), outputs=[jsdraw_video])
+            jsdraw_btn.click(jsdraw_run, inputs=[jsdraw_video, jsdraw_start, jsdraw_end, jsdraw_title,
+                                                 jsdraw_story, jsdraw_model],
+                             outputs=[jsdraw_log, jsdraw_out])
+            demo.load(lambda: gr.update(choices=jsdraw_video_choices()), outputs=[jsdraw_video])
         with gr.Tab("設定"):
             gr.Markdown("### 見どころを選ぶAI")
             ai_status_md = gr.Markdown("")
@@ -1679,6 +1929,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                 gr.Markdown(
                     "<small>ChatGPTやClaudeのアカウントでログインする代わりに、自分のAPIキーで"
                     "Codex／Claude Codeを動かせます（CLIのインストールは必要、ログインは不要）。"
+                    "Claude Code にキーを使うのは、下の「Claude Code もAPIキーで動かす」をオンにしたときだけです。"
                     "キーはこのパソコンの <code>data/api_keys.json</code> にだけ保存され、gitには入りません。"
                     "保存したキーは環境変数（ANTHROPIC_API_KEY・CODEX_API_KEY・OPENAI_API_KEY）より優先され、"
                     "利用料金はキーの持ち主のAPIアカウントにかかります。</small>"
@@ -1694,6 +1945,11 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                         key_test = gr.Button("接続テスト", scale=1, min_width=80)
                         key_delete = gr.Button("削除", scale=1, min_width=80)
                     api_key_widgets.append((provider, key_status, key_box, key_save, key_test, key_delete))
+                claude_uses_key = gr.Checkbox(
+                    value=False, label="Claude Code もAPIキーで動かす（従量課金）",
+                    info="オフ（標準）のときは、Claude（Anthropic）のキーは「API 1回呼び出し」とJS描画だけに使い、"
+                         "Claude Code はログインの枠で動かします。",
+                )
             gr.Markdown("### YouTubeアカウント")
             auto_account_md = gr.Markdown("")
             auto_agents_md = gr.Markdown("")
@@ -1747,6 +2003,13 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         remember_agent, inputs=[auto_agent, auto_model], show_progress="hidden")
     auto_model.input(remember_agent, inputs=[auto_agent, auto_model], show_progress="hidden")
     demo.load(apply_agent_settings, outputs=[auto_agent, auto_model, auto_effort])
+    auto_jsdraw.input(on_jsdraw_change, inputs=[auto_jsdraw, auto_agent],
+                      outputs=[auto_jsdraw_model, auto_jsdraw_note]).then(
+        remember_jsdraw, inputs=[auto_jsdraw, auto_jsdraw_model], show_progress="hidden")
+    auto_agent.input(jsdraw_controls, inputs=[auto_agent, auto_jsdraw],
+                     outputs=[auto_jsdraw, auto_jsdraw_model, auto_jsdraw_note])
+    auto_jsdraw_model.input(remember_jsdraw, inputs=[auto_jsdraw, auto_jsdraw_model], show_progress="hidden")
+    demo.load(apply_jsdraw_settings, outputs=[auto_jsdraw, auto_jsdraw_model, auto_jsdraw_note])
     auto_client_file.upload(auto_install_client_secret, inputs=[auto_client_file], outputs=[auto_account_md])
     gcp_login_btn.click(gcp_login, outputs=[gcp_status_md], concurrency_id="gcp-setup")
     gcp_code_btn.click(gcp_submit_code, inputs=[gcp_code], outputs=[gcp_status_md, gcp_code],
@@ -1774,6 +2037,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
         key_test.click(partial(api_key_test, provider), inputs=[key_box], outputs=[key_status])
         key_delete.click(partial(api_key_delete, provider), outputs=[key_box, key_status, ai_status_md]).then(
             summary_status, outputs=[status_md])
+    demo.load(lambda: gr.update(value=api_keys.claude_cli_uses_key()), outputs=[claude_uses_key])
+    claude_uses_key.input(save_claude_uses_key, inputs=[claude_uses_key], outputs=[ai_status_md]).then(
+        summary_status, outputs=[status_md])
     for button, agent in ((ai_codex_btn, "codex"), (ai_claude_btn, "claude"), (ai_local_btn, "local")):
         button.click(lambda agent=agent: ai_prepare(agent), outputs=[ai_status_md]).then(
             summary_status, outputs=[status_md])
@@ -1786,7 +2052,8 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     auto_start_btn.click(
         auto_submit,
         inputs=[auto_mode, auto_sources, auto_library, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish, auto_preload, auto_jsdraw,
+                auto_jsdraw_model],
         outputs=[auto_sources, auto_library, *auto_job_outputs],
     )
     auto_mode.change(on_mode_change, inputs=[auto_mode],
@@ -1809,7 +2076,8 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
     share_import_btn.click(
         import_shared_index,
         inputs=[share_import_file, share_start, auto_agent, auto_model, auto_clip_count, auto_effort,
-                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish],
+                auto_min_sec, auto_max_sec, auto_layout, auto_upload, auto_focus, auto_finish, auto_preload, auto_jsdraw,
+                auto_jsdraw_model],
         outputs=[share_import_log, auto_library, share_export_video],
         concurrency_id="library-share",
     ).then(auto_jobs_view, outputs=auto_job_outputs)

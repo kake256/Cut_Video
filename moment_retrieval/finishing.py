@@ -20,7 +20,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import short_style
+from . import av_check, short_style
 from .short_video import _ass_text, _ass_time, blurred_background
 from .video_encoder import h264_args
 
@@ -461,9 +461,137 @@ def build_ass(captions: list[Caption], plan: FinishPlan, width: int, height: int
     return "\n".join(lines) + "\n"
 
 
+LOUDNESS_I, LOUDNESS_TP, LOUDNESS_LRA = -16.0, -1.5, 11.0
+# A limiter without ``level=disabled`` turns the signal back up to 0 dBFS, and without
+# ``latency=enabled`` delays it by the attack time (5 ms) against the picture.
+LIMITER = "alimiter=limit=0.95:level=disabled:latency=enabled"
+
+
+def _audio_segment(index: int, a: float, b: float) -> str:
+    # Short fades so the joins do not click.
+    return (f"[as{index}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, b - a - 0.04):.3f}:d=0.04[a{index}]")
+
+
+def audio_join_filter(segments: list[tuple[float, float]] | None) -> tuple[list[str], str]:
+    """Audio-only graph parts that join the kept segments; returns (parts, output label)."""
+    if not segments:
+        return [], "[0:a]"
+    count = len(segments)
+    parts = ["[0:a]asplit=" + str(count) + "".join(f"[as{i}]" for i in range(count))]
+    parts += [_audio_segment(index, a, b) for index, (a, b) in enumerate(segments)]
+    parts.append("".join(f"[a{i}]" for i in range(count)) + f"concat=n={count}:v=0:a=1[ca]")
+    return parts, "[ca]"
+
+
+def loudnorm_filter(measured: dict | None = None) -> str:
+    """loudnorm at the policy target; with first-pass ``measured`` stats, one constant gain (linear).
+
+    Without measurements loudnorm runs in its one-pass dynamic mode, whose gain is set
+    from the first 3 s and then drifts, so the opening of a clip comes out louder or
+    softer than the rest.  With them the whole clip gets the same gain; a peak that
+    would then pass the true-peak target is held down by a limiter first, and the
+    LRA target is never below the clip's own range, so loudnorm can stay linear.
+    """
+    base = f"loudnorm=I={LOUDNESS_I:g}:TP={LOUDNESS_TP:g}:LRA={LOUDNESS_LRA:g}"
+    if not measured:
+        return base
+    gain = LOUDNESS_I - measured["input_i"]
+    allowed_tp = LOUDNESS_TP - gain - 0.5  # input true peak that still fits after the gain (0.5 dB margin)
+    pre, input_tp = "", measured["input_tp"]
+    if input_tp > allowed_tp + 0.5:
+        limit = min(1.0, max(0.0625, 10 ** ((allowed_tp - 0.5) / 20)))  # sample peak below the true-peak cap
+        pre = f"alimiter=limit={limit:.4f}:level=disabled:latency=enabled:attack=1:release=50,"
+        input_tp = min(input_tp, allowed_tp)
+    lra = min(50.0, max(LOUDNESS_LRA, math.ceil(measured["input_lra"] * 10 + 1) / 10))
+    return (f"{pre}loudnorm=I={LOUDNESS_I:g}:TP={LOUDNESS_TP:g}:LRA={lra:g}"
+            f":measured_I={measured['input_i']:.2f}:measured_TP={input_tp:.2f}"
+            f":measured_LRA={measured['input_lra']:.2f}:measured_thresh={measured['input_thresh']:.2f}"
+            f":offset={measured.get('target_offset', 0.0):.2f}:linear=true")
+
+
+def measure_loudness(source: Path, start: float, duration: float,
+                     segments: list[tuple[float, float]] | None, *, timeout: float = 600) -> dict | None:
+    """First loudnorm pass over the audio that will be rendered (pauses already cut)."""
+    parts, label = audio_join_filter(segments)
+    graph = ";".join(parts + [f"{label}{loudnorm_filter()}:print_format=json[m]"])
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+         "-i", str(Path(source).resolve()), "-vn", "-filter_complex", graph, "-map", "[m]", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    text = result.stderr or ""
+    begin, end = text.rfind("{"), text.rfind("}")
+    if result.returncode != 0 or begin < 0 or end < begin:
+        return None
+    try:
+        raw = json.loads(text[begin:end + 1])
+        stats = {key: float(raw[key]) for key in
+                 ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")}
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not all(math.isfinite(value) for value in stats.values()) or stats["input_i"] < -70:
+        return None  # (nearly) silent: leave it to the one-pass filter
+    return stats
+
+
+def quiet_start_shift(samples, rate: int, zero: int, *, quiet_db: float = -48.0, margin_db: float = 6.0,
+                      forward_weight: float = 1.5) -> float:
+    """Seconds to move a clip start (sample ``zero`` of ``samples``) to the nearest pause.
+
+    A range picked from transcript segment times often starts inside a word, or
+    with the last syllable of the previous sentence; the Short then opens with a
+    clipped, sudden sound.  Levels are 40 ms windows on a 10 ms grid; a point is a
+    pause when it is within ``margin_db`` of the quietest point here (and at least
+    as quiet as ``quiet_db``).  Moving later costs ``forward_weight`` times as much
+    as moving earlier, because it drops some of the clip.  0 when already in a pause.
+    """
+    import numpy as np
+
+    frame = max(1, rate // 100)
+    x = np.asarray(samples, dtype=np.float64)
+    count = len(x) // frame
+    if count < 6:
+        return 0.0
+    power = (x[: count * frame].reshape(count, frame) ** 2).mean(axis=1)
+    padded = np.concatenate([[power[0]] * 2, power, [power[-1]] * 2])
+    window = np.convolve(padded, np.ones(4) / 4, mode="valid")  # boundary b: frames b-2..b+1
+    level = 10 * np.log10(window[: count + 1] + 1e-12)
+    origin = min(count, max(0, round(zero / frame)))
+    threshold = max(float(level.min()) + margin_db, quiet_db)
+    if level[origin] <= threshold:
+        return 0.0
+    quiet = np.flatnonzero(level <= threshold)
+    cost = np.where(quiet < origin, origin - quiet, (quiet - origin) * forward_weight)
+    return round(float(quiet[int(np.argmin(cost))] - origin) * frame / rate, 3)
+
+
+START_BACK_SEC, START_AHEAD_SEC = 1.0, 0.6
+
+
+def speech_start_shift(source: Path, start: float, *, back: float = START_BACK_SEC,
+                       ahead: float = START_AHEAD_SEC, timeout: float = 120) -> float:
+    """``quiet_start_shift`` for ``start`` s into ``source`` (0 when it cannot be read)."""
+    import numpy as np
+
+    rate = 16000
+    back = max(0.0, min(back, start))
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{start - back:.3f}", "-i", str(Path(source).resolve()),
+             "-t", f"{back + ahead:.3f}", "-vn", "-ac", "1", "-ar", str(rate), "-f", "f32le", "-"],
+            capture_output=True, check=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    samples = np.frombuffer(result.stdout, dtype=np.float32)
+    return quiet_start_shift(samples, rate, int(back * rate))
+
+
 def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]], *,
-                 segments: list[tuple[float, float]] | None = None, loudnorm: bool = True) -> str:
-    """Video/audio graph: join the kept segments (pauses cut), fit 9:16, captions, loudness, effects."""
+                 segments: list[tuple[float, float]] | None = None, loudnorm: bool | dict = True) -> str:
+    """Video/audio graph: join the kept segments (pauses cut), fit 9:16, captions, loudness, effects.
+
+    ``loudnorm`` is True (one-pass), False (off) or the stats of ``measure_loudness`` (two-pass).
+    """
     parts: list[str] = []
     video_in, audio_in = "[0:v]", "[0:a]"
     if segments:
@@ -472,9 +600,7 @@ def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]]
         parts.append("[0:a]asplit=" + str(count) + "".join(f"[as{i}]" for i in range(count)))
         for index, (a, b) in enumerate(segments):
             parts.append(f"[vs{index}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{index}]")
-            # Short fades so the joins do not click.
-            parts.append(f"[as{index}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,"
-                         f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, b - a - 0.04):.3f}:d=0.04[a{index}]")
+            parts.append(_audio_segment(index, a, b))
         parts.append("".join(f"[v{i}][a{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=1[cv][ca]")
         video_in, audio_in = "[cv]", "[ca]"
     parts.append(
@@ -483,10 +609,11 @@ def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]]
         f"[fg_src]scale={width}:{height}:force_original_aspect_ratio=decrease,setsar=1[fg];"
         "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,subtitles=filename=finish.ass[vout]"
     )
-    level = "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000," if loudnorm else ""
+    measured = loudnorm if isinstance(loudnorm, dict) else None
+    level = f"{loudnorm_filter(measured)},aresample=48000," if loudnorm else ""
     main = f"{audio_in}{level}aformat=sample_rates=48000:channel_layouts=stereo"
     if not sound_effects:
-        parts.append(f"{main}[aout]")
+        parts.append(f"{main},{av_check.AUDIO_RETIME}[aout]")
         return ";".join(parts)
     labels = []
     for index, (at, kind) in enumerate(sound_effects):
@@ -495,7 +622,7 @@ def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]]
                      f"adelay={delay}|{delay},volume=0.7[sfx{index}]")
         labels.append(f"[sfx{index}]")
     parts.append(f"{main}[main]")
-    parts.append(f"[main]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:normalize=0,alimiter=limit=0.95[aout]")
+    parts.append(f"[main]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:normalize=0,{LIMITER},{av_check.AUDIO_RETIME}[aout]")
     return ";".join(parts)
 
 
@@ -515,10 +642,14 @@ def render(source: Path, start: float, end: float, words: list[Word], plan: Fini
     settings = settings or short_style.load_settings()
     shift = plan.trim_start
     start, end = start + plan.trim_start, end - plan.trim_end
+    lead = speech_start_shift(source, start) if settings.get("snap_start", True) else 0.0
+    start, shift = start + lead, shift + lead  # open at the nearest pause, not inside a word
     duration = end - start
-    shifted = [Word(w.start - shift, w.end - shift, w.text)
+    shifted = [Word(max(0.0, w.start - shift), w.end - shift, w.text)
                for w in words if w.end - shift > 0 and w.start - shift < duration]
-    regions = [(a - shift, b - shift) for a, b in speech or [] if b - shift > 0 and a - shift < duration]
+    regions = [(max(0.0, a - shift), b - shift) for a, b in speech or [] if b - shift > 0 and a - shift < duration]
+    if lead < 0:  # the voice that was cut off before the old start is speech too
+        regions.append((0.0, -lead))
     if plan.manual_captions:  # hand-written lines are used as written, with their own times
         captions = [Caption(a - shift, b - shift, text) for a, b, text in plan.manual_captions
                     if b - shift > 0 and a - shift < duration]
@@ -539,11 +670,16 @@ def render(source: Path, start: float, end: float, words: list[Word], plan: Fini
     timeline = short_style.TimeMap(segments)
     out_captions = [Caption(*span, c.text) for c in captions if (span := timeline.span(c.start, c.end))]
     out_notes = [(*span, text) for a, b, text in plan.notes if (span := timeline.span(a - shift, b - shift, 0.5))]
+    # Effects are in trimmed-clip time, so they follow the moved start too (one passed over stays at 0).
     out_effects = [(round(at, 2), kind) for at, kind in
-                   ((timeline.start(at), kind) for at, kind in plan.sound_effects) if at is not None]
+                   ((timeline.start(max(0.0, at - lead)), kind) for at, kind in plan.sound_effects)
+                   if at is not None]
     drawn = replace(plan, sound_effects=out_effects, notes=out_notes)
     out_duration = timeline.duration
     joined = None if segments == [(0.0, duration)] else segments
+    loudness = settings.get("loudnorm", True)
+    if loudness:  # two passes: measure what will be heard, then one gain for the whole clip
+        loudness = measure_loudness(source, start, duration, joined) or True
     output = Path(output).resolve()
     with tempfile.TemporaryDirectory(prefix="cut_finish_", dir=str(output.parent)) as tmp:
         Path(tmp, "finish.ass").write_text(
@@ -552,12 +688,16 @@ def render(source: Path, start: float, end: float, words: list[Word], plan: Fini
         command = [
             "ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
             "-i", str(Path(source).resolve()),
-            "-filter_complex", build_filter(width, height, out_effects, segments=joined,
-                                            loudnorm=settings.get("loudnorm", True)),
+            "-filter_complex", build_filter(width, height, out_effects, segments=joined, loudnorm=loudness),
             "-map", "[vout]", "-map", "[aout]", *h264_args(crf=20, preset="medium"), "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart", str(output),
         ]
         subprocess.run(command, cwd=tmp, check=True, capture_output=True, timeout=timeout)
+    try:  # YouTube re-encodes by timestamp: a file with broken audio times must not be uploaded
+        av_check.verify_audio_timing(output)
+    except av_check.AudioTimingError:
+        output.unlink(missing_ok=True)
+        raise
     return RenderResult(output, round(out_duration, 3), len(segments))
 
 
@@ -581,6 +721,16 @@ def request_plan(agent: str, model: str, prompt: str, *, timeout: float = 600) -
                                   timeout_sec=timeout, context_length=config.LLM_ANALYSIS_CONTEXT_LENGTH)
         return _json_object(provider.generate(model=model or config.LLM_ANALYSIS_MODEL, prompt=prompt,
                                               output_schema=PLAN_SCHEMA))
+    if agent == agent_runner.API_AGENT:  # clips picked by one Claude API call: plan the same way
+        from . import oneshot_selector
+
+        response = oneshot_selector._client().messages.create(
+            model=oneshot_selector.MODEL, max_tokens=8000,
+            messages=[{"role": "user", "content": prompt + "\n\nJSONオブジェクトだけを返してください。"}],
+            timeout=timeout,
+        )
+        return _json_object("".join(block.text for block in response.content
+                                    if getattr(block, "type", "") == "text"))
     exe = agent_runner.find_executable(agent)
     if not exe:
         raise RuntimeError(f"{agent} が見つかりません")

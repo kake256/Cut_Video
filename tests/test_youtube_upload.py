@@ -111,9 +111,41 @@ class PublishTest(unittest.TestCase):
         with self.assertRaises(youtube_upload.UploadError):
             youtube_upload.publish("abcDEF12345", service_factory=lambda: service)
 
+    def test_schedule_publish_sends_private_with_utc_publish_at(self):
+        sent = {}
+
+        class _Scheduler:
+            def videos(self):
+                return self
+
+            def update(self, part, body):
+                sent.update(body)
+                status = dict(body["status"])
+                return SimpleNamespace(execute=lambda: {"status": status})
+
+        when = youtube_upload.schedule_publish("abcDEF12345", 1_800_000_000, service_factory=_Scheduler)
+        self.assertEqual(sent["status"]["privacyStatus"], "private")
+        self.assertEqual(sent["status"]["publishAt"], "2027-01-15T08:00:00.000Z")
+        self.assertEqual(when, "2027-01-15T08:00:00.000Z")
+
+    def test_schedule_publish_refused_when_youtube_drops_the_time(self):
+        class _Dropping:
+            def videos(self):
+                return self
+
+            def update(self, part, body):
+                return SimpleNamespace(execute=lambda: {"status": {"privacyStatus": "private"}})
+
+        with self.assertRaises(youtube_upload.UploadError):
+            youtube_upload.schedule_publish("abcDEF12345", 1_800_000_000, service_factory=_Dropping)
+
 
 class YouTubeUploadTest(unittest.TestCase):
     def setUp(self):
+        # The synthetic files here are not real mp4s; the audio check is tested below.
+        preflight = patch.object(youtube_upload, "preflight_problems", return_value=[])
+        preflight.start()
+        self.addCleanup(preflight.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.video = self.root / "clip_見どころ.mp4"
@@ -346,6 +378,45 @@ class AutoPublishAppTest(unittest.TestCase):
         self.assertEqual(timer.call_args[0][0], 3.0)
         timer.return_value.start.assert_called_once()
         self.assertIn("終了しました", update["value"])
+
+
+class PreflightTest(unittest.TestCase):
+    """Every upload path goes through upload_private, which checks the file's audio first."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _upload_with(self, video, problems):
+        service = Mock()
+        with patch.object(youtube_upload, "preflight_problems", return_value=problems):
+            return list(youtube_upload.upload_private(video, service_factory=lambda: service)), service
+
+    def test_a_file_with_broken_audio_is_not_uploaded(self):
+        video = self.root / "clip.mp4"
+        video.write_bytes(b"synthetic")
+        with self.assertRaises(youtube_upload.UploadRejected) as caught:
+            self._upload_with(video, ["音声の時刻が 117 か所で乱れています"])
+        self.assertIn("clip.mp4", str(caught.exception))
+        self.assertIn("117", str(caught.exception))
+        self.assertFalse(youtube_upload.receipt_path(video).exists())
+        self.assertIsInstance(caught.exception, youtube_upload.UploadError)  # callers that show UploadError
+
+    def test_an_unreadable_file_is_a_problem_not_a_crash(self):
+        video = self.root / "clip.mp4"
+        video.write_bytes(b"not an mp4")
+        problems = youtube_upload.preflight_problems(video)
+        self.assertEqual(1, len(problems))
+        self.assertIn("確認できません", problems[0])
+
+    def test_an_uploaded_file_is_still_skipped_without_probing(self):
+        video = self.root / "clip.mp4"
+        video.write_bytes(b"synthetic")
+        youtube_upload.receipt_path(video).write_text(json.dumps({"video_id": "old"}), encoding="utf-8")
+        with patch.object(youtube_upload, "preflight_problems", side_effect=AssertionError("probed")):
+            messages = list(youtube_upload.upload_private(video, service_factory=Mock))
+        self.assertEqual("old", messages[-1][1]["video_id"])
 
 
 if __name__ == "__main__":

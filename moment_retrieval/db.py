@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS highlight_candidates (
     category TEXT NOT NULL,
     tags_json TEXT NOT NULL,
     boundary_warning INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(highlight_run_id, ordinal)
 );
 CREATE INDEX IF NOT EXISTS idx_highlight_candidates_run
@@ -386,6 +387,13 @@ def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE highlight_candidates ADD COLUMN "
             "boundary_warning INTEGER NOT NULL DEFAULT 0"
+        )
+    # Extra per-proposal facts from the picking AI (js_score / js_reason for the JS-drawn
+    # Short).  Older rows read back as {}.
+    if highlight_columns and "metadata_json" not in highlight_columns:
+        conn.execute(
+            "ALTER TABLE highlight_candidates ADD COLUMN "
+            "metadata_json TEXT NOT NULL DEFAULT '{}'"
         )
 
     conn.execute(
@@ -1243,13 +1251,14 @@ def replace_highlight_candidates(
         str(item["summary"]), str(item["reason"]), str(item["category"]),
         json.dumps(item.get("tags", []), ensure_ascii=False),
         int(bool(item.get("boundary_warning"))),
+        json.dumps(item.get("metadata") or {}, ensure_ascii=False, sort_keys=True),
     ) for ordinal, item in enumerate(candidates)]
     conn.executemany(
         "INSERT INTO highlight_candidates(highlight_candidate_id, highlight_run_id, ordinal, "
         "source_chapter_ordinal, anchor_start_segment_id, anchor_end_segment_id, "
         "start_segment_id, end_segment_id, "
-        "start_sec, end_sec, title, summary, reason, category, tags_json, boundary_warning) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
+        "start_sec, end_sec, title, summary, reason, category, tags_json, boundary_warning, metadata_json) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
     )
     if commit:
         conn.commit()
@@ -1301,6 +1310,11 @@ def get_highlight_candidates(conn: sqlite3.Connection, highlight_run_id: str) ->
         candidate = dict(row)
         candidate["tags"] = json.loads(candidate.pop("tags_json") or "[]")
         candidate["boundary_warning"] = bool(candidate["boundary_warning"])
+        try:
+            metadata = json.loads(candidate.pop("metadata_json", None) or "{}")
+        except ValueError:
+            metadata = {}
+        candidate["metadata"] = metadata if isinstance(metadata, dict) else {}
         candidates.append(candidate)
     return candidates
 

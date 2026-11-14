@@ -67,6 +67,9 @@ class ClipRequest:
     transcript_revision: str = ""
     # Ask for a 1-2 sentence synopsis in each proposal's summary (the JS-drawn Short's story).
     want_summary: bool = False
+    # Ask for js_score / js_reason per proposal (which clips suit a JS-drawn Short best).
+    # Also turns the two fields on in cut_propose_clips' schema (CUT_VIDEO_JS_SCORE).
+    want_js_score: bool = False
 
     def prompt(self) -> str:
         if self.transcript:
@@ -107,8 +110,11 @@ class ClipRequest:
         )
 
     def _summary_rule(self) -> str:
-        return ("summaryに話の流れが分かる1〜2文のあらすじを書く（JS描画ショートの台本に使う）。"
-                if self.want_summary else "")
+        from .js_suitability import PROMPT_RULE
+
+        return (("summaryに話の流れが分かる1〜2文のあらすじを書く（JS描画ショートの台本に使う）。"
+                 if self.want_summary else "")
+                + (PROMPT_RULE if self.want_js_score else ""))
 
     def _avoid(self) -> str:
         if not self.used_ranges:
@@ -207,31 +213,35 @@ def available_agents() -> dict[str, bool]:
     return found
 
 
-def _mcp_server() -> dict:
+JS_SCORE_ENV = "CUT_VIDEO_JS_SCORE"
+
+
+def _mcp_server(js_score: bool = False) -> dict:
+    env = {key: value for key, value in os.environ.items()
+           if key.startswith("CUT_VIDEO_") and key != JS_SCORE_ENV}
+    if js_score:  # per run, never from the app's own environment
+        env[JS_SCORE_ENV] = "1"
     return {
         "command": sys.executable,
         "args": [str(REPO_ROOT / "cut_mcp.py")],
-        "env": {
-            "PYTHONIOENCODING": "utf-8",
-            **{key: value for key, value in os.environ.items() if key.startswith("CUT_VIDEO_")},
-        },
+        "env": {"PYTHONIOENCODING": "utf-8", **env},
     }
 
 
 def build_command(agent: str, executable: str, config_dir: Path, *,
-                  model: str = "", effort: str = "") -> list[str]:
+                  model: str = "", effort: str = "", js_score: bool = False) -> list[str]:
     """Command reading the prompt from stdin and allowing only CUT's MCP tools."""
     model, effort = validate_model(agent, model, effort)
     if agent == "claude":
         config_path = config_dir / "cut_mcp.json"
-        config_path.write_text(json.dumps({"mcpServers": {"cut": _mcp_server()}}), encoding="utf-8")
+        config_path.write_text(json.dumps({"mcpServers": {"cut": _mcp_server(js_score)}}), encoding="utf-8")
         command = [
             executable, "-p", "--strict-mcp-config", "--mcp-config", str(config_path),
             "--allowedTools", ",".join(f"mcp__cut__{name}" for name in CLAUDE_TOOLS),
             "--output-format", "text",
         ]
         return command + (["--model", model] if model else [])
-    server = _mcp_server()
+    server = _mcp_server(js_score)
     overrides = [
         f"mcp_servers.cut_auto.command={json.dumps(server['command'])}",
         f"mcp_servers.cut_auto.args={json.dumps(server['args'])}",
@@ -269,7 +279,8 @@ def run_agent(
     if not executable:
         raise AgentError(f"{AGENT_LABELS.get(agent, agent)} が見つかりません。インストールとログインを確認してください。")
     with tempfile.TemporaryDirectory(prefix="cut_agent_") as config_dir:
-        command = build_command(agent, executable, Path(config_dir), model=model, effort=effort)
+        command = build_command(agent, executable, Path(config_dir), model=model, effort=effort,
+                                js_score=bool(getattr(request, "want_js_score", False)))
         process = runner(
             command, cwd=str(REPO_ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",

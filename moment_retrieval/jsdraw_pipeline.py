@@ -127,28 +127,42 @@ def range_for_clip(clip: Path) -> tuple[float, float]:
     return widen_range(start, end, segments, stream_end=stream_end, used=for_video(video_id))
 
 
+def candidate_for(clip: Path, highlight_run_id: str = "") -> dict | None:
+    """The highlight proposal an exported clip was cut from (matched by its source range)."""
+    if not highlight_run_id:
+        return None
+    _video_id, start, end, _meta = source_range(clip)
+    conn = db.get_conn()
+    try:
+        candidates = db.get_highlight_candidates(conn, highlight_run_id)
+    finally:
+        conn.close()
+    best = min(candidates, default=None,
+               key=lambda c: abs(float(c["start_sec"]) - start) + abs(float(c["end_sec"]) - end))
+    if best is not None and abs(float(best["start_sec"]) - start) + abs(float(best["end_sec"]) - end) < 5.0:
+        return best
+    return None
+
+
 def title_and_story(clip: Path, highlight_run_id: str = "") -> tuple[str, str]:
     """The proposal's title, and its synopsis (summary) or the reason it was picked."""
-    _video_id, start, end, meta = source_range(clip)
+    _video_id, _start, _end, meta = source_range(clip)
     title, story = str(meta.get("title") or ""), ""
-    if highlight_run_id:
-        conn = db.get_conn()
-        try:
-            candidates = db.get_highlight_candidates(conn, highlight_run_id)
-        finally:
-            conn.close()
-        best = min(candidates, default=None,
-                   key=lambda c: abs(float(c["start_sec"]) - start) + abs(float(c["end_sec"]) - end))
-        if best is not None and abs(float(best["start_sec"]) - start) + abs(float(best["end_sec"]) - end) < 5.0:
-            title = str(best["title"] or title)
-            story = str(best["summary"] or "").strip() or str(best["reason"] or "").strip()
+    best = candidate_for(clip, highlight_run_id)
+    if best is not None:
+        title = str(best["title"] or title)
+        story = str(best["summary"] or "").strip() or str(best["reason"] or "").strip()
     return title, story
 
 
 def make_for_clip(clip: Path, *, model: str, highlight_run_id: str = "", section=None,
                   log: Log | None = None, make_short: Callable | None = None,
-                  backend: str = "api", codex_model: str = "") -> dict:
-    """Replace the exported clip with a JS-drawn Short.  Raises on any failure (caller falls back)."""
+                  backend: str = "api", codex_model: str = "", suitability: dict | None = None) -> dict:
+    """Replace the exported clip with a JS-drawn Short.  Raises on any failure (caller falls back).
+
+    ``suitability`` ({"js_score", "js_reason"} from the picking AI) is written into
+    ``<clip>.jsdraw.json`` so it can be compared with how the Short did later.
+    """
     from . import jsdraw_short
 
     make_short = make_short or jsdraw_short.make_short
@@ -178,6 +192,7 @@ def make_for_clip(clip: Path, *, model: str, highlight_run_id: str = "", section
               "range": [start, end], "title": title, "story": story,
               "usd": result.get("usd"), "usd_equivalent": result.get("usd_equivalent"),
               "seconds": result.get("seconds"),
-              "segs_total_generated": result.get("segs_total_generated"), "usage": result.get("usage")}
+              "segs_total_generated": result.get("segs_total_generated"), "usage": result.get("usage"),
+              "js_score": (suitability or {}).get("js_score"), "js_reason": (suitability or {}).get("js_reason") or ""}
     clip.with_suffix(".jsdraw.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return record

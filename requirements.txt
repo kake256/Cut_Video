@@ -15,3 +15,5 @@ yt-dlp[default]>=2026.8.19
 # Optional: upload saved clips to the user's own YouTube channel as private videos.
 google-api-python-client>=2.100
 google-auth-oauthlib>=1.2
+# JS描画ショート（Claude API でショートを自動生成。Anthropic のAPIキーを使うときだけ必要）
+anthropic>=0.80

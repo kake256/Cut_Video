@@ -120,8 +120,36 @@ def resolve(provider: str) -> tuple[str, str]:
     return "", ""
 
 
+OPTIONS_FILE = "api_key_options.json"
+# Environment variables that would make Claude Code bill an API account instead of the login.
+CLAUDE_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _options_path() -> Path:
+    return Path(config.DATA_DIR) / OPTIONS_FILE
+
+
+def claude_cli_uses_key() -> bool:
+    """Off by default: the Anthropic key is for the app's own API features (one-call picking,
+    JS drawing); Claude Code keeps using its login unless the user turns this on."""
+    try:
+        data = json.loads(_options_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("claude_cli_uses_key") is True
+
+
+def set_claude_cli_uses_key(enabled: bool) -> None:
+    target = _options_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"claude_cli_uses_key": bool(enabled)}, indent=2), encoding="utf-8")
+
+
 def has_key(agent: str) -> bool:
+    """Whether the agent's CLI is started with an API key (Claude Code only when opted in)."""
     provider = AGENT_PROVIDER.get(agent)
+    if agent == "claude" and not claude_cli_uses_key():
+        return False
     return bool(provider and resolve(provider)[0])
 
 
@@ -145,6 +173,11 @@ def agent_env(agent: str, base: dict | None = None) -> dict:
     """Environment for the Codex / Claude Code process, with the key added when one is set."""
     env = dict(os.environ if base is None else base)
     provider = AGENT_PROVIDER.get(agent)
+    if agent == "claude" and not claude_cli_uses_key():
+        # Use the login: drop any key, saved or inherited, so the CLI cannot bill an API account.
+        for name in CLAUDE_KEY_VARS:
+            env.pop(name, None)
+        return env
     if provider:
         key, _source = resolve(provider)
         if key:

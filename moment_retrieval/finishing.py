@@ -20,7 +20,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import short_style
+from . import av_check, short_style
 from .short_video import _ass_text, _ass_time, blurred_background
 from .video_encoder import h264_args
 
@@ -613,7 +613,7 @@ def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]]
     level = f"{loudnorm_filter(measured)},aresample=48000," if loudnorm else ""
     main = f"{audio_in}{level}aformat=sample_rates=48000:channel_layouts=stereo"
     if not sound_effects:
-        parts.append(f"{main}[aout]")
+        parts.append(f"{main},{av_check.AUDIO_RETIME}[aout]")
         return ";".join(parts)
     labels = []
     for index, (at, kind) in enumerate(sound_effects):
@@ -622,7 +622,7 @@ def build_filter(width: int, height: int, sound_effects: list[tuple[float, str]]
                      f"adelay={delay}|{delay},volume=0.7[sfx{index}]")
         labels.append(f"[sfx{index}]")
     parts.append(f"{main}[main]")
-    parts.append(f"[main]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:normalize=0,{LIMITER}[aout]")
+    parts.append(f"[main]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:normalize=0,{LIMITER},{av_check.AUDIO_RETIME}[aout]")
     return ";".join(parts)
 
 
@@ -693,6 +693,11 @@ def render(source: Path, start: float, end: float, words: list[Word], plan: Fini
             "-movflags", "+faststart", str(output),
         ]
         subprocess.run(command, cwd=tmp, check=True, capture_output=True, timeout=timeout)
+    try:  # YouTube re-encodes by timestamp: a file with broken audio times must not be uploaded
+        av_check.verify_audio_timing(output)
+    except av_check.AudioTimingError:
+        output.unlink(missing_ok=True)
+        raise
     return RenderResult(output, round(out_duration, 3), len(segments))
 
 
@@ -716,6 +721,16 @@ def request_plan(agent: str, model: str, prompt: str, *, timeout: float = 600) -
                                   timeout_sec=timeout, context_length=config.LLM_ANALYSIS_CONTEXT_LENGTH)
         return _json_object(provider.generate(model=model or config.LLM_ANALYSIS_MODEL, prompt=prompt,
                                               output_schema=PLAN_SCHEMA))
+    if agent == agent_runner.API_AGENT:  # clips picked by one Claude API call: plan the same way
+        from . import oneshot_selector
+
+        response = oneshot_selector._client().messages.create(
+            model=oneshot_selector.MODEL, max_tokens=8000,
+            messages=[{"role": "user", "content": prompt + "\n\nJSONオブジェクトだけを返してください。"}],
+            timeout=timeout,
+        )
+        return _json_object("".join(block.text for block in response.content
+                                    if getattr(block, "type", "") == "text"))
     exe = agent_runner.find_executable(agent)
     if not exe:
         raise RuntimeError(f"{agent} が見つかりません")

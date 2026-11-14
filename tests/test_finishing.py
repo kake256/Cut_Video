@@ -132,7 +132,7 @@ class RenderPlanTest(unittest.TestCase):
         ass = finishing.build_ass([Caption(0.5, 1.5, "キレた"), Caption(2.0, 3.0, "落ち着く")], plan, 1080, 1920, 4.0)
         self.assertIn(r"\fscx118", ass.split("キレた")[0].splitlines()[-1])
         self.assertNotIn(r"\fscx118", [line for line in ass.splitlines() if "落ち着く" in line][0])
-        self.assertIn(r"Title,,0,0,0,,{\an5\pos(540,150)\c&H3CDCFF&}引き", ass)
+        self.assertIn(r"Title,,0,0,0,,{\an5\pos(540,580)\c&H3CDCFF&}引き", ass)
         self.assertIn(r"Note,,0,0,0,,{\an5\pos(540,1300)}※補足", ass)
         self.assertIn(r"Footer,,0,0,0,,{\an5\pos(540,1870)}ゲラサブロウ", ass)
         self.assertIn(r"{\an5\pos(540,1430)}落ち着く", ass)
@@ -145,6 +145,20 @@ class RenderPlanTest(unittest.TestCase):
         self.assertIn("loudnorm=I=-16:TP=-1.5:LRA=11", graph)
         self.assertNotIn("zoompan", graph)
         self.assertNotIn("loudnorm", finishing.build_filter(1080, 1920, [], loudnorm=False))
+        # Audio times are renumbered from the sample count last (loudnorm's own times can be broken).
+        self.assertIn("latency=enabled,asetpts=N/SR/TB[aout]", graph)
+        for loudness in (True, False, {"input_i": -30.0, "input_tp": -20.0, "input_lra": 6.0,
+                                       "input_thresh": -40.0, "target_offset": 0.3}):
+            self.assertIn("channel_layouts=stereo,asetpts=N/SR/TB[aout]",
+                          finishing.build_filter(1080, 1920, [], loudnorm=loudness))
+
+    def test_two_line_title_sits_just_above_the_picture(self):
+        plan = FinishPlan(title_lines=[("上の行", False), ("強調の行", True)])
+        ass = finishing.build_ass([], plan, 1080, 1920, 4.0)
+        self.assertIn(r"{\an5\pos(540,471)}上の行", ass)
+        self.assertIn(r"{\an5\pos(540,580)\c&H3CDCFF&}強調の行", ass)
+        # Bottom of the second line (centre + half size + outline) stays above a 16:9 picture (y=656).
+        self.assertLess(580 + short_style.TITLE_SIZE / 2 + short_style.TITLE_OUTLINE, 656)
 
     def test_kept_segments_are_joined_in_the_graph(self):
         graph = finishing.build_filter(1080, 1920, [], segments=[(0.0, 2.0), (3.5, 6.0)])
@@ -206,6 +220,7 @@ class RenderPlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(finishing, "speech_start_shift", return_value=-0.5), \
                 patch.object(finishing, "measure_loudness", return_value=None), \
+                patch.object(finishing.av_check, "verify_audio_timing"), \
                 patch.object(finishing.subprocess, "run",
                              side_effect=lambda command, cwd, **_: calls.append(
                                  (command, Path(cwd, "finish.ass").read_text(encoding="utf-8")))):

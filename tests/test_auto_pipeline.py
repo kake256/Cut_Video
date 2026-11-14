@@ -410,7 +410,7 @@ class DeferredRenderTest(_Isolated):
         requests = []
         for finish in (False, True):
             job = auto_pipeline.AutoJob(job_id=f"auto_cap_{finish}", source="x", agent="claude",
-                                        finish=finish, video_id="vid_x")
+                                        finish=finish, video_id="vid_x", preload_transcript=False)
             with patch.object(pipeline, "_signals", return_value=[]), \
                     patch("moment_retrieval.used_ranges.for_video", return_value=[]), \
                     patch.object(agent_runner, "run_agent",
@@ -456,6 +456,22 @@ def _pid_running(pid: int) -> bool:
         ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True
     ).stdout
     return str(pid) in listing
+
+
+class UploadPreflightTest(_Isolated):
+    def test_a_rejected_file_is_logged_and_the_others_still_go_up(self):
+        pipeline = auto_pipeline.AutoPipeline(steps={})
+        job = auto_pipeline.AutoJob(job_id="auto_pre", source="x", agent="codex", outputs=["bad.mp4", "good.mp4"])
+
+        def upload_private(path, **_):
+            if path.name == "bad.mp4":
+                raise youtube_upload.UploadRejected("アップロードしませんでした: bad.mp4（音声の時刻が乱れています）")
+            yield "アップロード完了", {"video_id": "yt2", "title": "良い", "privacy_status": "private"}
+
+        with patch.object(youtube_upload, "setup_problems", return_value=[]),                 patch.object(youtube_upload, "token_path", return_value=Path(__file__)),                 patch.object(youtube_upload, "upload_private", side_effect=upload_private),                 patch("moment_retrieval.used_ranges.record_from_clip"):
+            pipeline._upload(job)
+        self.assertEqual(["yt2"], [item["video_id"] for item in job.uploads])
+        self.assertTrue(any("bad.mp4" in line and "乱れ" in line for line in job.log))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,344 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head><body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+// コードで描くショート 試作2（Fable版）：Codexリセット券消失事件
+// 全面を Canvas で描き、配信の顔カメラ（face/00001.jpg〜, 30fps）を「LIVE」枠として重ねる。
+// draw(t, s, tEnd) : t = 出力動画の時刻, s = 元配信の時刻（秒）
+const W = 1080, H = 1920, OFF = 2105.0, FPS = 30;
+const cv = document.getElementById('c'); let g = cv.getContext('2d');
+const F = '"IPAGothic","IPAPGothic",sans-serif', MONO = '"JetBrains Mono",monospace', EN = '"Inter",sans-serif';
+let FACE = null;
+window.loadFace = async function (s) {
+  const i = Math.max(1, Math.min(1830, Math.round((s - OFF) * FPS) + 1));
+  const im = new Image(); im.src = 'face/' + String(i).padStart(5, '0') + '.jpg'; await im.decode(); FACE = im;
+};
+
+const SUBS = [
+ [2112.73, 2114.69, '今日一個ガチやらかしがあって'], [2114.69, 2116.59, '朝まで俺Codexで'],
+ [2119.54, 2120.94, 'なんかその卒論のための'], [2120.94, 2124.16, 'いろいろ倫理申請やってたんですよ'],
+ [2124.16, 2125.70, 'でCodexの利用枠が'], [2125.70, 2128.0, '残り数パーセントになっちゃって'],
+ [2128.22, 2130.34, 'で10月30日まで使える'], [2131.56, 2133.40, 'リセット券残してたから'],
+ [2134.26, 2135.84, 'あの朝のね'], [2135.84, 2137.22, '6時ぐらいになって'],
+ [2137.22, 2140.2, 'よしそろそろ使おうかなってやったら'], [2140.58, 2142.80, 'リセット券なくなってて'],
+ [2143.04, 2143.84, 'へえって'], [2143.84, 2145.32, 'ふざけんなと思って'], [2145.32, 2148.58, 'リセット券なくなる…'],
+ [2149.70, 2151.14, '今日なくなるから'], [2151.14, 2153.92, '今日に合わせていい感じに使ってったのに'],
+ [2153.92, 2156.6, 'リセットできなかったんだけど'], [2157.82, 2158.92, '超びっくりした'], [2158.92, 2159.9, '超悔しい'],
+ [2160.16, 2163.6, '1回1200円分ぐらいの価値あるかな'],
+];
+
+// ---------- 小道具 ----------
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const ease = x => { x = clamp(x); return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+const out3 = x => 1 - Math.pow(1 - clamp(x), 3);
+const back = x => { x = clamp(x); const c = 1.7; return 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2); };
+const lerp = (a, b, x) => a + (b - a) * x;
+const mix = (c1, c2, m) => `rgb(${c1.map((v, i) => Math.round(lerp(v, c2[i], m)))})`;
+function rnd(n) { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+function rr(x, y, w, h, r) { g.beginPath(); g.roundRect(x, y, w, h, r); }
+function text(str, x, y, size, fill, o = {}) {
+  g.save(); g.font = `${o.weight || ''} ${size}px ${o.font || F}`; g.textAlign = o.align || 'center'; g.textBaseline = 'middle';
+  if (o.rot || o.scale) { g.translate(x, y); g.rotate(o.rot || 0); g.scale(o.scale || 1, o.scale || 1); x = 0; y = 0; }
+  if (o.stroke) { g.lineJoin = 'round'; g.lineWidth = o.sw || size * 0.2; g.strokeStyle = o.stroke; g.strokeText(str, x, y); }
+  g.fillStyle = fill; g.fillText(str, x, y);
+  if (o.bold) { g.lineJoin = 'round'; g.lineWidth = size * 0.04; g.strokeStyle = fill; g.strokeText(str, x, y); } // IPAゴシックに太字がないので線で太らせる
+  g.restore();
+}
+
+// ---------- 部屋（夜→朝） ----------
+const SKY = { n0: [8, 10, 32], n1: [28, 30, 78], d0: [255, 140, 96], d1: [255, 220, 150] };
+function windowView(s, m) {
+  const x = 150, y = 240, w = 780, h = 400;
+  g.save(); rr(x, y, w, h, 18); g.clip();
+  const gr = g.createLinearGradient(0, y, 0, y + h); gr.addColorStop(0, mix(SKY.n0, SKY.d0, m)); gr.addColorStop(1, mix(SKY.n1, SKY.d1, m));
+  g.fillStyle = gr; g.fillRect(x, y, w, h);
+  // 星と月
+  for (let i = 0; i < 46; i++) { g.globalAlpha = (1 - m) * (.3 + .7 * Math.abs(Math.sin(s * (1 + rnd(i) * 2) + i))); g.fillStyle = '#fff'; const r = 1.5 + rnd(i + 20) * 2.5; g.beginPath(); g.arc(x + rnd(i) * w, y + rnd(i + 9) * h * .6, r, 0, 7); g.fill(); }
+  g.globalAlpha = 1 - m; const mx = x + 610 + m * 200, my = y + 110 - m * 90;
+  g.fillStyle = '#fbf3c4'; g.beginPath(); g.arc(mx, my, 48, 0, 7); g.fill(); g.fillStyle = mix(SKY.n0, SKY.d0, m); g.beginPath(); g.arc(mx + 22, my - 14, 44, 0, 7); g.fill();
+  g.globalAlpha = 1;
+  // 朝日
+  if (m > 0) { const sx = x + 230, sy = y + h - 60 - out3(m) * 150; const sg = g.createRadialGradient(sx, sy, 20, sx, sy, 420);
+    sg.addColorStop(0, 'rgba(255,250,210,1)'); sg.addColorStop(.12, 'rgba(255,225,120,.95)'); sg.addColorStop(1, 'rgba(255,170,90,0)'); g.globalAlpha = m; g.fillStyle = sg; g.fillRect(x, y, w, h); g.globalAlpha = 1; }
+  // ビル群（2層）
+  for (let L = 0; L < 2; L++) { let bx = x - 20; let i = 0;
+    while (bx < x + w) { const bw = 60 + rnd(i + L * 40) * 90, bh = (L ? 120 : 190) + rnd(i * 3 + L * 17) * (L ? 150 : 170);
+      g.fillStyle = L ? mix([14, 16, 40], [70, 44, 60], m) : mix([24, 27, 62], [150, 92, 96], m); g.fillRect(bx, y + h - bh, bw, bh);
+      for (let r = 0; r < Math.floor(bh / 34) - 1; r++) for (let c = 0; c < Math.floor(bw / 24) - 1; c++) { const k = rnd(i * 31 + r * 7 + c * 13 + L * 5);
+        const on = k > .55 && rnd(i + r + c + Math.floor(s / 4 + k * 9)) > .15; if (!on) continue; g.globalAlpha = (1 - m) * .9; g.fillStyle = k > .8 ? '#9fe3ff' : '#ffd77a'; g.fillRect(bx + 12 + c * 24, y + h - bh + 16 + r * 34, 10, 16); }
+      g.globalAlpha = 1; bx += bw + 6; i++; } }
+  // 朝の鳥
+  if (m > .6) { g.strokeStyle = '#3a2430'; g.lineWidth = 4; g.lineCap = 'round'; for (let i = 0; i < 4; i++) { const bx = x + ((s * 60 + i * 190) % (w + 100)) - 50, by = y + 110 + i * 34 + Math.sin(s * 2 + i) * 12, f = Math.sin(s * 10 + i) * 10;
+      g.beginPath(); g.moveTo(bx - 16, by - f); g.quadraticCurveTo(bx - 6, by - 8, bx, by); g.quadraticCurveTo(bx + 6, by - 8, bx + 16, by - f); g.stroke(); } }
+  g.restore();
+  g.strokeStyle = '#11131f'; g.lineWidth = 22; rr(x, y, w, h, 18); g.stroke(); g.lineWidth = 12; g.beginPath(); g.moveTo(x + w / 2, y); g.lineTo(x + w / 2, y + h); g.moveTo(x, y + h * .42); g.lineTo(x + w, y + h * .42); g.stroke();
+  g.fillStyle = '#11131f'; rr(x - 30, y + h, w + 60, 26, 8); g.fill();
+}
+function ring(cx, cy, r, v, s) {
+  const red = v < .1, col = red ? '#ff4d5e' : v < .35 ? '#ffb347' : '#3ddc97';
+  g.lineWidth = 22; g.strokeStyle = '#222a3f'; g.beginPath(); g.arc(cx, cy, r, 0, 7); g.stroke();
+  g.strokeStyle = col; g.lineCap = 'round'; g.beginPath(); g.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + Math.max(.04, v) * Math.PI * 2); g.stroke(); g.lineCap = 'butt';
+  const p = red ? 1 + Math.sin(s * 14) * .06 : 1;
+  text(Math.round(v * 100) + '%', cx, cy - 6, 58, col, { font: EN, weight: 800, scale: p }); text('利用枠 残り', cx, cy + 44, 22, '#93a0bd');
+}
+function monitor(s, usage, dlg) {
+  const x = 120, y = 720, w = 840, h = 460;
+  g.fillStyle = '#0a0b12'; rr(x - 22, y - 22, w + 44, h + 44, 30); g.fill();
+  g.fillStyle = '#23263a'; g.fillRect(W / 2 - 40, y + h + 22, 80, 70); rr(W / 2 - 170, y + h + 84, 340, 22, 11); g.fill();
+  g.save(); rr(x, y, w, h, 12); g.clip(); g.fillStyle = '#0e1424'; g.fillRect(x, y, w, h);
+  // 文書ウィンドウ
+  g.fillStyle = '#f3f1ea'; rr(x + 430, y + 30, 380, 250, 10); g.fill(); g.fillStyle = '#d9d5c8'; g.fillRect(x + 430, y + 30, 380, 36);
+  text('倫理申請書_v7_final.docx', x + 446, y + 49, 20, '#444', { align: 'left' });
+  for (let i = 0; i < 7; i++) { g.fillStyle = '#b9b4a6'; g.fillRect(x + 452, y + 86 + i * 26, 250 + rnd(i) * 90, 9); }
+  // ターミナル
+  g.fillStyle = '#080c16'; rr(x + 24, y + 26, 470, 410, 10); g.fill(); g.fillStyle = '#1b2236'; g.fillRect(x + 24, y + 26, 470, 34);
+  ['#ff5f57', '#febc2e', '#28c840'].forEach((c, i) => { g.fillStyle = c; g.beginPath(); g.arc(x + 46 + i * 24, y + 43, 7, 0, 7); g.fill(); });
+  text('codex — 卒論', x + 260, y + 43, 20, '#8a96b3');
+  g.save(); g.beginPath(); g.rect(x + 24, y + 64, 470, 370); g.clip();
+  const sp = usage > .05 ? 70 : 0, off = (s * sp) % 30;
+  for (let i = 0; i < 15; i++) { const n = i + Math.floor(s * sp / 30), ind = (rnd(n) * 4 | 0) * 26, len = 90 + rnd(n + 9) * 250;
+    g.fillStyle = ['#7aa2f7', '#9ece6a', '#e0af68', '#bb9af7', '#5e6a8a'][(rnd(n + 3) * 5) | 0]; rr(x + 44 + ind, y + 76 + i * 30 - off, len, 12, 6); g.fill(); }
+  g.restore();
+  // 利用枠リング
+  g.fillStyle = 'rgba(16,22,40,.96)'; rr(x + 560, y + 222, 250, 220, 16); g.fill(); ring(x + 685, y + 328, 76, usage, s);
+  if (dlg) dlg(x, y, w, h);
+  g.restore();
+  // 画面の光
+  const gl = g.createRadialGradient(W / 2, y + h / 2, 100, W / 2, y + h / 2, 760); gl.addColorStop(0, 'rgba(110,150,255,.16)'); gl.addColorStop(1, 'rgba(110,150,255,0)'); g.fillStyle = gl; g.fillRect(0, 400, W, 1520);
+}
+function deskClock(s, hr, ringing) {
+  const x = 700, y = 1330; g.save(); g.translate(x + (ringing ? Math.sin(s * 70) * 7 : 0), y);
+  g.fillStyle = '#161927'; rr(0, 0, 290, 120, 20); g.fill(); g.fillStyle = '#05070c'; rr(12, 12, 266, 96, 12); g.fill();
+  const hh = Math.floor(hr), mm = Math.floor((hr % 1) * 60 + 1e-6);
+  text(`${hh}:${String(mm).padStart(2, '0')}`, 160, 62, 76, ringing ? '#ffcf5a' : '#69e0ff', { font: MONO, weight: 800 }); text('AM', 46, 40, 20, '#69e0ff', { font: EN, weight: 700 });
+  if (ringing) { g.strokeStyle = '#ffcf5a'; g.lineWidth = 6; g.lineCap = 'round'; for (let i = 0; i < 3; i++) { const a = (s * 3 + i / 3) % 1; g.globalAlpha = 1 - a; g.beginPath(); g.arc(145, 60, 170 + a * 90, -2.3, -.85); g.stroke(); } }
+  g.restore(); g.globalAlpha = 1;
+}
+function mug(s) {
+  const x = 520, y = 1335; g.fillStyle = '#e8e2d4'; rr(x, y, 110, 120, 14); g.fill(); g.strokeStyle = '#e8e2d4'; g.lineWidth = 14; g.beginPath(); g.arc(x + 118, y + 58, 30, -1.3, 1.3); g.stroke();
+  g.fillStyle = '#c0392b'; g.fillRect(x, y + 44, 110, 16);
+  g.strokeStyle = 'rgba(255,255,255,.35)'; g.lineWidth = 7; g.lineCap = 'round';
+  for (let i = 0; i < 3; i++) { g.beginPath(); for (let k = 0; k <= 12; k++) { const yy = y - 12 - k * 11, xx = x + 30 + i * 26 + Math.sin(s * 2 + k * .6 + i * 2) * 9; k ? g.lineTo(xx, yy) : g.moveTo(xx, yy); } g.stroke(); }
+}
+function keyboard(s, typing) {
+  const x = 280, y = 1500; g.fillStyle = '#161927'; rr(x, y, 380, 110, 14); g.fill();
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 11; c++) { const lit = typing && rnd(r * 11 + c + Math.floor(s * 14)) > .86; g.fillStyle = lit ? '#8fb4ff' : '#2a3048'; rr(x + 14 + c * 32.5, y + 12 + r * 30, 26, 22, 5); g.fill(); }
+}
+function room(s, m, usage, hr, o = {}) {
+  const wall = g.createLinearGradient(0, 0, 0, H); wall.addColorStop(0, mix([16, 18, 40], [120, 84, 92], m)); wall.addColorStop(1, mix([10, 11, 24], [70, 52, 62], m));
+  g.fillStyle = wall; g.fillRect(0, 0, W, H);
+  windowView(s, m);
+  // 朝の光が床に差す
+  if (m > 0) { g.globalAlpha = m * .22; g.fillStyle = '#ffd98a'; g.beginPath(); g.moveTo(150, 666); g.lineTo(930, 666); g.lineTo(1080, 1300); g.lineTo(-60, 1300); g.fill(); g.globalAlpha = 1; }
+  g.fillStyle = mix([34, 26, 30], [92, 62, 50], m); g.fillRect(0, 1290, W, 630); g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(0, 1290, W, 14);
+  monitor(s, usage, o.dlg); mug(s); deskClock(s, hr, o.ringing);
+}
+
+// ---------- リセット券 ----------
+function ticket(cx, cy, sc, rot, s, o = {}) {
+  g.save(); g.translate(cx, cy); g.rotate(rot); g.scale(sc, sc);
+  const w = 640, h = 290;
+  const path = () => { g.beginPath(); g.roundRect(-w / 2, -h / 2, w, h, 26); g.arc(-w / 2, 0, 36, 0, 7); g.arc(w / 2, 0, 36, 0, 7); };
+  g.save(); g.beginPath(); g.roundRect(-w / 2, -h / 2, w, h, 26); g.clip();
+  const gr = g.createLinearGradient(-w / 2, -h / 2, w / 2, h / 2); gr.addColorStop(0, '#ffcf3f'); gr.addColorStop(.45, '#fff3b0'); gr.addColorStop(1, '#ffa62b'); g.fillStyle = gr; g.fillRect(-w / 2, -h / 2, w, h);
+  g.strokeStyle = 'rgba(140,90,0,.5)'; g.lineWidth = 4; rr(-w / 2 + 16, -h / 2 + 16, w - 32, h - 32, 16); g.stroke();
+  g.setLineDash([14, 12]); g.beginPath(); g.moveTo(150, -h / 2 + 22); g.lineTo(150, h / 2 - 22); g.stroke(); g.setLineDash([]);
+  text('RESET TICKET', -80, -92, 26, '#9a6500', { font: EN, weight: 800 });
+  text('リセット券', -80, -22, 88, '#5a3600', { bold: 1 }); text('利用枠を 100% に回復', -80, 62, 32, '#7a4a00');
+  text('期限', 222, -84, 28, '#7a4a00'); text('10/30', 218, 76, 48, '#c0392b', { font: EN, weight: 800 }); text('まで', 222, -50, 28, '#7a4a00');
+  if (!o.dead) { const sh = ((s * .55) % 1.7) - .35; g.globalCompositeOperation = 'lighter'; g.save(); g.transform(1, 0, -.4, 1, 0, 0);
+    const lg = g.createLinearGradient(-w / 2 + sh * w, 0, -w / 2 + sh * w + 150, 0); lg.addColorStop(0, 'rgba(255,255,255,0)'); lg.addColorStop(.5, 'rgba(255,255,255,.7)'); lg.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = lg; g.fillRect(-w, -h, w * 2, h * 2); g.restore(); }
+  g.restore();
+  g.globalCompositeOperation = 'destination-out'; g.beginPath(); g.arc(-w / 2, 0, 36, 0, 7); g.arc(w / 2, 0, 36, 0, 7); g.fill(); g.globalCompositeOperation = 'source-over';
+  g.restore();
+}
+// 券のレイヤーだけ別キャンバスに描く（切り欠きと、粒になって消える処理のため）
+const tc = document.createElement('canvas'); tc.width = 760; tc.height = 380; const tg = tc.getContext('2d');
+function ticketLayer(s, dead) { const main = g; tg.clearRect(0, 0, 760, 380); g = tg; ticket(380, 190, 1, 0, s, { dead }); g = main; }
+function drawTicket(cx, cy, sc, rot, s, dead) { ticketLayer(s, dead); g.save(); g.translate(cx, cy); g.rotate(rot); g.scale(sc, sc); g.drawImage(tc, -380, -190); g.restore(); }
+
+function rays(cx, cy, s, a, col) {
+  g.save(); g.translate(cx, cy); g.rotate(s * .25); g.globalAlpha = a;
+  for (let i = 0; i < 18; i++) { g.rotate(Math.PI * 2 / 18); const gr = g.createLinearGradient(0, 0, 0, -1100); gr.addColorStop(0, col); gr.addColorStop(1, 'rgba(255,200,80,0)'); g.fillStyle = gr; g.beginPath(); g.moveTo(-8, 0); g.lineTo(-70 - (i % 2) * 40, -1100); g.lineTo(70 + (i % 2) * 40, -1100); g.lineTo(8, 0); g.fill(); }
+  g.restore(); g.globalAlpha = 1;
+}
+function sparkle(x, y, r, a) { g.save(); g.globalAlpha = a; g.fillStyle = '#fff'; g.translate(x, y); g.beginPath(); for (let i = 0; i < 8; i++) { const rad = i % 2 ? r * .22 : r, an = i * Math.PI / 4; g.lineTo(Math.cos(an) * rad, Math.sin(an) * rad); } g.fill(); g.restore(); }
+function calendarFlip(cx, cy, s, t0) {
+  const k = back((s - t0) / .45); if (k <= 0) return;
+  const days = [27, 28, 29, 30], p = clamp((s - t0 - .3) / 1.5) * 3, idx = Math.min(3, Math.floor(p)), fr = p - idx;
+  g.save(); g.translate(cx, cy); g.scale(k, k); g.rotate(.05);
+  g.fillStyle = 'rgba(0,0,0,.35)'; rr(-150, -160, 320, 360, 22); g.fill();
+  g.fillStyle = '#fff'; rr(-160, -175, 320, 360, 22); g.fill(); g.fillStyle = '#d64545'; g.beginPath(); g.roundRect(-160, -175, 320, 86, [22, 22, 0, 0]); g.fill();
+  text('10月', 0, -130, 46, '#fff', { bold: 1 });
+  text(String(days[idx]), 0, 55, 190, idx === 3 ? '#c0392b' : '#222', { font: EN, weight: 800 });
+  if (idx < 3 && fr > .5) { const f = (fr - .5) * 2; g.save(); g.translate(0, -89); g.scale(1, 1 - f); g.fillStyle = '#eee'; g.fillRect(-160, 0, 320, 274); g.restore(); }
+  if (idx === 3) { const c = clamp((s - t0 - 1.9) / .5); g.strokeStyle = '#e02020'; g.lineWidth = 12; g.lineCap = 'round'; g.beginPath(); g.ellipse(0, 55, 135, 105, -.15, -1.2, -1.2 + c * 6.7); g.stroke();
+    if (c >= 1) text('今日まで！', 0, 235, 54, '#fff', { stroke: '#c0392b', bold: 1, rot: -.04 }); }
+  g.restore();
+}
+
+// ---------- 消滅の画面 ----------
+function glitch(s, a) { for (let i = 0; i < 9; i++) { const k = Math.floor(s * 18) + i; if (rnd(k) > a) continue; const y = rnd(k + 3) * H, h = 8 + rnd(k + 5) * 46, dx = (rnd(k + 7) - .5) * 160;
+    g.drawImage(cv, 0, y, W, h, dx, y, W, h); g.fillStyle = `rgba(${rnd(k + 9) > .5 ? '255,40,80' : '40,220,255'},.18)`; g.fillRect(0, y, W, h); } }
+function vanish(s) {
+  const e = s - 2140.5; ticketLayer(s, true);
+  const bgc = g.createLinearGradient(0, 0, 0, H); bgc.addColorStop(0, '#0e1424'); bgc.addColorStop(1, '#1a0b16'); g.fillStyle = bgc; g.fillRect(0, 0, W, H);
+  // 格子
+  g.strokeStyle = 'rgba(120,150,255,.07)'; g.lineWidth = 2; for (let i = 0; i < 28; i++) { g.beginPath(); g.moveTo(0, i * 72 + (s * 30 % 72)); g.lineTo(W, i * 72 + (s * 30 % 72)); g.stroke(); g.beginPath(); g.moveTo(i * 72, 0); g.lineTo(i * 72, H); g.stroke(); }
+  const red = clamp((e - .3) / .6); const vg = g.createRadialGradient(W / 2, 800, 200, W / 2, 800, 1100); vg.addColorStop(0, 'rgba(255,30,60,0)'); vg.addColorStop(1, `rgba(255,30,60,${.42 * red})`); g.fillStyle = vg; g.fillRect(0, 0, W, H);
+  // 券：粒になって右上へ吹き飛ぶ
+  const cx = W / 2, cy = 720, d = clamp((e - .35) / 1.6);
+  if (d <= 0) { g.drawImage(tc, cx - 380 * 1.25, cy - 190 * 1.25, 760 * 1.25, 380 * 1.25); }
+  else if (d < 1) { const cell = 20, cols = 38, rows = 19;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { const id = r * cols + c, st = (c / cols) * .55 + rnd(id) * .2, p = clamp((d - st) / .45); if (p >= 1) continue;
+      const q = p * p, dx = q * (500 + rnd(id + 1) * 500), dy = -q * (300 + rnd(id + 2) * 700) + Math.sin(p * 9 + id) * 16 * p;
+      g.globalAlpha = 1 - p; const sz = cell * 1.25 * (1 - p * .6);
+      g.drawImage(tc, c * cell, r * cell, cell, cell, cx - 475 + c * cell * 1.25 + dx, cy - 237 + r * cell * 1.25 + dy, sz + .6, sz + .6); }
+    g.globalAlpha = 1; }
+  // 点線の跡
+  if (d > .5) { g.globalAlpha = clamp((d - .5) * 2); g.setLineDash([18, 14]); g.strokeStyle = 'rgba(255,255,255,.5)'; g.lineWidth = 5; rr(cx - 400, cy - 181, 800, 362, 30); g.stroke(); g.setLineDash([]);
+    text('所持数  0', cx, cy, 84, 'rgba(255,255,255,.75)', { bold: 1 }); g.globalAlpha = 1; }
+  // エラーダイアログ
+  if (e > .25) { const k = back((e - .25) / .35); g.save(); g.translate(W / 2, 350); g.scale(k, k);
+    g.fillStyle = 'rgba(0,0,0,.4)'; rr(-442, -82, 900, 190, 28); g.fill(); g.fillStyle = '#fff'; rr(-450, -95, 900, 190, 28); g.fill(); g.fillStyle = '#e5484d'; g.beginPath(); g.roundRect(-450, -95, 24, 190, [28, 0, 0, 28]); g.fill();
+    g.beginPath(); g.arc(-350, 0, 48, 0, 7); g.fill(); text('!', -350, 3, 70, '#fff', { font: EN, weight: 800 });
+    text('このリセット券は', 60, -34, 46, '#222', { bold: 1 }); text('すでに失効しています', 60, 34, 46, '#e5484d', { bold: 1 }); g.restore(); }
+  glitch(s, e < 1.2 ? .75 : .12);
+}
+function burstShape(cx, cy, n, r0, r1, col, seed = 0) { g.fillStyle = col; g.beginPath(); for (let i = 0; i < n * 2; i++) { const a = i / (n * 2) * 6.283, r = i % 2 ? r0 : r1 * (.82 + .36 * rnd(i + seed)); g.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r); } g.fill(); }
+
+// ---------- 計画グラフ ----------
+function plan(s) {
+  const t0 = 2149.3, e = s - t0;
+  g.fillStyle = '#f4f0e6'; g.fillRect(0, 0, W, H);
+  g.strokeStyle = 'rgba(60,100,160,.13)'; g.lineWidth = 2; for (let i = 0; i < 60; i++) { g.beginPath(); g.moveTo(0, i * 40); g.lineTo(W, i * 40); g.stroke(); if (i < 28) { g.beginPath(); g.moveTo(i * 40, 0); g.lineTo(i * 40, H); g.stroke(); } }
+  text('ゲラサブロウの完璧な計画', W / 2, 330, 62, '#22304a', { bold: 1, rot: -.015 });
+  g.strokeStyle = '#e0b020'; g.lineWidth = 16; g.lineCap = 'round'; g.globalAlpha = .55; g.beginPath(); g.moveTo(170, 376); g.lineTo(170 + 740 * clamp(e / .5), 372); g.stroke(); g.globalAlpha = 1;
+  const x0 = 170, y0 = 500, w = 760, h = 540;
+  g.strokeStyle = '#22304a'; g.lineWidth = 7; g.beginPath(); g.moveTo(x0, y0 - 20); g.lineTo(x0, y0 + h); g.lineTo(x0 + w + 30, y0 + h); g.stroke();
+  text('利用枠', x0 - 10, y0 - 50, 32, '#22304a'); text('100%', x0 - 62, y0 + 20, 28, '#55617a', { font: EN, weight: 700 }); text('0%', x0 - 46, y0 + h, 28, '#55617a', { font: EN, weight: 700 });
+  const days = ['26', '27', '28', '29', '30'], val = [.95, .74, .5, .27, .03];
+  const px = i => x0 + 60 + i * 162, py = v => y0 + h - v * h;
+  days.forEach((d, i) => text('10/' + d, px(i), y0 + h + 44, 30, i === 4 ? '#c0392b' : '#22304a', { font: EN, weight: 700 }));
+  const p = clamp((e - .4) / 2.4) * 4;
+  g.strokeStyle = '#3566d6'; g.lineWidth = 12; g.lineJoin = 'round'; g.beginPath(); g.moveTo(px(0), py(val[0]));
+  for (let i = 1; i <= 4; i++) { const f = clamp(p - (i - 1)); if (f <= 0) break; g.lineTo(lerp(px(i - 1), px(i), f), lerp(py(val[i - 1]), py(val[i]), f)); } g.stroke();
+  for (let i = 0; i <= 4; i++) if (p >= i) { g.fillStyle = '#fff'; g.strokeStyle = '#3566d6'; g.lineWidth = 8; g.beginPath(); g.arc(px(i), py(val[i]), 15, 0, 7); g.fill(); g.stroke(); }
+  if (p >= 4) { // 予定：ここでリセット → 100%
+    const u = clamp((e - 2.9) / .6), dead = s > 2153.9, fall = dead ? clamp((s - 2154.4) / .8) : 0;
+    g.save(); if (dead) { g.translate(px(4) + 40, py(.03)); g.rotate(fall * fall * 1.5); g.translate(-px(4) - 40, -py(.03) + fall * fall * 500); g.globalAlpha = 1 - fall * .7; }
+    g.setLineDash([18, 14]); g.strokeStyle = '#1fa971'; g.lineWidth = 12; g.beginPath(); g.moveTo(px(4) + 40, py(.03)); g.lineTo(px(4) + 40, lerp(py(.03), py(.98), u)); g.stroke(); g.setLineDash([]);
+    if (u >= 1) { g.fillStyle = '#1fa971'; g.beginPath(); g.moveTo(px(4) + 40, py(1) - 26); g.lineTo(px(4) + 8, py(1) + 24); g.lineTo(px(4) + 72, py(1) + 24); g.fill(); }
+    g.restore(); g.globalAlpha = 1;
+    if (u > .3) { const k = back((e - 3.1) / .35); g.save(); g.translate(px(2) + 70, py(.93)); g.scale(k, k); g.rotate(-.05); g.fillStyle = '#fff6a8'; g.fillRect(-170, -62, 340, 124); g.fillStyle = 'rgba(0,0,0,.08)'; g.fillRect(-170, 50, 340, 12);
+      text('30日の朝に', 0, -24, 34, '#3a3a2a'); text('リセット券で全回復', 0, 22, 34, '#1a7f55', { bold: 1 }); g.restore(); }
+    if (dead) { const c = clamp((s - 2153.95) / .18), c2 = clamp((s - 2154.13) / .18), bx = px(4) + 40, by = py(.5);
+      g.strokeStyle = '#e02020'; g.lineWidth = 30; g.lineCap = 'round'; g.beginPath(); g.moveTo(bx - 110, by - 110); g.lineTo(bx - 110 + 220 * c, by - 110 + 220 * c); g.stroke();
+      if (c2 > 0) { g.beginPath(); g.moveTo(bx + 110, by - 110); g.lineTo(bx + 110 - 220 * c2, by - 110 + 220 * c2); g.stroke(); }
+      if (s > 2154.4) text('券、もう無い', 740, 1300, 84, '#e02020', { stroke: '#fff', bold: 1, rot: -.05, scale: back((s - 2154.4) / .3) }); } }
+}
+
+// ---------- レシート ----------
+function receipt(s, t, tEnd) {
+  const e = s - 2157.3;
+  const bgc = g.createLinearGradient(0, 0, 0, H); bgc.addColorStop(0, '#2a1d3f'); bgc.addColorStop(1, '#120c1e'); g.fillStyle = bgc; g.fillRect(0, 0, W, H);
+  for (let i = 0; i < 26; i++) { const x = rnd(i) * W, sp = 240 + rnd(i + 4) * 300, y = ((e * sp + rnd(i + 8) * 2200) % 2200) - 140, sq = Math.cos(e * 5 + i);
+    g.save(); g.translate(x, y); g.scale(sq, 1); g.globalAlpha = .55; g.fillStyle = '#e7b416'; g.beginPath(); g.arc(0, 0, 40, 0, 7); g.fill(); g.strokeStyle = '#a77a00'; g.lineWidth = 6; g.stroke(); text('¥', 0, 2, 44, '#a77a00', { font: EN, weight: 800 }); g.restore(); }
+  g.globalAlpha = 1;
+  // 上のスリットから紙が出てくる
+  const len = out3(e / 1.6) * 900, x = 190, w = 700, top = 300;
+  g.fillStyle = '#0a0710'; rr(x - 50, top - 46, w + 100, 60, 30); g.fill();
+  g.save(); g.beginPath(); g.rect(x, top, w, len); g.clip(); g.translate(0, len - 900);
+  g.fillStyle = '#fbfaf5'; g.fillRect(x, top, w, 900);
+  g.fillStyle = '#120c1e'; for (let i = 0; i < 18; i++) { g.beginPath(); g.moveTo(x + i * 40, top + 900); g.lineTo(x + i * 40 + 20, top + 880); g.lineTo(x + i * 40 + 40, top + 900); g.fill(); }
+  const L = (a, b, y, o = {}) => { text(a, x + 50, top + y, o.size || 38, o.col || '#222', { align: 'left', bold: o.bold }); if (b) text(b, x + w - 50, top + y, o.size || 38, o.col || '#222', { align: 'right', font: o.fb || F, weight: 700, bold: o.bold }); };
+  text('領 収 書（のはずだった）', x + w / 2, top + 80, 44, '#222', { bold: 1 });
+  text('2026/10/30  AM 6:00', x + w / 2, top + 136, 28, '#777', { font: MONO });
+  g.setLineDash([10, 10]); g.strokeStyle = '#999'; g.lineWidth = 3; g.beginPath(); g.moveTo(x + 40, top + 180); g.lineTo(x + w - 40, top + 180); g.moveTo(x + 40, top + 420); g.lineTo(x + w - 40, top + 420); g.stroke(); g.setLineDash([]);
+  L('リセット券', '×1', 240); L('  状態', '失効', 300, { col: '#e02020', bold: 1 }); L('  回復した利用枠', '0%', 360, { fb: EN });
+  L('損失', '', 500, { size: 46, bold: 1 });
+  const v = s > 2160.1 ? Math.round(1200 * out3((s - 2160.2) / 1.5)) : 0;
+  text('¥' + v.toLocaleString(), x + w - 50, top + 600, 170, v ? '#e02020' : '#bbb', { align: 'right', font: EN, weight: 800 });
+  text('※本人の見積もり', x + w - 50, top + 710, 26, '#888', { align: 'right' });
+  for (let i = 0; i < 44; i++) { g.fillStyle = '#222'; g.fillRect(x + 90 + i * 12, top + 770, rnd(i) > .5 ? 7 : 3, 70); }
+  g.restore();
+  // 朱印
+  if (s > 2158.92) { const k = clamp((s - 2158.92) / .16), sc = lerp(2.4, 1, k * k); g.save(); g.translate(400, 1040); g.rotate(-.14); g.scale(.8, .8); g.scale(sc, sc); g.globalAlpha = k;
+    g.strokeStyle = '#d01818'; g.lineWidth = 12; rr(-190, -70, 380, 140, 18); g.stroke(); text('超悔しい', 0, 4, 84, '#d01818', { bold: 1 }); g.restore(); }
+}
+
+// ---------- 顔カメラ（実際の配信映像） ----------
+function live(s, t) {
+  if (!FACE) return;
+  // 既定は左下の小窓。反応の強い所で中央に大きく出す。
+  const big = Math.max(ease((s - 2142.95) / .3) * (1 - ease((s - 2148.4) / .35)), ease((s - 2157.5) / .3) * (1 - ease((s - 2160.0) / .35)));
+  const w = lerp(400, 860, big), h = w * 250 / 300, cx = lerp(250, W / 2, big), cy = lerp(1300, 980, big);
+  const sh = big > .5 && s > 2143.84 && s < 2145.4 ? 1 : 0;
+  g.save(); g.translate(cx + (rnd(Math.floor(t * 30)) - .5) * 26 * sh, cy + (rnd(Math.floor(t * 30) + 5) - .5) * 26 * sh); g.rotate(lerp(-.035, .02, big));
+  if (big > .3 && s < 2149) { g.globalAlpha = (big - .3) / .7; burstShape(0, 0, 20, w * .6, w * .76, '#ffe14a', Math.floor(s * 8)); g.globalAlpha = 1; }
+  g.fillStyle = 'rgba(0,0,0,.45)'; rr(-w / 2 + 10, -h / 2 + 14, w, h, 26); g.fill();
+  g.save(); rr(-w / 2, -h / 2, w, h, 26); g.clip(); g.imageSmoothingQuality = 'high'; g.drawImage(FACE, 140, 80, 300, 250, -w / 2, -h / 2, w, h); g.restore();
+  g.strokeStyle = '#fff'; g.lineWidth = 10; rr(-w / 2, -h / 2, w, h, 26); g.stroke();
+  const ls = lerp(1, 1.5, big); g.fillStyle = '#e5484d'; rr(-w / 2 + 18, -h / 2 + 18, 218 * ls, 46 * ls, 23 * ls); g.fill();
+  if (Math.floor(s * 2) % 2 === 0) { g.fillStyle = '#fff'; g.beginPath(); g.arc(-w / 2 + 18 + 26 * ls, -h / 2 + 18 + 23 * ls, 8 * ls, 0, 7); g.fill(); }
+  text('実際の配信', -w / 2 + 18 + 126 * ls, -h / 2 + 18 + 24 * ls, 30 * ls, '#fff', { bold: 1 });
+  g.restore();
+  if (s > 2143.84 && s < 2148.4 && big > .6) text('ふざけんな!!', W / 2, 560, 150, '#fff', { stroke: '#e02020', sw: 34, bold: 1, rot: -.07, scale: back((s - 2143.84) / .25) });
+  if (s > 2143.04 && s < 2143.84 && big > .2) text('へえ…？', W / 2, 580, 130, '#fff', { stroke: '#22304a', sw: 30, bold: 1, rot: .04, scale: back((s - 2143.04) / .2) });
+  if (s > 2157.82 && s < 2160.0 && big > .5) text('超びっくり', W / 2, 500, 120, '#fff', { stroke: '#7a3cff', sw: 30, bold: 1, rot: -.05, scale: back((s - 2157.82) / .25) });
+}
+
+// ---------- 1フレーム ----------
+window.draw = function (t, s, tEnd) {
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  const m = ease((s - 2133.9) / 3.2);
+  const usage = s < 2124 ? lerp(.62, .31, clamp((s - 2112) / 12)) : lerp(.31, .03, out3((s - 2124.2) / 2.6));
+  const hr = s < 2128 ? lerp(3 + 20 / 60, 4.5, clamp((s - 2112.6) / 15.4)) : lerp(5.75, 6.0, clamp((s - 2134) / 2.9));
+
+  if (s < 2140.5) {
+    // 部屋。券の場面ではカメラを少し引いて暗くする。クリックの瞬間はモニターへ寄る。
+    const zin = ease((s - 2140.25) / .25), sc = 1 + zin * 1.6;
+    g.save(); g.translate(W / 2, 950); g.scale(sc, sc); g.translate(-W / 2, -950);
+    const dlg = s > 2137.2 ? (x, y, w, h) => { const k = back((s - 2137.2) / .35); g.fillStyle = `rgba(4,6,14,${.6 * clamp(k)})`; g.fillRect(x, y, w, h);
+      g.save(); g.translate(x + w / 2, y + h / 2); g.scale(k, k); g.fillStyle = '#fff'; rr(-330, -180, 660, 360, 22); g.fill();
+      text('リセット券を使いますか？', 0, -110, 44, '#222', { bold: 1 }); text('利用枠が 100% に回復します', 0, -52, 28, '#667');
+      const press = s > 2140.05; g.fillStyle = press ? '#168a5c' : '#22b07a'; rr(-170, 30 + (press ? 5 : 0), 340, 104, 52); g.fill(); text('使う', 0, 84 + (press ? 5 : 0), 56, '#fff', { bold: 1 });
+      const cp = ease((s - 2137.7) / 2.1), cx = lerp(260, 60, cp), cy = lerp(230, 96, cp);
+      g.fillStyle = '#fff'; g.strokeStyle = '#111'; g.lineWidth = 5; g.lineJoin = 'round'; g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx, cy + 74); g.lineTo(cx + 18, cy + 58); g.lineTo(cx + 33, cy + 90); g.lineTo(cx + 47, cy + 83); g.lineTo(cx + 32, cy + 52); g.lineTo(cx + 56, cy + 52); g.closePath(); g.fill(); g.stroke();
+      g.restore(); } : null;
+    room(s, m, usage, hr, { typing: s < 2127.5, ringing: s > 2135.8 && s < 2137.6, dlg });
+    if (usage < .1 && s < 2128.1) { const a = .5 + .5 * Math.sin(s * 14); g.fillStyle = `rgba(255,40,70,${.10 * a})`; g.fillRect(0, 0, W, H);
+      text('残り ' + Math.round(usage * 100) + '%', W / 2, 560, 150, '#ff4d5e', { stroke: '#fff', sw: 30, bold: 1, rot: -.04, scale: back((s - 2125.7) / .3) }); }
+    if (s > 2120.9 && s < 2124.2) { const k = back((s - 2120.9) / .3) * clamp((2124.2 - s) / .2); g.save(); g.translate(730, 660); g.scale(k, k); g.rotate(.04); g.fillStyle = '#fff'; rr(-220, -52, 440, 104, 52); g.fill(); g.beginPath(); g.moveTo(-40, 48); g.lineTo(0, 100); g.lineTo(30, 48); g.fill(); text('卒論の倫理申請', 0, 2, 44, '#22304a', { bold: 1 }); g.restore(); }
+    g.restore();
+    // 券のお披露目
+    if (s > 2128.0 && s < 2134.3) { const a = ease((s - 2128.0) / .5) * (1 - ease((s - 2133.7) / .6)); g.fillStyle = `rgba(6,6,18,${.78 * a})`; g.fillRect(0, 0, W, H);
+      rays(W / 2, 700, s, a * .5, 'rgba(255,215,110,.55)');
+      const k = back((s - 2128.2) / .6); drawTicket(W / 2, lerp(2100, 700, k) + Math.sin(s * 2.2) * 12 - (1 - a) * (s > 2133 ? 900 : 0), 1.3, Math.sin(s * 1.6) * .04 - .03, s, false);
+      for (let i = 0; i < 7; i++) { const ph = (s * .9 + rnd(i)) % 1; sparkle(W / 2 + (rnd(i + 2) - .5) * 900, 700 + (rnd(i + 4) - .5) * 520, 30 * Math.sin(ph * Math.PI), a * Math.sin(ph * Math.PI)); }
+      if (s > 2131.5) text('とっておき', W / 2, 440, 90, '#ffe9a8', { stroke: '#5a3600', bold: 1, scale: back((s - 2131.5) / .3) * a });
+      g.globalAlpha = a; calendarFlip(790, 1180, s, 2128.5); g.globalAlpha = 1; }
+    if (zin > 0) { g.fillStyle = `rgba(255,255,255,${zin * .9})`; g.fillRect(0, 0, W, H); }
+  } else if (s < 2149.3) { vanish(s); const f = 1 - clamp((s - 2140.5) / .25); if (f > 0) { g.fillStyle = `rgba(255,255,255,${f})`; g.fillRect(0, 0, W, H); } }
+  else if (s < 2157.3) plan(s);
+  else receipt(s, t, tEnd);
+
+  live(s, t);
+
+  // ---------- 見出し・字幕・出典 ----------
+  const hg = g.createLinearGradient(0, 0, 0, 240); hg.addColorStop(0, 'rgba(0,0,0,.78)'); hg.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = hg; g.fillRect(0, 0, W, 240);
+  g.fillStyle = '#ffd34d'; rr(W / 2 - 250, 52, 500, 56, 28); g.fill(); text('ゲラサブロウ やらかし事件簿', W / 2, 81, 32, '#22180a', { bold: 1 });
+  text('朝6時、リセット券が消えた', W / 2, 168, 66, '#fff', { stroke: '#101425', sw: 16, bold: 1, scale: back(t / .45) });
+  const sub = SUBS.find(x => s >= x[0] && s < x[1]);
+  if (sub) { let size = 72; g.font = `${size}px ${F}`; while (g.measureText(sub[2]).width > 960) { size -= 2; g.font = `${size}px ${F}`; }
+    const tw = g.measureText(sub[2]).width; g.fillStyle = 'rgba(8,10,20,.82)'; rr(W / 2 - tw / 2 - 34, 1528 - size * .8, tw + 68, size * 1.6, 24); g.fill();
+    text(sub[2], W / 2, 1530, size, '#fff', { bold: 1 }); }
+  text('配信「赤信号と青信号間違えて轢かれかけた」より', W / 2, 1650, 28, 'rgba(255,255,255,.7)', { stroke: 'rgba(0,0,0,.6)', sw: 6 });
+  // 締め
+  if (t > tEnd - 2.0) { const k = clamp((t - (tEnd - 2.0)) / .35); g.fillStyle = `rgba(10,8,18,${k * .93})`; g.fillRect(0, 0, W, H); g.globalAlpha = k;
+    ticketLayer(s, true); g.save(); g.translate(W / 2, 640); g.rotate(-.08); g.globalAlpha = k * .35; g.drawImage(tc, -380, -190); g.restore(); g.globalAlpha = k;
+    text('Codexリセット券', W / 2, 900, 96, '#fff', { bold: 1 }); text('消失事件', W / 2, 1050, 150, '#ff4d5e', { bold: 1, scale: back((t - (tEnd - 1.8)) / .3) }); g.globalAlpha = 1; }
+};
+</script></body></html>

@@ -30,6 +30,7 @@ SHORTS_MAX_SEC = 180
 # Clips finished side by side.  Each mostly waits for the AI's plan (about 45 s with
 # Claude Sonnet); the render and relisten parts share the GPU without trouble at 3.
 FINISH_WORKERS = int(os.environ.get("CUT_VIDEO_FINISH_WORKERS", "3"))
+JSDRAW_WORKERS = int(os.environ.get("CUT_VIDEO_JSDRAW_WORKERS", "2"))
 # Seconds fetched around each clip range when only the ranges are downloaded.
 SECTION_MARGIN_SEC = 2.0
 STEPS = ("取り込み", "文字起こし", "候補選び", "書き出し", "投稿")
@@ -57,6 +58,12 @@ class AutoJob:
     link_only: bool = False
     focus: str = ""  # optional: what kind of scene to look for
     finish: bool = False  # hook title, word-timed captions and sound effects before upload
+    # Claude Code / Codex: put the condensed transcript in the first prompt instead of
+    # letting the agent page through it with cut_read_transcript (fewer round trips).
+    preload_transcript: bool = True
+    # Make each clip as a JS-drawn Short (jsdraw_short, Claude API) instead of the normal finish.
+    jsdraw: bool = False
+    jsdraw_model: str = "fable"
     model: str = ""
     effort: str = ""
     state: str = "queued"
@@ -252,13 +259,29 @@ class AutoPipeline:
     def submit(self, source: str, agent: str, *, clip_count: int = 3, min_duration_sec: float = 20.0,
                max_duration_sec: float = SHORTS_MAX_SEC, layout: str = "blur", upload: bool = True,
                model: str = "", effort: str = "", link_only: bool = False, focus: str = "",
-               finish: bool = False, privacy: str = "private") -> AutoJob:
-        if agent not in agent_runner.AGENTS:
+               finish: bool = False, privacy: str = "private", preload_transcript: bool = True,
+               jsdraw: bool = False, jsdraw_model: str = "fable") -> AutoJob:
+        if agent not in agent_runner.PIPELINE_AGENTS:
             raise PipelineError("呼び出すAIを選択してください。")
+        if agent == agent_runner.API_AGENT:
+            model = ""  # the one-call selector always uses its own model
+            from .oneshot_selector import NO_KEY_MESSAGE, has_key
+
+            if not link_only and not has_key():
+                raise PipelineError(NO_KEY_MESSAGE)
         try:
             model, effort = agent_runner.validate_model(agent, model, effort)
         except agent_runner.AgentError as exc:
             raise PipelineError(str(exc)) from exc
+        if jsdraw and not link_only:
+            from . import jsdraw_pipeline
+            from .jsdraw_short import MODELS as JSDRAW_MODELS
+
+            if jsdraw_model not in JSDRAW_MODELS:
+                raise PipelineError("JS描画のモデルを選んでください。")
+            if not jsdraw_pipeline.available_for(agent):  # only the API route needs a key
+                raise PipelineError(jsdraw_pipeline.NO_KEY_MESSAGE)
+            finish = True  # the JS-drawn Short is made in the finishing step, clip by clip
         if not 1 <= int(clip_count) <= 10:
             raise PipelineError("切り抜き本数は1〜10本で指定してください。")
         if not 5 <= float(min_duration_sec) <= float(max_duration_sec) <= SHORTS_MAX_SEC:
@@ -272,7 +295,8 @@ class AutoPipeline:
             clip_count=int(clip_count), min_duration_sec=float(min_duration_sec),
             max_duration_sec=float(max_duration_sec), layout=layout, upload=bool(upload),
             model=model, effort=effort, link_only=bool(link_only), focus=clean_focus(focus), finish=bool(finish),
-            privacy=privacy,
+            privacy=privacy, preload_transcript=bool(preload_transcript),
+            jsdraw=bool(jsdraw) and not link_only, jsdraw_model=jsdraw_model,
         )
         with self.lock:
             self.jobs[job.job_id] = job
@@ -589,7 +613,18 @@ class AutoPipeline:
             url = getattr(self.video_downloads.get(job.job_id), "url", "")
         if not clips or not url:
             return False
-        ranges = [(max(0.0, start - SECTION_MARGIN_SEC), end + SECTION_MARGIN_SEC) for _output, start, end in clips]
+        if job.jsdraw:  # the JS-drawn Short reads a wider stretch around each clip
+            from .jsdraw_pipeline import PREPARE_PAD_SEC, range_for_clip
+
+            try:
+                clips = [(output, *range_for_clip(Path(output))) for output, _start, _end in clips]
+            except Exception as exc:
+                self._log(job, f"JS描画の範囲を決められなかったため、動画全体のダウンロードを待ちます（{type(exc).__name__}）")
+                return False
+            margin = PREPARE_PAD_SEC + SECTION_MARGIN_SEC
+        else:
+            margin = SECTION_MARGIN_SEC
+        ranges = [(max(0.0, start - margin), end + margin) for _output, start, end in clips]
         directory = _jobs_dir() / f"{job.job_id}.sections"
         with self.lock:
             self.clip_sources[job.job_id] = {"dir": directory, "files": {}}
@@ -881,16 +916,30 @@ class AutoPipeline:
         if performance:
             self._log(job, "過去の投稿でよく見られた切り抜きとそうでないものを参考に選ぶよう指示します。")
 
+        if job.agent == agent_runner.API_AGENT:
+            return self._select_api(job, before, prompt_section(hints) + performance, label)
+
         def register(process):
             with self.lock:
                 self.processes[job.job_id] = process
+
+        preloaded = {}
+        if job.preload_transcript:
+            from .oneshot_selector import OneshotSelectionError, preloaded_transcript
+
+            try:
+                transcript, revision = preloaded_transcript(job.video_id)
+            except OneshotSelectionError as exc:
+                raise PipelineError(str(exc)) from exc
+            preloaded = {"transcript": transcript, "transcript_revision": revision}
+            self._log(job, f"文字起こし全体（{transcript.count(chr(10)) + 1}行・{len(transcript)}文字）を最初に渡します。")
 
         output = agent_runner.run_agent(
             job.agent,
             agent_runner.ClipRequest(job.video_id, job.clip_count, job.min_duration_sec, job.max_duration_sec,
                                      used_ranges=tuple(used), focus=job.focus,
                                      hints=prompt_section(hints) + performance,
-                                     confirm_captions=not job.finish),
+                                     confirm_captions=not job.finish, want_summary=job.jsdraw, **preloaded),
             register_process=register,
             model=job.model,
             effort=job.effort,
@@ -912,6 +961,41 @@ class AutoPipeline:
         summary = list(dict.fromkeys(summary))[-4:]
         for line in summary:
             self._log(job, f"  {label}: {line}")
+        return after
+
+    def _select_api(self, job: AutoJob, before: set[str], hints: str, label: str) -> str:
+        """One Claude API call; the checked picks are stored like ``cut_propose_clips`` results."""
+        from . import oneshot_selector
+
+        try:
+            result = oneshot_selector.select_clips(
+                job.video_id, clip_count=job.clip_count, focus=job.focus, hints=hints,
+                min_duration_sec=job.min_duration_sec, max_duration_sec=job.max_duration_sec,
+                log=lambda message: self._log(job, message, replace_progress=True), want_summary=job.jsdraw,
+            )
+            self._log(job, f"API料金: 約{result['cost_usd']:.3f}ドル（入力{result['usage'].get('input_tokens', 0)}"
+                           f"・出力{result['usage'].get('output_tokens', 0)}トークン、{result['seconds']:g}秒"
+                           + ("、1回聞き直し" if result.get("retried") else "") + "）")
+            self._check_cancel(job)
+            if not result["clips"]:
+                raise PipelineError(
+                    f"「{job.focus}」に当てはまる場面が見つかりませんでした。" if job.focus
+                    else f"{label} が条件に合う候補を返しませんでした。"
+                )
+            oneshot_selector.save_proposals(job.video_id, result, min_duration_sec=job.min_duration_sec,
+                                            max_duration_sec=job.max_duration_sec)
+        except oneshot_selector.OneshotSelectionError as exc:
+            raise PipelineError(str(exc)) from exc
+        except Exception as exc:
+            if type(exc).__module__.startswith("anthropic"):  # network / auth / rate limit
+                raise PipelineError(f"Claude APIの呼び出しに失敗しました（{type(exc).__name__}）: {exc}"[:300]) from exc
+            raise
+        after = self._collect_runs(job, before)
+        if not after:
+            raise PipelineError(f"{label} が候補を保存しませんでした。")
+        for clip in result["clips"]:
+            self._log(job, f"  {label}: {oneshot_selector.clock(clip['start_sec'])}〜"
+                           f"{oneshot_selector.clock(clip['end_sec'])}「{clip['title']}」")
         return after
 
     def _export(self, job: AutoJob) -> list[str]:
@@ -946,7 +1030,10 @@ class AutoPipeline:
 
         from . import relisten
 
-        workers = max(1, min(FINISH_WORKERS, len(job.outputs)))
+        # JS drawing removes the face background and renders in a browser per clip, and on a
+        # login CLI three long generations at once eat the plan's limit quickly: two at a time.
+        limit = min(FINISH_WORKERS, JSDRAW_WORKERS) if job.jsdraw else FINISH_WORKERS
+        workers = max(1, min(limit, len(job.outputs)))
         self._log(job, "仕上げ（2行タイトル・発話単位の字幕・補足字幕・無音カット・音量調整・効果音）を行います"
                        + (f"（{workers}本ずつ並行）。" if workers > 1 else "。"))
         # Most of a clip's finishing is waiting for the AI's plan, so clips run side by side.
@@ -974,6 +1061,26 @@ class AutoPipeline:
         self._check_cancel(job)
         with self.lock:
             section = (self.clip_sources.get(job.job_id) or {}).get("files", {}).get(output)
+        if job.jsdraw:
+            from . import jsdraw_pipeline
+
+            try:
+                record = jsdraw_pipeline.make_for_clip(
+                    Path(output), model=job.jsdraw_model, highlight_run_id=job.highlight_run_id, section=section,
+                    backend=jsdraw_pipeline.backend_for(job.agent), codex_model=job.model if job.agent == "codex" else "",
+                    log=lambda message: self._log(job, f"  {index}本目（JS描画）: {message}", replace_progress=True),
+                )
+                cost = (f"API料金 約{record['usd']}ドル" if record.get("backend", "api") == "api" else
+                        "ログインの枠" + (f"・API換算 約{record['usd_equivalent']}ドル"
+                                        if record.get("usd_equivalent") is not None else ""))
+                self._log(job, f"  {index}本目: JS描画ショートを作りました（{record['seconds']}秒・{cost}）")
+                return
+            except Cancelled:
+                raise
+            except Exception as exc:  # keep the clip: make it the normal way instead
+                self._log(job, f"  {index}本目はJS描画に失敗したため、通常の仕上げで作ります"
+                               f"（{type(exc).__name__}: {exc}）"[:300])
+                self._check_cancel(job)
         try:
             plan = finishing.finish_exported_clip(
                 Path(output), agent=job.agent, model=job.model, focus=job.focus,
@@ -1002,9 +1109,14 @@ class AutoPipeline:
         for output in job.outputs:
             self._check_cancel(job)
             receipt = None
-            for message, result in youtube_upload.upload_private(Path(output), privacy=job.privacy, interactive=False):
-                self._log(job, message, replace_progress=message.startswith("  アップロード中"))
-                receipt = result or receipt
+            try:
+                for message, result in youtube_upload.upload_private(Path(output), privacy=job.privacy,
+                                                                     interactive=False):
+                    self._log(job, message, replace_progress=message.startswith("  アップロード中"))
+                    receipt = result or receipt
+            except youtube_upload.UploadRejected as exc:  # this file only; the others still go up
+                self._log(job, str(exc))
+                continue
             if receipt:
                 job.uploads.append({**receipt, "file": Path(output).name})
                 from .used_ranges import record_from_clip

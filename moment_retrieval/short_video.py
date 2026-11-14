@@ -21,6 +21,7 @@ from .output_profile import (
 )
 from .publication import private_source_fingerprint
 from .video_encoder import h264_args
+from .av_check import AUDIO_RETIME, AudioTimingError, verify_audio_timing
 from .subtitles import SubtitleCue
 
 
@@ -479,12 +480,12 @@ def build_audio_filter(
         filters.append(
             f"{source_label}{bgm_label}"
             "amix=inputs=2:duration=longest:dropout_transition=0,"
-            "alimiter=limit=0.95[aout]"
+            f"alimiter=limit=0.95,{AUDIO_RETIME}[aout]"
         )
     elif source_label:
-        filters.append(f"{source_label}anull[aout]")
+        filters.append(f"{source_label}{AUDIO_RETIME}[aout]")
     elif bgm_label:
-        filters.append(f"{bgm_label}anull[aout]")
+        filters.append(f"{bgm_label}{AUDIO_RETIME}[aout]")
     else:
         return None
     return ";".join(filters)
@@ -604,6 +605,11 @@ def render_captioned_source_clip(
         except (OSError, subprocess.SubprocessError) as exc:
             output_path.unlink(missing_ok=True)
             raise ShortVideoError("字幕付き動画の生成に失敗しました") from exc
+    try:  # YouTube re-encodes by timestamp: broken audio times garble the opening
+        verify_audio_timing(output_path)
+    except AudioTimingError as exc:
+        output_path.unlink(missing_ok=True)
+        raise ShortVideoError(f"字幕付き動画の生成に失敗しました（{exc}）") from exc
     return output_path
 
 
@@ -694,4 +700,9 @@ def render_short_clip(
         except (OSError, subprocess.SubprocessError) as exc:
             output_path.unlink(missing_ok=True)
             raise ShortVideoError("ショート動画の生成に失敗しました") from exc
+    try:  # YouTube re-encodes by timestamp: broken audio times garble the opening
+        verify_audio_timing(output_path)
+    except AudioTimingError as exc:
+        output_path.unlink(missing_ok=True)
+        raise ShortVideoError(f"ショート動画の生成に失敗しました（{exc}）") from exc
     return output_path

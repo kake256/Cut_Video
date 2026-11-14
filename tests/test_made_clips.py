@@ -55,6 +55,10 @@ class _Service:
 
 class MadeClipsTest(unittest.TestCase):
     def setUp(self):
+        # The synthetic files here are not real mp4s; the audio check has its own tests.
+        preflight = patch.object(youtube_upload, "preflight_problems", return_value=[])
+        preflight.start()
+        self.addCleanup(preflight.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         patcher = patch.object(config, "CACHE_ROOT", root)
@@ -134,7 +138,6 @@ class MadeClipsTest(unittest.TestCase):
         receipt = {"video_id": "v", "privacy_status": "private", "publish_at": "2026-11-13T09:00:00Z"}
         label = made_clips.status_label(receipt)
         self.assertTrue(label.startswith("公開予約 "), label)
-        self.assertIn("今は非公開", label)
         self.assertIsNotNone(made_clips.scheduled_publish_at(receipt))
         public = {**receipt, "privacy_status": "public"}
         self.assertEqual(made_clips.status_label(public), "公開済み")

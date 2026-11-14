@@ -81,6 +81,10 @@ def _video(vid, views, *, age_days=5, privacy="public", seconds=80):
 
 class RepostTest(unittest.TestCase):
     def setUp(self):
+        # The synthetic files here are not real mp4s; the audio check has its own tests.
+        preflight = patch.object(youtube_upload, "preflight_problems", return_value=[])
+        preflight.start()
+        self.addCleanup(preflight.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         patcher = patch.object(config, "CACHE_ROOT", root)

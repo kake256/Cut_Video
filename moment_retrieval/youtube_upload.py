@@ -14,6 +14,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -68,6 +69,24 @@ UPLOAD_RETRIES = 5  # googleapiclient backs off 1, 2, 4, 8, 16 s (randomised) be
 
 class UploadError(RuntimeError):
     pass
+
+
+class UploadRejected(UploadError):
+    """The file itself must not be uploaded (e.g. broken audio timestamps); other files may go on."""
+
+
+def preflight_problems(video_path: Path) -> list[str]:
+    """Why ``video_path`` must not be uploaded ([] when fine), whichever renderer wrote it.
+
+    YouTube re-encodes by timestamp, so audio whose times do not follow its samples
+    (as one-pass loudnorm produced) plays fine locally but garbles on YouTube.
+    """
+    from . import av_check
+
+    try:
+        return av_check.audio_timing_problems(video_path)
+    except Exception as exc:  # ffprobe missing or the file unreadable
+        return [f"音声を確認できませんでした（{type(exc).__name__}）"]
 
 
 BUNDLED_CLIENT_ENV = "CUT_YOUTUBE_CLIENT_FILE"
@@ -480,6 +499,9 @@ def upload_private(
             previous = json.loads(receipt.read_text(encoding="utf-8"))
             yield f"アップロード済みのため省略しました: {video_path.name}", previous
             return
+        problems = preflight_problems(video_path)
+        if problems:
+            raise UploadRejected(f"アップロードしませんでした: {video_path.name}（{'／'.join(problems)}）")
         yield from _upload_locked(video_path, privacy, service_factory, interactive)
 
 
@@ -616,6 +638,38 @@ def set_privacy(video_id: str, privacy: str, *, service_factory: Callable | None
             "APIプロジェクトが未監査の場合は非公開に固定されます。"
         )
     return status
+
+
+def schedule_publish(video_id: str, publish_at: float, *, service_factory: Callable | None = None) -> str:
+    """Make one video private with a YouTube publish time (``status.publishAt``), so it goes
+    public at ``publish_at`` (epoch seconds) even while this app is closed.
+
+    YouTube only keeps a publish time on a private video that was never public; returns
+    the publish time YouTube reports back (ISO 8601, UTC).
+    """
+    when = datetime.fromtimestamp(float(publish_at), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    service = _service(service_factory)
+    try:
+        response = service.videos().update(
+            part="status",
+            body={"id": video_id, "status": {"privacyStatus": "private", "publishAt": when,
+                                             "selfDeclaredMadeForKids": False}},
+        ).execute()
+    except Exception as exc:
+        if "insufficientPermissions" in str(exc) or "insufficient authentication scopes" in str(exc):
+            raise UploadError(
+                "公開予約する許可がありません。「設定」タブで「YouTubeアカウントを連携」をやり直し、"
+                "「YouTubeアカウントの管理」を許可してください。"
+            ) from exc
+        if "videoNotFound" in str(exc) or "HttpError 404" in str(exc):
+            raise UploadError("YouTubeに動画が見つかりません（削除された可能性があります）。") from exc
+        if "invalidPublishAt" in str(exc):
+            raise UploadError("YouTubeが公開予約を受け付けませんでした（一度公開した動画は予約できません）。") from exc
+        raise UploadError(f"公開予約できませんでした（{type(exc).__name__}）。") from exc
+    status = response.get("status") or {}
+    if status.get("privacyStatus") != "private" or not status.get("publishAt"):
+        raise UploadError("YouTubeが公開予約を受け付けませんでした（一度公開した動画は予約できません）。")
+    return str(status["publishAt"])
 
 
 def video_statuses(video_ids: list[str], *, service_factory: Callable | None = None) -> dict[str, dict]:

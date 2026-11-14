@@ -30,7 +30,9 @@ BASE_W, BASE_H = 1080, 1920
 
 CAPTION_SIZE, CAPTION_OUTLINE, CAPTION_Y = 74, 9, 1430
 NOTE_SIZE, NOTE_OUTLINE, NOTE_Y = 46, 5, 1300
-TITLE_SIZE, TITLE_OUTLINE, TITLE_Y = 92, 8, 150
+# TITLE_Y is the centre of the last title line: just above the source picture (y≈656 for 16:9),
+# clear of YouTube's top player buttons; a first line stacks above it.
+TITLE_SIZE, TITLE_OUTLINE, TITLE_Y = 92, 8, 580
 FOOTER_SIZE, FOOTER_OUTLINE, FOOTER_Y = 34, 3, 1870
 LINE_HEIGHT = 1.18
 CAPTION_LINE_UNITS = 28  # 14 full-width characters (74 px each) fit inside 1080 px
@@ -395,7 +397,7 @@ def title_events(layout: Layout, lines: list[tuple[str, bool]], duration_text: s
 
     lines = lines[:2]
     step = TITLE_SIZE * LINE_HEIGHT
-    first = TITLE_Y - step * (len(lines) - 1) / 2
+    first = TITLE_Y - step * (len(lines) - 1)
     events = []
     for index, (text, emphasis) in enumerate(lines):
         colour = r"\c&H3CDCFF&" if emphasis else ""

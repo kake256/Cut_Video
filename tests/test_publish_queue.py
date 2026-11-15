@@ -60,6 +60,15 @@ class PublishQueueTest(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual([item["not_before"] for item in added], [NOW, NOW + 3 * HOUR, NOW + 6 * HOUR])
 
+    def test_js_drawn_clip_keeps_its_youtube_title_and_is_marked_for_the_app(self):
+        from dataclasses import replace
+        clips = [replace(self.clips[0], jsdraw=True)] + self.clips[1:]
+        added, _ = publish_queue.enqueue(self._paths("a", "b"), interval_hours=3, now=NOW, clips=clips)
+        self.assertEqual([(item["title"], item["jsdraw"]) for item in added],
+                         [("title a", True), ("title b", False)])
+        self.assertEqual([made_clips.app_title(item["title"], item["jsdraw"]) for item in added],
+                         ["[JS] title a", "title b"])
+
     def test_second_enqueue_goes_after_last_pending(self):
         publish_queue.enqueue(self._paths("a", "b"), interval_hours=2, now=NOW, clips=self.clips)
         added, _ = publish_queue.enqueue(self._paths("c"), interval_hours=2, now=NOW + 60, clips=self.clips)

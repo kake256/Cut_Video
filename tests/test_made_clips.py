@@ -92,6 +92,29 @@ class MadeClipsTest(unittest.TestCase):
         self.assertEqual(clips[0].source_name, "20251012_002528_EPbvm8wJ9pk")
         self.assertEqual(made_clips.status_label(clips[0].receipt), "未投稿")
 
+    def test_js_drawn_clip_is_marked_only_in_the_app(self):
+        self.clip.with_suffix(".jsdraw.json").write_text(json.dumps({"jsdraw": True, "model": "fable"}),
+                                                         encoding="utf-8")
+        clips = made_clips.list_clips()
+        self.assertEqual([(clip.jsdraw, clip.display_title) for clip in clips],
+                         [(True, "[JS] 見出し"), (False, "b_short")])
+        self.assertEqual(clips[0].title, "見出し")
+        with patch("moment_retrieval.used_ranges.record_from_clip"):
+            list(made_clips.upload(self.clip, "unlisted", service_factory=lambda: self.service))
+        snippet = self.service.inserted[0]["snippet"]
+        self.assertEqual(snippet["title"], "見出し")
+        self.assertNotIn("[JS]", snippet["title"] + snippet.get("description", ""))
+
+    def test_js_record_without_the_key_counts_and_an_explicit_false_or_broken_one_does_not(self):
+        record = self.clip.with_suffix(".jsdraw.json")
+        record.write_text(json.dumps({"model": "fable"}), encoding="utf-8")  # made before the key existed
+        self.assertTrue(made_clips.is_jsdraw(self.clip))
+        record.write_text(json.dumps({"jsdraw": False}), encoding="utf-8")
+        self.assertFalse(made_clips.is_jsdraw(self.clip))
+        record.write_text("{broken", encoding="utf-8")
+        self.assertFalse(made_clips.is_jsdraw(self.clip))
+        self.assertFalse(made_clips.is_jsdraw(self.old))
+
     def test_unlisted_upload_writes_receipt_and_second_press_is_skipped(self):
         with patch("moment_retrieval.used_ranges.record_from_clip") as record:
             list(made_clips.upload(self.clip, "unlisted", service_factory=lambda: self.service))

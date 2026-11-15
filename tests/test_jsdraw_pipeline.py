@@ -159,6 +159,11 @@ class MakeForClipTest(_Isolated):
         self.assertEqual(record["usd"], 0.11)
         self.assertFalse(clip.with_name(f".{clip.stem}.jsdraw").exists())
         self.assertTrue(clip.with_suffix(".jsdraw.json").is_file())
+        self.assertIs(json.loads(clip.with_suffix(".jsdraw.json").read_text(encoding="utf-8"))["jsdraw"], True)
+        # The app-only "[JS] " mark never reaches the title YouTube gets.
+        from moment_retrieval import made_clips, youtube_upload
+        self.assertTrue(made_clips.is_jsdraw(clip))
+        self.assertEqual(youtube_upload.metadata_for(clip).title, "借金ルート")
 
     def test_section_file_is_used_with_its_offset(self):
         clip, _video_id, run_id, _source = self._clip()

@@ -29,6 +29,31 @@ class MadeClip:
     title: str
     batch: bool  # made without uploading (daily batch, or "アップロードしない")
     receipt: dict | None
+    jsdraw: bool = False  # made as a JS-drawn Short (has a ``<clip>.jsdraw.json`` record)
+
+    @property
+    def display_title(self) -> str:
+        """The title shown inside this app only.  ``title`` stays the YouTube title as-is."""
+        return app_title(self.title, self.jsdraw)
+
+
+# Marks JS-drawn Shorts in the app's lists.  Never part of the YouTube title or description.
+JSDRAW_LABEL = "[JS] "
+
+
+def app_title(title: str, jsdraw: bool) -> str:
+    return f"{JSDRAW_LABEL}{title}" if jsdraw else title
+
+
+def is_jsdraw(path: Path) -> bool:
+    """True when the clip was made by JS drawing: ``jsdraw_pipeline.make_for_clip`` writes
+    ``<clip>.jsdraw.json`` only after the JS-drawn video replaced the clip (older records
+    without the ``jsdraw`` key count too)."""
+    try:
+        record = json.loads(Path(path).with_suffix(".jsdraw.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record.get("jsdraw", True) is not False
 
 
 def _jobs_dir() -> Path:
@@ -90,6 +115,7 @@ def list_clips() -> list[MadeClip]:
                 path=path, job_id=str(job.get("job_id") or ""), job_source=str(job.get("source") or ""),
                 created_at=float(job.get("created_at") or 0), source_name=_source_name(path),
                 title=youtube_upload.metadata_for(path).title, batch=not job.get("upload", True), receipt=receipt,
+                jsdraw=is_jsdraw(path),
             ))
     return clips
 

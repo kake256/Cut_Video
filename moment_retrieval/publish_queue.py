@@ -125,7 +125,8 @@ def enqueue(paths, *, interval_hours: float = DEFAULT_INTERVAL_HOURS, now: float
             if made_clips.scheduled_publish_at(clip.receipt) is not None:
                 skipped.append((clip.title, "すでにYouTubeで公開予約されています"))
                 continue
-            item = {"path": str(clip.path), "title": clip.title, "video_id": str(clip.receipt["video_id"]),
+            item = {"path": str(clip.path), "title": clip.title, "jsdraw": bool(clip.jsdraw),
+                    "video_id": str(clip.receipt["video_id"]),
                     "state": "queued", "not_before": slot, "interval_hours": interval_hours,
                     "previous_privacy": str(clip.receipt.get("privacy_status") or "private"),
                     "queued_at": now, "message": ""}

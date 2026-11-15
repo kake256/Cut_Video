@@ -188,7 +188,8 @@ def make_for_clip(clip: Path, *, model: str, highlight_run_id: str = "", section
         os.replace(result["mp4"], clip)
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    record = {"backend": backend, "model": codex_model if backend == "codex" else model,
+    record = {"jsdraw": True,  # marks the clip as JS-drawn in the app's lists (made_clips.is_jsdraw)
+              "backend": backend, "model": codex_model if backend == "codex" else model,
               "range": [start, end], "title": title, "story": story,
               "usd": result.get("usd"), "usd_equivalent": result.get("usd_equivalent"),
               "seconds": result.get("seconds"),

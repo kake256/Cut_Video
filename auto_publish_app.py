@@ -1352,11 +1352,18 @@ def publish_clips_from_ui(paths, interval_hours=None):
         now_count = len(added) - len(scheduled) - len(kept)
         if now_count:
             lines.append(f"- {now_count}本はすぐ公開の順番なので、アプリがこのまま公開します。")
-        lines += [f"- YouTubeに予約できず、アプリを開いている間に公開します: {html.escape(item['title'])}"
+        lines += [f"- YouTubeに予約できず、アプリを開いている間に公開します: {html.escape(_queue_title(item))}"
                   f"（{html.escape(item['message'])}）" for item in kept]
         gr.Info(f"{len(added)}本を公開待ちに入れました。")
     lines += [f"- 公開待ちに入れませんでした: {html.escape(name)}: {html.escape(reason)}" for name, reason in skipped]
     return "\n".join(lines), cards_signature()
+
+
+def _queue_title(item: dict) -> str:
+    """The app-only name of a queued clip ("[JS] " for JS-drawn ones); YouTube keeps item["title"]."""
+    from moment_retrieval import made_clips
+
+    return made_clips.app_title(str(item.get("title") or ""), bool(item.get("jsdraw")))
 
 
 def publish_queue_markdown() -> str:
@@ -1375,7 +1382,7 @@ def publish_queue_markdown() -> str:
         for item in info["pending"]:
             label = publish_queue.STATE_LABELS.get(item.get("state"), item.get("state"))
             lines.append(f"- {label} {datetime.fromtimestamp(item['not_before']):%m/%d %H:%M} "
-                         f"{html.escape(item['title'])}")
+                         f"{html.escape(_queue_title(item))}")
     else:
         lines.append("公開待ちの動画はありません。")
     if info["recent"]:
@@ -1384,7 +1391,7 @@ def publish_queue_markdown() -> str:
             label = publish_queue.STATE_LABELS.get(item.get("state"), item.get("state"))
             when = f"{datetime.fromtimestamp(item['finished_at']):%m/%d %H:%M}" if item.get("finished_at") else ""
             note = f" — {html.escape(item['message'])}" if item.get("message") else ""
-            lines.append(f"- {label} {when} {html.escape(item['title'])}{note}")
+            lines.append(f"- {label} {when} {html.escape(_queue_title(item))}{note}")
     return "\n".join(lines)
 
 
@@ -1405,7 +1412,7 @@ def publish_queue_move_to_youtube():
     scheduled, kept = publish_queue.schedule_waiting()
     lines = [f"- {len(scheduled)}本をYouTubeに公開予約しました（予定時刻まで非公開）。" if scheduled else
              "- YouTubeに移す公開待ちはありません（すぐ公開の順番の1本はアプリが公開します）。"]
-    lines += [f"- 予約できませんでした: {html.escape(item['title'])}（{html.escape(item['message'])}）" for item in kept]
+    lines += [f"- 予約できませんでした: {html.escape(_queue_title(item))}（{html.escape(item['message'])}）" for item in kept]
     return "\n".join(lines), publish_queue_markdown(), cards_signature()
 
 
@@ -1742,9 +1749,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                             else:
                                 links = (f'<a href="/gradio_api/file={quote(str(clip.path))}" target="_blank">'
                                          "再生して確認</a>")
-                            lines.append(f"- {status} {html.escape(clip.title)} — {links}")
+                            lines.append(f"- {status} {html.escape(clip.display_title)} — {links}")
                         gr.Markdown("\n".join(lines), padding=True)
-                        unposted = [(clip.title, str(clip.path)) for clip in clips if not clip.receipt]
+                        unposted = [(clip.display_title, str(clip.path)) for clip in clips if not clip.receipt]
                         if unposted:
                             # Uploaded with the 切り抜き tab's YouTube setting, like a manual run.
                             to_upload = gr.CheckboxGroup(choices=unposted, label="アップロードする動画")
@@ -1761,7 +1768,7 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                                 inputs=[auto_upload], outputs=[publish_result_md, auto_uploads_sig],
                                 concurrency_id="youtube-upload", concurrency_limit=1,
                             )
-                        private = [(clip.title, str(clip.path)) for clip in clips
+                        private = [(clip.display_title, str(clip.path)) for clip in clips
                                    if clip.receipt and clip.receipt.get("privacy_status") != "public"
                                    and not clip.receipt.get("missing_on_youtube")
                                    # Waiting in the app's queue or scheduled on YouTube: not offered again.

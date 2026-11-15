@@ -21,6 +21,14 @@ class WidenRangeTest(unittest.TestCase):
         self.assertLessEqual(start, 502.0)
         self.assertGreaterEqual(end, 543.0)
 
+    def test_a_longer_short_reads_a_wider_stretch(self):
+        self.assertEqual(jsdraw_pipeline.widen_target(), 90.0)
+        self.assertEqual(jsdraw_pipeline.widen_target(58.0), 90.0)
+        self.assertEqual(jsdraw_pipeline.widen_target(90.0), 122.0)
+        start, end = jsdraw_pipeline.widen_range(502.0, 543.0, _segments(), stream_end=1000.0,
+                                                 target=jsdraw_pipeline.widen_target(90.0))
+        self.assertGreaterEqual(end - start, 112.0)
+
     def test_long_clip_passes_through(self):
         self.assertEqual(jsdraw_pipeline.widen_range(100.0, 230.0, _segments(), stream_end=1000.0), (100.0, 230.0))
 

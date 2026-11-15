@@ -620,9 +620,11 @@ class AutoPipeline:
             return False
         if job.jsdraw:  # the JS-drawn Short reads a wider stretch around each clip
             from .jsdraw_pipeline import PREPARE_PAD_SEC, range_for_clip
+            from .jsdraw_short import video_max_for
 
             try:
-                clips = [(output, *range_for_clip(Path(output))) for output, _start, _end in clips]
+                video_max = video_max_for(job.max_duration_sec)
+                clips = [(output, *range_for_clip(Path(output), video_max)) for output, _start, _end in clips]
             except Exception as exc:
                 self._log(job, f"JS描画の範囲を決められなかったため、動画全体のダウンロードを待ちます（{type(exc).__name__}）")
                 return False
@@ -1101,6 +1103,7 @@ class AutoPipeline:
             section = (self.clip_sources.get(job.job_id) or {}).get("files", {}).get(output)
         if job.jsdraw and js_pick:
             from . import jsdraw_pipeline
+            from .jsdraw_short import video_max_for
 
             try:
                 record = jsdraw_pipeline.make_for_clip(
@@ -1108,6 +1111,7 @@ class AutoPipeline:
                     backend=jsdraw_pipeline.backend_for(job.agent), codex_model=job.model if job.agent == "codex" else "",
                     log=lambda message: self._log(job, f"  {index}本目（JS描画）: {message}", replace_progress=True),
                     suitability=js_pick if isinstance(js_pick, dict) else None,
+                    max_video_sec=video_max_for(job.max_duration_sec),
                 )
                 cost = (f"API料金 約{record['usd']}ドル" if record.get("backend", "api") == "api" else
                         "ログインの枠" + (f"・API換算 約{record['usd_equivalent']}ドル"

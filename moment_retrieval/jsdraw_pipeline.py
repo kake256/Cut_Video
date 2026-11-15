@@ -1,7 +1,8 @@
 """Auto-publish: make each picked clip as a JS-drawn Short (jsdraw_short) instead of the normal finish.
 
 The picked clip is 20-180 s; ``jsdraw_short.make_short`` takes a 50-300 s stretch of the
-stream and condenses it to a 50-58 s Short.  Short clips are widened around their middle
+stream and condenses it to a Short of 50 s up to the job's longest (``jsdraw_short.video_max_for``:
+58-90 s).  Short clips are widened around their middle
 to about ``TARGET_SEC`` (edges on segment boundaries, never past the stream's ends or into
 another posted range); longer clips are passed as they are.
 
@@ -18,7 +19,8 @@ from typing import Callable, Sequence
 
 from . import db
 
-TARGET_SEC = 90.0
+TARGET_SEC = 90.0  # for a 58 s Short; longer Shorts read WIDEN_EXTRA_SEC more than their length
+WIDEN_EXTRA_SEC = 32.0
 MIN_SEC = 50.0  # make_short's lower limit
 MAX_SEC = 300.0  # make_short's upper limit
 PREPARE_PAD_SEC = 8.0  # make_short reads this much around the range (audio cut points, face thumbnails)
@@ -117,14 +119,20 @@ def source_range(clip: Path) -> tuple[str, float, float, dict]:
     return str(source["video_id"]), float(source["start_sec"]), float(source["end_sec"]), meta
 
 
-def range_for_clip(clip: Path) -> tuple[float, float]:
+def widen_target(video_max: float | None = None) -> float:
+    """How long a stretch to read for a Short of at most ``video_max`` s (90 s for the default 58 s)."""
+    return max(TARGET_SEC, float(video_max or 0.0) + WIDEN_EXTRA_SEC)
+
+
+def range_for_clip(clip: Path, video_max: float | None = None) -> tuple[float, float]:
     """The widened source range for an exported clip (also used to download just that section)."""
     from .used_ranges import for_video
 
     video_id, start, end, _meta = source_range(clip)
     video, segments = _video_and_segments(video_id)
     stream_end = float(video.get("duration") or 0.0) or max((float(s["end_sec"]) for s in segments), default=end)
-    return widen_range(start, end, segments, stream_end=stream_end, used=for_video(video_id))
+    return widen_range(start, end, segments, stream_end=stream_end, used=for_video(video_id),
+                       target=widen_target(video_max))
 
 
 def candidate_for(clip: Path, highlight_run_id: str = "") -> dict | None:
@@ -157,18 +165,20 @@ def title_and_story(clip: Path, highlight_run_id: str = "") -> tuple[str, str]:
 
 def make_for_clip(clip: Path, *, model: str, highlight_run_id: str = "", section=None,
                   log: Log | None = None, make_short: Callable | None = None,
-                  backend: str = "api", codex_model: str = "", suitability: dict | None = None) -> dict:
+                  backend: str = "api", codex_model: str = "", suitability: dict | None = None,
+                  max_video_sec: float | None = None) -> dict:
     """Replace the exported clip with a JS-drawn Short.  Raises on any failure (caller falls back).
 
     ``suitability`` ({"js_score", "js_reason"} from the picking AI) is written into
     ``<clip>.jsdraw.json`` so it can be compared with how the Short did later.
+    ``max_video_sec``: the Short's longest (None keeps make_short's default, 58 s).
     """
     from . import jsdraw_short
 
     make_short = make_short or jsdraw_short.make_short
     clip = Path(clip)
     video_id, _start, _end, _meta = source_range(clip)
-    start, end = range_for_clip(clip)
+    start, end = range_for_clip(clip, max_video_sec)
     if end - start < MIN_SEC:
         raise JsDrawPipelineError(f"前後に広げても{end - start:.0f}秒しか取れません（{MIN_SEC:g}秒以上が必要）")
     end = min(end, start + MAX_SEC)
@@ -184,14 +194,15 @@ def make_for_clip(clip: Path, *, model: str, highlight_run_id: str = "", section
     try:
         result = make_short(media, start, end, model=model, title=title, story=story, out_dir=work,
                             progress=log or (lambda _message: None), video_id=video_id, media_offset=offset,
-                            backend=backend, codex_model=codex_model)
+                            backend=backend, codex_model=codex_model,
+                            **({"max_video_sec": max_video_sec} if max_video_sec is not None else {}))
         os.replace(result["mp4"], clip)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     record = {"backend": backend, "model": codex_model if backend == "codex" else model,
               "range": [start, end], "title": title, "story": story,
               "usd": result.get("usd"), "usd_equivalent": result.get("usd_equivalent"),
-              "seconds": result.get("seconds"),
+              "seconds": result.get("seconds"), "max_video_sec": result.get("max_video_sec"),
               "segs_total_generated": result.get("segs_total_generated"), "usage": result.get("usage"),
               "js_score": (suitability or {}).get("js_score"), "js_reason": (suitability or {}).get("js_reason") or ""}
     clip.with_suffix(".jsdraw.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")

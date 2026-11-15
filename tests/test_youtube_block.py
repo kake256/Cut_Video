@@ -66,6 +66,12 @@ class YouTubeBlockTests(unittest.TestCase):
         youtube_block.forget_info()
         self.addCleanup(youtube_block.forget_info)
 
+    def test_retry_sleep_functions_accept_yt_dlp_keyword(self):
+        # yt-dlp's RetryManager calls ``sleep_func(n=attempts)``; a different name crashed downloads on retry.
+        for sleep_func in youtube_block.polite_options(YOUTUBE_URL)["retry_sleep_functions"].values():
+            self.assertEqual(5.0, sleep_func(n=0))
+            self.assertEqual(120.0, sleep_func(n=9))
+
     def test_recognises_youtube_hosts_only(self):
         self.assertTrue(youtube_block.is_youtube(YOUTUBE_URL))
         self.assertTrue(youtube_block.is_youtube("https://youtu.be/abcdefghijk"))

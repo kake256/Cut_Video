@@ -71,6 +71,8 @@ class Length:
         self.segs_max = self.video_max - TAIL
         self.segs_min = self.video_min - TAIL
         self.segs_target = self.video_max - 3.0
+        # 長くしたときの目安の下限（90秒なら72秒）。上限だけ伝えると、AI は短い方へ寄せがち。
+        self.aim_min = round(self.segs_target - (self.video_max - VIDEO_MAX_SEC) / 2)
         ratio = self.video_max / VIDEO_MAX_SEC
         self.scenes = (5, round(7 * ratio))
         self.lines = int(round(600 * ratio, -2))
@@ -216,7 +218,8 @@ def _rules(lo: float, hi: float, length: Length | None = None) -> str:
     length = length or Length()
     if length.longer:
         total = (f"合計{length.segs_min:g}〜{length.segs_max:g}秒（最後に{TAIL:g}秒の余韻が付き、動画は{length.video_max:g}秒以内）。"
-                 "話が入りきる長さにする（無理に延ばさない）")
+                 f"{length.aim_min:g}〜{length.segs_target:g}秒を目安に、話の前置きからオチまで切らずに入れる"
+                 f"（{VIDEO_MAX_SEC:g}秒の版より長く使ってよい。話がそれより短いときだけ短くする）")
     else:
         total = "合計50〜56秒（最後に1.5秒の余韻が付き、動画は58秒以内）"
     return f"""## ハーネスとの約束（必ず守る）

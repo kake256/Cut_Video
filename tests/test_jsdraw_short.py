@@ -53,6 +53,6 @@ def test_longer_short_scales_the_prompt_rules():
         (90.0, 88.5, (5, 11), 900, 8)
     spec = js._spec("題", "話", 100, 250, length)
     assert "50〜90秒" in spec and "5〜11つ" in spec and "900行以内" in spec
-    assert "動画は90秒以内" in spec and "区間は3〜8個まで" in spec and "無理に延ばさない" in spec
+    assert "動画は90秒以内" in spec and "区間は3〜8個まで" in spec and "71〜87秒を目安" in spec
     assert js.length_note(70.0, length) == ""
     assert "87秒以内" in js.length_note(95.0, length)

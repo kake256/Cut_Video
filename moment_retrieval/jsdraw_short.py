@@ -48,6 +48,37 @@ VIDEO_MAX_SEC = 58.0
 SEGS_MAX_SEC = VIDEO_MAX_SEC - TAIL
 SEGS_MIN_SEC = VIDEO_MIN_SEC - TAIL
 SEGS_TARGET_SEC = 55.0
+# 自動作成では、通常の切り抜きの最長に合わせて動画を長くできる（ただし LONGEST_VIDEO_SEC まで）。
+# 話のテンポが遅い配信者だと58秒では話が入りきらないため。下限は VIDEO_MIN_SEC のまま。
+LONGEST_VIDEO_SEC = 90.0
+
+
+def video_max_for(max_duration_sec: float | None) -> float:
+    """自動作成の最長（秒）から、JS描画ショートの最長を決める（VIDEO_MAX_SEC〜LONGEST_VIDEO_SEC）。"""
+    try:
+        value = float(max_duration_sec)
+    except (TypeError, ValueError):
+        return VIDEO_MAX_SEC
+    return min(LONGEST_VIDEO_SEC, max(VIDEO_MAX_SEC, value))
+
+
+class Length:
+    """1本の長さの決まり。既定（58秒）は従来どおり。長くするときは場面数・行数・区間数も比例して増やす。"""
+
+    def __init__(self, video_max: float = VIDEO_MAX_SEC):
+        self.video_max = min(LONGEST_VIDEO_SEC, max(VIDEO_MAX_SEC, float(video_max)))
+        self.video_min = VIDEO_MIN_SEC
+        self.segs_max = self.video_max - TAIL
+        self.segs_min = self.video_min - TAIL
+        self.segs_target = self.video_max - 3.0
+        ratio = self.video_max / VIDEO_MAX_SEC
+        self.scenes = (5, round(7 * ratio))
+        self.lines = int(round(600 * ratio, -2))
+        self.max_segs = round(5 * ratio)
+
+    @property
+    def longer(self) -> bool:
+        return self.video_max > VIDEO_MAX_SEC + 1e-6
 FACE_CROP = (440, 320, 1480, 760)  # w, h, x, y（1920x1080 の配信画面の右下の顔カメラ）
 RVM_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx"
 REFERENCE_HTML = Path(__file__).resolve().parent / "jsdraw_reference.html"
@@ -181,10 +212,16 @@ def prepare(video_path: str, start: float, end: float, workdir: Path, progress: 
 
 # ---------------------------------------------------------------- プロンプト
 
-def _rules(lo: float, hi: float) -> str:
+def _rules(lo: float, hi: float, length: Length | None = None) -> str:
+    length = length or Length()
+    if length.longer:
+        total = (f"合計{length.segs_min:g}〜{length.segs_max:g}秒（最後に{TAIL:g}秒の余韻が付き、動画は{length.video_max:g}秒以内）。"
+                 "話が入りきる長さにする（無理に延ばさない）")
+    else:
+        total = "合計50〜56秒（最後に1.5秒の余韻が付き、動画は58秒以内）"
     return f"""## ハーネスとの約束（必ず守る）
 - `<canvas width="1080" height="1920">` を1つ置き、`window.SEGS` と `function draw(t, s, tEnd)` をグローバルに定義する。
-- `window.SEGS`：使う音声の区間（元配信の秒）のリスト。ハーネスが順につないで音声にする。合計50〜56秒（最後に1.5秒の余韻が付き、動画は58秒以内）、区間は3〜5個まで。
+- `window.SEGS`：使う音声の区間（元配信の秒）のリスト。ハーネスが順につないで音声にする。{total}、区間は3〜{length.max_segs}個まで。
   区間は{lo:.0f}〜{hi:.0f}秒の中から。切れ目は文字起こしの区間の境目（発話の切れ目）に合わせる。文の途中で切らない。
   ハーネスが切れ目を近くの無音へ最大0.6秒ずらすので、字幕は SEGS ではなく s（元配信の秒）で出し入れする。
 - `draw(t, s, tEnd)`：t=出力動画の秒、s=いま流れている音声の元配信の秒、tEnd=動画の長さ。毎フレーム全面を描き直す（t と s だけで決まる）。
@@ -193,19 +230,20 @@ def _rules(lo: float, hi: float) -> str:
 - 画面上部220pxと下部320pxはSNSのUIがかぶるので文字を置かない。"""
 
 
-def _spec(title: str, story: str, lo: float, hi: float) -> str:
+def _spec(title: str, story: str, lo: float, hi: float, length: Length | None = None) -> str:
+    length = length or Length()
     about = f"題材：「{title}」。{story}" if title else "題材：文字起こしを読み、一番おもしろい流れを自分で選ぶ。"
     return f"""## 作るもの
-配信の一区間から、縦型ショート（1080x1920、50〜58秒）を1本。
+配信の一区間から、縦型ショート（1080x1920、{length.video_min:g}〜{length.video_max:g}秒）を1本。
 {about}
 下に元配信の文字起こし（音声認識、元配信の秒）と、顔カメラの数枚を付けます。
 
-{_rules(lo, hi)}
+{_rules(lo, hi, length)}
 - 字幕：SUBS を自分で作る。文字起こしの区間の時刻に合わせ、長い区間は文字数の位置で比例配分。1枚14文字前後。音声認識の誤りは文脈で直してよい。
 
 ## 期待する絵
 参考に別の話で作った scene.html を付けます（絵柄と完成度の目安。場面をそのまま流用しない）。
-話の流れに合わせて場面を5〜7つに分け、「動く図解」で見せる。冒頭2秒でつかむ見出しを入れる。コードは簡潔に（全体で600行以内）。
+話の流れに合わせて場面を{length.scenes[0]}〜{length.scenes[1]}つに分け、「動く図解」で見せる。冒頭2秒でつかむ見出しを入れる。コードは簡潔に（全体で{length.lines}行以内）。
 
 ## 出力
 説明は1行だけ。そのあと ```html で始まるコードブロックに scene.html 全体を書く。"""
@@ -320,19 +358,21 @@ def fit_length(segs, env: list, off: float, max_total: float = SEGS_MAX_SEC, sea
     return segs
 
 
-def length_note(total: float) -> str:
+def length_note(total: float, length: Length | None = None) -> str:
     """生成された SEGS の合計が範囲外なら、直しの依頼に添える一文。"""
-    if SEGS_MIN_SEC <= total <= SEGS_MAX_SEC:
+    length = length or Length()
+    if length.segs_min <= total <= length.segs_max:
         return ""
-    return (f"\n\n【長さ】いまの SEGS の合計が{total:.1f}秒です。合計が{SEGS_TARGET_SEC:.0f}秒前後"
-            f"（{SEGS_MIN_SEC:g}〜{SEGS_MAX_SEC:g}秒）になるように SEGS を直してください。"
+    target = f"{length.segs_target:.0f}秒以内" if length.longer else f"{SEGS_TARGET_SEC:.0f}秒前後"
+    return (f"\n\n【長さ】いまの SEGS の合計が{total:.1f}秒です。合計が{target}"
+            f"（{length.segs_min:g}〜{length.segs_max:g}秒）になるように SEGS を直してください。"
             "区間を減らすか、区間の終わりを発話の切れ目で早めます。")
 
 
 class _Scene:
     """scene.html をブラウザで開き、t ごとのコマを取る。"""
 
-    def __init__(self, workdir: Path, scene: Path):
+    def __init__(self, workdir: Path, scene: Path, length: Length | None = None):
         from playwright.sync_api import sync_playwright
 
         self.meta = json.loads((workdir / "meta.json").read_text(encoding="utf-8"))
@@ -360,7 +400,7 @@ class _Scene:
         env = json.loads((workdir / "env.json").read_text(encoding="utf-8"))
         self.segs = [[self._quiet(env, a), self._quiet(env, b)] for a, b in raw]
         self.raw_total = segs_total(self.segs)  # AI が書いたままの長さ（直しの依頼に使う）
-        self.segs = fit_length(self.segs, env, self.meta["off"])
+        self.segs = fit_length(self.segs, env, self.meta["off"], max_total=(length or Length()).segs_max)
         self.starts, acc = [], 0.0
         for a, b in self.segs:
             self.starts.append(acc)
@@ -393,8 +433,8 @@ class _Scene:
         self._pw.stop()
 
 
-def _preview(workdir: Path, scene: Path, outdir: Path) -> tuple[list, float, str, float]:
-    sc = _Scene(workdir, scene)
+def _preview(workdir: Path, scene: Path, outdir: Path, length: Length | None = None) -> tuple[list, float, str, float]:
+    sc = _Scene(workdir, scene, length)
     try:
         times = [0.8] + [round(sc.tend * k / 8, 1) for k in range(1, 8)] + [round(sc.tend - 0.8, 1)]
         blocks = []
@@ -409,13 +449,14 @@ def _preview(workdir: Path, scene: Path, outdir: Path) -> tuple[list, float, str
         sc.close()
 
 
-def render(workdir: Path, scene: Path, out_mp4: Path, progress: Progress) -> float:
-    sc = _Scene(workdir, scene)
-    if sc.raw_total > SEGS_MAX_SEC + 1e-6:
+def render(workdir: Path, scene: Path, out_mp4: Path, progress: Progress, length: Length | None = None) -> float:
+    length = length or Length()
+    sc = _Scene(workdir, scene, length)
+    if sc.raw_total > length.segs_max + 1e-6:
         progress(f"音声区間の合計が{sc.raw_total:.1f}秒だったため、最後の区間を静かな所で切って"
                  f"{segs_total(sc.segs):.1f}秒にしました")
-    elif sc.raw_total < SEGS_MIN_SEC:
-        progress(f"音声区間の合計が{sc.raw_total:.1f}秒で、動画が{VIDEO_MIN_SEC:g}秒より短くなります（そのまま作ります）")
+    elif sc.raw_total < length.segs_min:
+        progress(f"音声区間の合計が{sc.raw_total:.1f}秒で、動画が{length.video_min:g}秒より短くなります（そのまま作ります）")
     vtmp = out_mp4.with_suffix(".video.mp4")
     try:
         ff = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "image2pipe", "-framerate", str(FPS), "-c:v", "mjpeg",
@@ -562,13 +603,16 @@ def _ask(backend: str, model: str, parts: list, workdir: Path, progress: Progres
 
 def make_short(video_path: str, start: float, end: float, *, model: str = DEFAULT_MODEL, title: str = "",
                story: str = "", out_dir: Path | None = None, progress: Progress = print,
-               video_id: str = "", media_offset: float = 0.0, backend: str = "api", codex_model: str = "") -> dict:
+               video_id: str = "", media_offset: float = 0.0, backend: str = "api", codex_model: str = "",
+               max_video_sec: float = VIDEO_MAX_SEC) -> dict:
     """1本作る。戻り値：{"mp4", "scene", "usage", "usd", "usd_equivalent", "seconds", ...}。
 
     ``backend``：描く AI。"api"（Claude API の Batch・従量課金）、"claude"（Claude Code のログイン）、
     "codex"（Codex のログイン。モデルは ``codex_model``）。``model`` は api / claude のときの描画モデル。
     ``video_id`` と ``media_offset`` は、元配信の一部分だけのファイルから作るとき（``prepare`` を参照）。
+    ``max_video_sec``：動画の最長（既定58秒、最大 LONGEST_VIDEO_SEC）。長くすると場面数などの決まりも増やす。
     """
+    length = Length(max_video_sec)
     if model not in MODELS:
         raise JsDrawError(f"未対応のモデルです: {model}")
     if backend not in BACKENDS:
@@ -587,7 +631,7 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     run = work / f"run_{backend}_{tag}_{time.strftime('%Y%m%d_%H%M%S')}"
     run.mkdir()
     lo, hi = start, end
-    parts = [("text", _spec(title, story, lo, hi))]
+    parts = [("text", _spec(title, story, lo, hi, length))]
     if REFERENCE_HTML.is_file():
         parts.append(("text", "## 参考 scene.html（別の話）\n```html\n" + REFERENCE_HTML.read_text(encoding="utf-8") + "\n```"))
     transcript = json.loads((work / "transcript.json").read_text(encoding="utf-8"))
@@ -612,13 +656,13 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     (run / "scene_v1.html").write_text(html, encoding="utf-8")
 
     progress("プレビューを作っています")
-    blocks, tend, errors, raw_total = _preview(work, scene, run)
-    note = length_note(raw_total)
+    blocks, tend, errors, raw_total = _preview(work, scene, run, length)
+    note = length_note(raw_total, length)
     if note:
         progress(f"音声区間の合計が{raw_total:.1f}秒なので、直しで長さも直してもらいます")
     ask = [("text", (
         f"縦型ショート動画（1080x1920）を描く scene.html と、その書き出しプレビュー（出力動画の秒）です。長さ {tend:.1f} 秒。"
-        f"ブラウザのエラー：{errors or 'なし'}\n\n{_rules(lo, hi)}\n\n"
+        f"ブラウザのエラー：{errors or 'なし'}\n\n{_rules(lo, hi, length)}\n\n"
         "見た目の崩れ（文字のはみ出し・重なり・読みにくさ・空白の多い画面・意味が伝わらない絵）とエラーを点検し、"
         "直す箇所だけを次の形式で出力してください。全文は書き直さない。\n"
         "<<<<<<< FIND\n（scene.html にそのまま1回だけ現れる元の文字列）\n=======\n（置き換え後）\n>>>>>>> END\n"
@@ -631,7 +675,7 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     (run / "scene.html").write_text(html, encoding="utf-8")
 
     out_mp4 = out_dir / f"{stem}_{backend}_{tag}.mp4"
-    seconds = render(work, scene, out_mp4, progress)
+    seconds = render(work, scene, out_mp4, progress, length)
     total = round(sum(x["usd"] for x in usage), 3)
     equivalents = [x.get("usd_equivalent") for x in usage if x.get("usd_equivalent") is not None]
     equivalent = round(sum(equivalents), 3) if equivalents else None
@@ -643,4 +687,5 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
         "ログインの枠" + (f"（API換算 約{equivalent}ドル）" if equivalent is not None else ""))
     progress(f"完成：{out_mp4}（{cost}）")
     return {"mp4": str(out_mp4), "scene": str(scene), "backend": backend, "usage": usage, "usd": total,
-            "usd_equivalent": equivalent, "seconds": round(seconds, 2), "segs_total_generated": round(raw_total, 2)}
+            "usd_equivalent": equivalent, "seconds": round(seconds, 2), "segs_total_generated": round(raw_total, 2),
+            "max_video_sec": length.video_max}

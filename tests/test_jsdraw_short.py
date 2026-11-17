@@ -179,3 +179,24 @@ def test_rules_tell_the_ai_when_there_is_no_live_face():
     assert "常に null" in js._rules(0, 60, face_mode="none")
     assert "写真" in js._rules(0, 60, face_mode="stand_in")
     assert "口の動きと声が合う" in js._rules(0, 60)
+
+
+def test_transcript_lines_split_long_segment_by_word_times():
+    # 20秒の塊のままだと AI が文字数で比例配分してずれる：単語の時刻で短い発話ごとに分ける
+    words = [{"word": "あいう", "start": 100.0, "end": 100.5}, {"word": "えお", "start": 100.5, "end": 101.0},
+             # 1.5秒の間
+             {"word": "かきく", "start": 102.5, "end": 103.0}, {"word": "けこ", "start": 103.0, "end": 103.4}]
+    rows = [{"start_sec": 100.0, "end_sec": 120.0, "text": "あいうえおかきくけこ", "words_json": json.dumps(words)}]
+    assert js.transcript_lines(rows, 90.0, 130.0) == [[100.0, 101.0, "あいうえお"], [102.5, 103.4, "かきくけこ"]]
+
+
+def test_transcript_lines_caps_length_and_keeps_rows_without_words():
+    words = [{"word": "あいうえおかきくけ", "start": 10.0 + i, "end": 10.9 + i} for i in range(4)]
+    rows = [{"start_sec": 0.0, "end_sec": 5.0, "text": "単語の時刻なし", "words_json": "[]"},
+            {"start_sec": 10.0, "end_sec": 14.0, "text": "", "words_json": json.dumps(words)},
+            {"start_sec": 50.0, "end_sec": 55.0, "text": "範囲の外", "words_json": None}]
+    lines = js.transcript_lines(rows, 0.0, 20.0)
+    assert lines[0] == [0.0, 5.0, "単語の時刻なし"]
+    assert all(len(text) <= 18 and b - a <= js.LINE_MAX_SEC for a, b, text in lines[1:])
+    assert "".join(text for _a, _b, text in lines[1:]) == "あいうえおかきくけ" * 4
+    assert all(text != "範囲の外" for _a, _b, text in lines)

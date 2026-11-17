@@ -353,6 +353,23 @@ class HighlightAnalysisTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_library_at_version_12_gains_metadata_json(self):
+        # metadata_json was added without a version bump; a library already at 12 never got it.
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            db.init_db(conn, create_backup=False)
+            conn.execute("ALTER TABLE highlight_candidates DROP COLUMN metadata_json")
+            conn.execute("PRAGMA user_version = 12")
+            conn.commit()
+
+            db.init_db(conn, create_backup=False)
+
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(highlight_candidates)")}
+            self.assertIn("metadata_json", columns)
+        finally:
+            conn.close()
+
     def test_obvious_continuation_suffixes_are_warned_locally(self):
         self.assertTrue(_has_obvious_continuation("この話には続きがあるんだけど、"))
         self.assertTrue(_has_obvious_continuation("例を挙げると例えば"))

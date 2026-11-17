@@ -294,40 +294,87 @@ def _transcript(video_path: str, start: float, end: float, video_id: str = "") -
     return [[round(r["start_sec"], 2), round(r["end_sec"], 2), r["text"]] for r in rows]
 
 
+def stand_in_dir() -> Path:
+    """配信者が映っていないときに小窓へ入れる、別の配信から撮った配信者の写真（背景透過の PNG / WebP）。"""
+    return Path(config.DATA_DIR) / "jsdraw_stand_in"
+
+
+def _stand_in_images() -> list[Path]:
+    folder = stand_in_dir()
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if p.suffix.lower() in (".png", ".webp"))
+
+
+def fit_stand_in(image, size: tuple[int, int] = FACE_SIZE):
+    """背景透過の人物写真を、顔カメラと同じ大きさ・同じ人物の置き方（FACE_PERSON_BOX）の RGBA 画像にする。"""
+    from PIL import Image
+
+    im = image.convert("RGBA")
+    alpha = np.asarray(im.split()[3])
+    ys, xs = np.nonzero(alpha > 127)
+    if not len(xs):
+        raise JsDrawError("写真に人物が写っていません（背景透過の画像を使ってください）。")
+    # 写真の外は透明で足してよいので、まわりを広げてから切る（枠が写真の端で止まって人物がずれないように）
+    pad = max(im.size) * 2
+    canvas = Image.new("RGBA", (im.width + 2 * pad, im.height + 2 * pad), (0, 0, 0, 0))
+    canvas.paste(im, (pad, pad))
+    im = canvas
+    person = (float(xs.min() + pad), float(ys.min() + pad), float(xs.max() - xs.min() + 1), float(ys.max() - ys.min() + 1))
+    w, h, x, y = crop_around_person(person, im.size)
+    return im.crop((x, y, x + w, y + h)).resize(size, Image.LANCZOS)
+
+
+def _make_stand_in(workdir: Path, progress: Progress) -> bool:
+    """stand_in_dir の写真から1枚選んで face/00001.webp と見本画像を作る。写真が無ければ False。"""
+    from PIL import Image
+
+    images = _stand_in_images()
+    if not images:
+        return False
+    pick = images[sum(workdir.name.encode("utf-8")) % len(images)]  # 同じ切り抜きならいつも同じ写真
+    face = fit_stand_in(Image.open(pick))
+    face_dir = workdir / "face"
+    face_dir.mkdir(parents=True, exist_ok=True)
+    face.save(face_dir / "00001.webp", quality=90)
+    thumbs = workdir / "thumbs"
+    thumbs.mkdir(exist_ok=True)
+    flat = Image.new("RGB", face.size, (40, 40, 48))
+    flat.paste(face, mask=face.split()[3])
+    flat.save(thumbs / "stand_in.jpg", quality=85)
+    progress(f"配信者が映っていないため、別の配信の写真（{pick.name}）を小窓に使います")
+    return True
+
+
 def prepare(video_path: str, start: float, end: float, workdir: Path, progress: Progress,
-            crop: tuple[int, int, int, int] | None = None, *, video_id: str = "", media_offset: float = 0.0) -> dict:
+            crop: tuple[int, int, int, int] | None = None, *, video_id: str = "", media_offset: float = 0.0,
+            face: str = "auto") -> dict:
     """区間 [start, end]（元配信の秒）の素材を workdir に用意する。
 
     ``video_path`` が元配信の一部分だけのファイルのときは、その 0 秒が元配信の ``media_offset`` 秒。
     文字起こしは ``video_id``（ライブラリの動画）から読む。
     ``crop``（w, h, x, y）を省くと、配信画面から配信者の位置を探して決める（find_face_crop）。
-    顔カメラはいつも FACE_SIZE に揃える。背景を抜いても人がほとんど残らなければ JsDrawError。
+    顔カメラはいつも FACE_SIZE に揃える。
+
+    ``face``："auto" は配信者を探し、見つからない・背景を抜くと人がほとんど残らないときは
+    別の配信の写真（stand_in_dir）に、写真も無ければ小窓なしにする。"stand_in" は初めから写真を使う。
+    meta の ``face_mode`` は "live"（顔カメラ）／"stand_in"（写真1枚、nface=1）／"none"（nface=0）。
     """
     if end - start < 50:
         raise JsDrawError("区間は50秒以上にしてください（その中から約55秒に詰めます）。")
     if end - start > 300:
         raise JsDrawError("区間は5分以内にしてください。")
+    if face not in ("auto", "stand_in"):
+        raise JsDrawError(f"未対応の顔の指定です: {face}")
     workdir.mkdir(parents=True, exist_ok=True)
     off = max(0.0, start - 8.0)
     dur = end - off + 8.0
     transcript = _transcript(video_path, start, end, video_id)
     seek = max(0.0, off - media_offset)
-    if crop is None:
-        crop = find_face_crop(video_path, seek, dur, progress)
-    w, h, x, y = crop
-    fw, fh = FACE_SIZE
     (workdir / "transcript.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
-    progress("音声と顔カメラを切り出しています")
+    progress("音声を切り出しています")
     _ffmpeg("-ss", f"{seek:.3f}", "-t", f"{dur:.3f}", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "48000",
             str(workdir / "src.wav"))
-    _ffmpeg("-ss", f"{seek:.3f}", "-t", f"{dur:.3f}", "-i", str(video_path), "-an",
-            "-vf", f"crop={w}:{h}:{x}:{y},scale={fw}:{fh}:flags=lanczos,fps={FPS}", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
-            str(workdir / "face.mp4"))
-    thumbs = workdir / "thumbs"
-    thumbs.mkdir(exist_ok=True)
-    for s in range(int(start // 10 * 10 + 10), int(end), 10):
-        _ffmpeg("-ss", f"{s - off:.3f}", "-i", str(workdir / "face.mp4"), "-frames:v", "1", "-q:v", "5",
-                str(thumbs / f"s{s}.jpg"))
     # 10ms ごとの音量（dB）：音声の切れ目を無音へ寄せるのに使う
     import wave
     with wave.open(str(workdir / "src.wav")) as wf:
@@ -337,20 +384,69 @@ def prepare(video_path: str, start: float, end: float, workdir: Path, progress: 
     n = len(pcm) // hop
     env = 20 * np.log10(np.sqrt((pcm[: n * hop].reshape(n, hop) ** 2).mean(1)) + 1)
     (workdir / "env.json").write_text(json.dumps([round(float(v), 1) for v in env]), encoding="utf-8")
-    face_dir = workdir / "face"
-    shutil.rmtree(face_dir, ignore_errors=True)  # 古い作り方のコマが残らないように
-    nface, coverage = _matte_faces(workdir / "face.mp4", face_dir, (fw, fh), progress)
-    if coverage < FACE_MIN_COVERAGE:
-        raise JsDrawError(f"切り出した顔カメラに配信者が映っていません（人物の割合 {coverage:.1%}）。")
-    meta = {"video": str(video_path), "start": start, "end": end, "off": off, "nface": nface, "crop": list(crop),
-            "face_coverage": round(coverage, 4), "rev": MATERIAL_REV}
+
+    # 古い作り方のコマ・見本が残らないように
+    face_dir, thumbs = workdir / "face", workdir / "thumbs"
+    shutil.rmtree(face_dir, ignore_errors=True)
+    shutil.rmtree(thumbs, ignore_errors=True)
+    meta = {"video": str(video_path), "start": start, "end": end, "off": off, "rev": MATERIAL_REV}
+    live_error = "写真を使う指定"
+    if face == "auto":
+        try:
+            meta.update(_prepare_live_face(video_path, seek, dur, start, end, off, workdir, progress, crop))
+            meta["face_mode"] = "live"
+        except JsDrawError as exc:
+            live_error = str(exc)
+            progress(f"顔カメラは使いません（{live_error}）")
+            shutil.rmtree(face_dir, ignore_errors=True)
+            shutil.rmtree(thumbs, ignore_errors=True)
+    if "face_mode" not in meta:
+        if _make_stand_in(workdir, progress):
+            meta.update(face_mode="stand_in", nface=1, face_note=live_error)
+        else:
+            progress("別の配信の写真も無いため、配信者の小窓なしで描きます")
+            thumbs.mkdir(exist_ok=True)
+            meta.update(face_mode="none", nface=0, face_note=live_error)
     (workdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     return meta
 
 
+def _prepare_live_face(video_path: str, seek: float, dur: float, start: float, end: float, off: float,
+                       workdir: Path, progress: Progress, crop) -> dict:
+    """配信画面から顔カメラを切り出して背景を抜く。配信者が見つからない・映っていなければ JsDrawError。"""
+    if crop is None:
+        crop = find_face_crop(video_path, seek, dur, progress)
+    w, h, x, y = crop
+    fw, fh = FACE_SIZE
+    progress("顔カメラを切り出しています")
+    _ffmpeg("-ss", f"{seek:.3f}", "-t", f"{dur:.3f}", "-i", str(video_path), "-an",
+            "-vf", f"crop={w}:{h}:{x}:{y},scale={fw}:{fh}:flags=lanczos,fps={FPS}", "-c:v", "libx264", "-crf", "12",
+            "-preset", "fast", str(workdir / "face.mp4"))
+    thumbs = workdir / "thumbs"
+    thumbs.mkdir(exist_ok=True)
+    for s in range(int(start // 10 * 10 + 10), int(end), 10):
+        _ffmpeg("-ss", f"{s - off:.3f}", "-i", str(workdir / "face.mp4"), "-frames:v", "1", "-q:v", "5",
+                str(thumbs / f"s{s}.jpg"))
+    nface, coverage = _matte_faces(workdir / "face.mp4", workdir / "face", (fw, fh), progress)
+    if coverage < FACE_MIN_COVERAGE:
+        raise JsDrawError(f"切り出した顔カメラに配信者が映っていません（人物の割合 {coverage:.1%}）")
+    return {"nface": nface, "crop": list(crop), "face_coverage": round(coverage, 4)}
+
+
 # ---------------------------------------------------------------- プロンプト
 
-def _rules(lo: float, hi: float, length: Length | None = None) -> str:
+FACE_RULES = {
+    "live": "- 顔カメラ：毎フレーム `window.FACE`（いまの瞬間の顔カメラ、背景透過済みの Image）が入る。人物は画像の中央〜右下寄り。口の動きと声が合う。",
+    "stand_in": ("- 配信者の小窓：この区間は配信者が映っていないため、`window.FACE` には別の配信で撮った配信者の写真"
+                 "（背景透過の静止画、毎フレーム同じ）が入る。人物は画像の中央〜右下寄り。口は動かないので、"
+                 "小さめの窓にするか、揺らす・拡大するなどで動きを付ける。"),
+    "none": ("- 配信者の小窓：この区間は配信者が映っておらず写真も無いため、`window.FACE` は常に null。"
+             "顔の小窓は描かず、図解と字幕だけで見せる。"),
+}
+FACE_ATTACHED = {"live": "と、顔カメラの数枚", "stand_in": "と、小窓に入れる配信者の写真"}
+
+
+def _rules(lo: float, hi: float, length: Length | None = None, face_mode: str = "live") -> str:
     length = length or Length()
     if length.longer:
         total = (f"合計{length.segs_min:g}〜{length.segs_max:g}秒（最後に{TAIL:g}秒の余韻が付き、動画は{length.video_max:g}秒以内）。"
@@ -364,20 +460,20 @@ def _rules(lo: float, hi: float, length: Length | None = None) -> str:
   区間は{lo:.0f}〜{hi:.0f}秒の中から。切れ目は文字起こしの区間の境目（発話の切れ目）に合わせる。文の途中で切らない。
   ハーネスが切れ目を近くの無音へ最大0.6秒ずらすので、字幕は SEGS ではなく s（元配信の秒）で出し入れする。
 - `draw(t, s, tEnd)`：t=出力動画の秒、s=いま流れている音声の元配信の秒、tEnd=動画の長さ。毎フレーム全面を描き直す（t と s だけで決まる）。
-- 顔カメラ：毎フレーム `window.FACE`（いまの瞬間の顔カメラ、背景透過済みの Image）が入る。人物は画像の中央〜右下寄り。口の動きと声が合う。
+{FACE_RULES.get(face_mode, FACE_RULES['live'])}
 - フォントは "IPAGothic","IPAPGothic","Yu Gothic","Meiryo",sans-serif の順で指定する。外部ファイル・ネットワークは使わない。
 - 画面上部220pxと下部320pxはSNSのUIがかぶるので文字を置かない。"""
 
 
-def _spec(title: str, story: str, lo: float, hi: float, length: Length | None = None) -> str:
+def _spec(title: str, story: str, lo: float, hi: float, length: Length | None = None, face_mode: str = "live") -> str:
     length = length or Length()
     about = f"題材：「{title}」。{story}" if title else "題材：文字起こしを読み、一番おもしろい流れを自分で選ぶ。"
     return f"""## 作るもの
 配信の一区間から、縦型ショート（1080x1920、{length.video_min:g}〜{length.video_max:g}秒）を1本。
 {about}
-下に元配信の文字起こし（音声認識、元配信の秒）と、顔カメラの数枚を付けます。
+下に元配信の文字起こし（音声認識、元配信の秒）{FACE_ATTACHED.get(face_mode, '')}を付けます。
 
-{_rules(lo, hi, length)}
+{_rules(lo, hi, length, face_mode)}
 - 字幕：SUBS を自分で作る。文字起こしの区間の時刻に合わせ、長い区間は文字数の位置で比例配分。1枚14文字前後。音声認識の誤りは文脈で直してよい。
 
 ## 期待する絵
@@ -451,8 +547,9 @@ def _apply_edits(html: str, reply: str) -> tuple[str, int, int]:
 _HARNESS_JS = """([OFF, FPS, N]) => {
   const cache = new Map();
   const idx = s => Math.max(1, Math.min(N, Math.round((s - OFF) * FPS) + 1));
-  window.faceAt = s => cache.get(idx(s)) || null;
+  window.faceAt = s => N ? (cache.get(idx(s)) || null) : null;
   window.__load = async list => {
+    if (!N) return;  // 小窓なし（配信者が映っておらず、写真も無い）
     for (const s of list) { const i = idx(s); if (cache.has(i)) continue;
       const im = new Image(); im.src = 'face/' + String(i).padStart(5, '0') + '.webp'; await im.decode(); cache.set(i, im);
       if (cache.size > 400) cache.delete(cache.keys().next().value); }
@@ -783,22 +880,28 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = work / "meta.json"
     cached = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
-    if cached.get("nface") and cached.get("rev") == MATERIAL_REV:
+    if cached.get("rev") == MATERIAL_REV and (cached.get("nface") or cached.get("face_mode") == "none"):
         progress("素材は用意済みのものを使います")
+        meta = cached
     else:
-        prepare(video_path, start, end, work, progress, video_id=video_id, media_offset=media_offset)
+        meta = prepare(video_path, start, end, work, progress, video_id=video_id, media_offset=media_offset)
+    face_mode = meta.get("face_mode", "live")
     tag = model if backend != "codex" else "codex"
     run = work / f"run_{backend}_{tag}_{time.strftime('%Y%m%d_%H%M%S')}"
     run.mkdir()
     lo, hi = start, end
-    parts = [("text", _spec(title, story, lo, hi, length))]
+    parts = [("text", _spec(title, story, lo, hi, length, face_mode))]
     if REFERENCE_HTML.is_file():
         parts.append(("text", "## 参考 scene.html（別の話）\n```html\n" + REFERENCE_HTML.read_text(encoding="utf-8") + "\n```"))
     transcript = json.loads((work / "transcript.json").read_text(encoding="utf-8"))
     parts += [("text", "## 文字起こし（[開始秒, 終了秒, 本文]）\n" + json.dumps(transcript, ensure_ascii=False)),
-              ("text", "## 顔カメラ（元配信の秒）")]
-    for p in sorted((work / "thumbs").glob("s*.jpg"), key=lambda p: int(p.stem[1:])):
-        parts += [("text", f"{p.stem[1:]}秒"), ("image", p)]
+              ]
+    if face_mode == "live":
+        parts.append(("text", "## 顔カメラ（元配信の秒）"))
+        for p in sorted((work / "thumbs").glob("s*.jpg"), key=lambda p: int(p.stem[1:])):
+            parts += [("text", f"{p.stem[1:]}秒"), ("image", p)]
+    elif face_mode == "stand_in" and (work / "thumbs" / "stand_in.jpg").is_file():
+        parts += [("text", "## 小窓に入れる配信者の写真（別の配信から。静止画）"), ("image", work / "thumbs" / "stand_in.jpg")]
 
     usage = []
     draw_model = codex_model if backend == "codex" else MODELS[model][0]
@@ -822,7 +925,7 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
         progress(f"音声区間の合計が{raw_total:.1f}秒なので、直しで長さも直してもらいます")
     ask = [("text", (
         f"縦型ショート動画（1080x1920）を描く scene.html と、その書き出しプレビュー（出力動画の秒）です。長さ {tend:.1f} 秒。"
-        f"ブラウザのエラー：{errors or 'なし'}\n\n{_rules(lo, hi, length)}\n\n"
+        f"ブラウザのエラー：{errors or 'なし'}\n\n{_rules(lo, hi, length, face_mode)}\n\n"
         "見た目の崩れ（文字のはみ出し・重なり・読みにくさ・空白の多い画面・意味が伝わらない絵）とエラーを点検し、"
         "直す箇所だけを次の形式で出力してください。全文は書き直さない。\n"
         "<<<<<<< FIND\n（scene.html にそのまま1回だけ現れる元の文字列）\n=======\n（置き換え後）\n>>>>>>> END\n"

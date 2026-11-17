@@ -93,3 +93,32 @@ def test_muxed_audio_passes_upload_timing_check(tmp_path):
                             str(out)], capture_output=True, text=True, check=True).stdout.split()
     lengths = dict(line.split(",") for line in probe)
     assert abs(float(lengths["video"]) - float(lengths["audio"])) < 0.03
+
+
+def test_crop_around_person_puts_person_in_the_face_box():
+    # 1080x1920 の縦長の配信の上の方に、幅300・高さ240の人物
+    w, h, x, y = js.crop_around_person((400, 300, 300, 240), (1080, 1920))
+    assert (w, h) == js.FACE_SIZE  # 拡大率1：FACE と同じ大きさ
+    px, py, pw, ph = js.FACE_PERSON_BOX
+    assert (x, y) == (400 + 150 - (px + pw // 2), 300 - py)
+
+
+def test_crop_around_person_stays_inside_the_frame():
+    # 全画面カメラ：人物が画面の大半を占める
+    w, h, x, y = js.crop_around_person((300, 100, 1500, 980), (1920, 1080))
+    assert 0 <= x and x + w <= 1920 and 0 <= y and y + h <= 1080
+    assert abs(w / h - 440 / 320) < 0.01
+    # 画面の右下の隅にいる人物でも、枠は外へはみ出さない
+    w, h, x, y = js.crop_around_person((1800, 1000, 120, 80), (1920, 1080))
+    assert x + w <= 1920 and y + h <= 1080
+
+
+def test_largest_component_ignores_small_specks():
+    import numpy as np
+
+    mask = np.zeros((20, 30), bool)
+    mask[2, 2] = True
+    mask[5:15, 10:25] = True
+    assert js._largest_component(mask) == (10, 5, 15, 10, 150)
+    assert js._largest_component(np.zeros((4, 4), bool)) is None
+

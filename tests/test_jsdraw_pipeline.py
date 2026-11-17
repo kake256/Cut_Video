@@ -434,7 +434,7 @@ class CliDrawingTest(unittest.TestCase):
         work = self.work / "data"
         stem_dir = work / "jsdraw" / "src_100_190"
         (stem_dir / "thumbs").mkdir(parents=True)
-        (stem_dir / "meta.json").write_text(json.dumps({"nface": 10, "off": 92.0}), encoding="utf-8")
+        (stem_dir / "meta.json").write_text(json.dumps({"nface": 10, "off": 92.0, "rev": jsdraw_short.MATERIAL_REV}), encoding="utf-8")
         (stem_dir / "transcript.json").write_text("[]", encoding="utf-8")
         with patch.object(config, "DATA_DIR", work), patch.object(jsdraw_short, "_ask", side_effect=fake_ask), \
                 patch.object(jsdraw_short, "_client", side_effect=AssertionError("no API client")), \

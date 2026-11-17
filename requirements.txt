@@ -12,6 +12,9 @@ torch>=2.6
 # Site extractors change frequently.  The default extra supplies the supported
 # JavaScript solver scripts (EJS); Node.js or Deno is installed separately.
 yt-dlp[default]>=2026.8.19
+# PO tokens for YouTube (yt-dlp plugin; versions below 2.0.0 are vulnerable).
+# Its token script is built by scripts/setup_pot_provider.ps1 (needs Node.js and git).
+bgutil-ytdlp-pot-provider>=2.0.2,<3
 # Optional: upload saved clips to the user's own YouTube channel as private videos.
 google-api-python-client>=2.100
 google-auth-oauthlib>=1.2

@@ -2,9 +2,11 @@ import json
 import contextlib
 import io
 import sys
+import tempfile
 import types
 import unittest
 import urllib.request
+from pathlib import Path
 from unittest.mock import patch
 
 from moment_retrieval.youtube_captions import (
@@ -34,6 +36,15 @@ class CaptionTests(unittest.TestCase):
         self.video_id = "syn00000001"
         self.url = f"https://www.youtube.com/api/timedtext?v={self.video_id}&lang=ja"
         _YDL.info = {"id": self.video_id, "availability": "public", "title": "<b>unsafe</b>", "subtitles": {"ja": [{"ext": "json3", "url": self.url}]}}
+        # Independent of a real YouTube cooldown (data/youtube_block.json) and of request pacing on this PC.
+        from moment_retrieval import config, youtube_block
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for target, name, value in ((config, "LIBRARY_ROOT", Path(tmp.name)), (youtube_block, "MIN_GAP_SEC", 0),
+                                    (youtube_block, "MAX_GAP_SEC", 0)):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_normalizes_only_single_public_youtube_videos(self):
         self.assertEqual(normalize_youtube_url(f"https://youtu.be/{self.video_id}?si=x"), f"https://www.youtube.com/watch?v={self.video_id}")

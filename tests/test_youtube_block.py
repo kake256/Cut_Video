@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import time
@@ -19,6 +20,7 @@ TWITCH_URL = "https://www.twitch.tv/videos/2919381021"
 class _FakeYoutubeDL:
     error = None
     calls = 0
+    processed = 0
 
     def __init__(self, options):
         self.options = options
@@ -42,6 +44,13 @@ class _FakeYoutubeDL:
         if type(self).error is not None:
             raise Exception(type(self).error)
 
+    def process_ie_result(self, info, download=True):
+        # Works from information fetched earlier: nothing is asked of YouTube.
+        type(self).processed += 1
+        if download:
+            Path(self.options["outtmpl"].replace("%(ext)s", "mp4")).write_bytes(b"synthetic")
+        return {**info, "ext": "mp4"}
+
 
 class YouTubeBlockTests(unittest.TestCase):
     def setUp(self):
@@ -52,6 +61,7 @@ class YouTubeBlockTests(unittest.TestCase):
         self.addCleanup(root.stop)
         _FakeYoutubeDL.error = None
         _FakeYoutubeDL.calls = 0
+        _FakeYoutubeDL.processed = 0
         fake = types.ModuleType("yt_dlp")
         fake.YoutubeDL = _FakeYoutubeDL
         utils = types.ModuleType("yt_dlp.utils")
@@ -60,9 +70,10 @@ class YouTubeBlockTests(unittest.TestCase):
         modules.start()
         self.addCleanup(modules.stop)
         self.save_dir = Path(self.tmp.name) / "video"
-        gap = patch.object(youtube_block, "MIN_GAP_SEC", 0)
-        gap.start()
-        self.addCleanup(gap.stop)
+        for name in ("MIN_GAP_SEC", "MAX_GAP_SEC"):
+            gap = patch.object(youtube_block, name, 0)
+            gap.start()
+            self.addCleanup(gap.stop)
         youtube_block.forget_info()
         self.addCleanup(youtube_block.forget_info)
 
@@ -167,7 +178,12 @@ class YouTubeBlockTests(unittest.TestCase):
         youtube_block.remember_info(YOUTUBE_URL, {"id": "abcdefghijk", "title": "t", "upload_date": "20261101",
                                                   "formats": [{"format_id": "140", "vcodec": "none"}]})
         list(download_video(YOUTUBE_URL, self.save_dir))
-        self.assertEqual(_FakeYoutubeDL.calls, 1)  # only the download itself
+        self.assertEqual(_FakeYoutubeDL.calls, 0)  # the download itself reuses it too
+        self.assertEqual(_FakeYoutubeDL.processed, 1)
+
+    def test_fresh_download_asks_youtube_once(self):
+        list(download_video(YOUTUBE_URL, self.save_dir))
+        self.assertEqual((_FakeYoutubeDL.calls, _FakeYoutubeDL.processed), (1, 1))
 
     def test_youtube_sections_are_fetched_one_at_a_time_with_polite_options(self):
         seen = []
@@ -175,7 +191,7 @@ class YouTubeBlockTests(unittest.TestCase):
         class Recording(_FakeYoutubeDL):
             active = 0
 
-            def download(self, urls):
+            def process_ie_result(self, info, download=True):
                 type(self).active += 1
                 seen.append((type(self).active, self.options))
                 Path(self.options["outtmpl"].replace("%(ext)s", "mp4")).write_bytes(b"x")
@@ -184,6 +200,8 @@ class YouTubeBlockTests(unittest.TestCase):
 
         sys.modules["yt_dlp"].YoutubeDL = Recording
         download_sections(YOUTUBE_URL, [(0, 10), (20, 30), (40, 50)], self.save_dir, workers=4)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(Recording.calls, 1)  # one lookup for all three sections
         self.assertEqual(max(active for active, _ in seen), 1)
         self.assertEqual(seen[0][1]["concurrent_fragment_downloads"], 1)
         self.assertLessEqual(seen[0][1]["retries"], 5)
@@ -195,13 +213,83 @@ class YouTubeBlockTests(unittest.TestCase):
         self.assertGreaterEqual(options["retry_sleep_functions"]["http"](0), 5)
 
     def test_pace_spaces_out_youtube_requests(self):
-        with patch.object(youtube_block, "MIN_GAP_SEC", 0.2):
+        with patch.object(youtube_block, "MIN_GAP_SEC", 0.2), patch.object(youtube_block, "MAX_GAP_SEC", 0.2):
             started = time.monotonic()
             youtube_block.pace(YOUTUBE_URL)
             youtube_block.pace(YOUTUBE_URL)
             youtube_block.pace(TWITCH_URL)  # other sites are not slowed down
             self.assertGreaterEqual(time.monotonic() - started, 0.19)
             self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_pace_waits_a_random_gap_between_min_and_max(self):
+        with patch.object(youtube_block, "MIN_GAP_SEC", 5), patch.object(youtube_block, "MAX_GAP_SEC", 10), \
+                patch.object(youtube_block, "_last_request", 0.0), \
+                patch.object(youtube_block.time, "monotonic", return_value=100.0), \
+                patch.object(youtube_block.time, "sleep") as sleep, \
+                patch.object(youtube_block.random, "uniform", return_value=7.5) as uniform:
+            youtube_block.pace(YOUTUBE_URL)
+            youtube_block.pace(YOUTUBE_URL)
+        uniform.assert_called_with(5, 10)
+        sleep.assert_called_once_with(7.5)
+
+    # ---- yt-dlp options shared by every call ----
+
+    def test_client_options_name_js_runtimes_for_every_site(self):
+        self.assertEqual(youtube_block.client_options(TWITCH_URL), {"js_runtimes": {"deno": {}, "node": {}}})
+        self.assertEqual(youtube_block.client_options(YOUTUBE_URL)["js_runtimes"], {"deno": {}, "node": {}})
+
+    def test_mweb_client_only_with_the_po_token_provider(self):
+        with patch.dict(os.environ, {}, clear=False), patch.object(youtube_block, "pot_provider_installed",
+                                                                     return_value=True):
+            os.environ.pop("CUT_VIDEO_YOUTUBE_PLAYER_CLIENTS", None)
+            os.environ.pop("CUT_VIDEO_BGUTIL_SERVER_HOME", None)
+            options = youtube_block.client_options(YOUTUBE_URL)
+            self.assertEqual(options["extractor_args"], {"youtube": {"player_client": ["default", "mweb"]}})
+            self.assertNotIn("extractor_args", youtube_block.client_options(TWITCH_URL))
+        with patch.dict(os.environ, {}, clear=False), patch.object(youtube_block, "pot_provider_installed",
+                                                                     return_value=False):
+            os.environ.pop("CUT_VIDEO_YOUTUBE_PLAYER_CLIENTS", None)
+            os.environ.pop("CUT_VIDEO_BGUTIL_SERVER_HOME", None)
+            self.assertNotIn("extractor_args", youtube_block.client_options(YOUTUBE_URL))
+
+    def test_player_clients_and_script_home_can_be_set(self):
+        with patch.dict(os.environ, {"CUT_VIDEO_YOUTUBE_PLAYER_CLIENTS": "mweb, tv",
+                                       "CUT_VIDEO_BGUTIL_SERVER_HOME": r"D:\bgutil\server"}):
+            args = youtube_block.client_options(YOUTUBE_URL)["extractor_args"]
+        self.assertEqual(args["youtube"], {"player_client": ["mweb", "tv"]})
+        self.assertEqual(args["youtubepot-bgutilscript"], {"server_home": [r"D:\bgutil\server"]})
+
+    def test_force_ipv4_binds_youtube_requests_and_skips_ffmpeg_sections(self):
+        with patch.dict(os.environ, {"CUT_VIDEO_YOUTUBE_FORCE_IPV4": "1"}):
+            self.assertEqual(youtube_block.client_options(YOUTUBE_URL)["source_address"], "0.0.0.0")
+            self.assertIn("--dns-result-order=ipv4first", os.environ["NODE_OPTIONS"])
+            self.assertNotIn("source_address", youtube_block.client_options(TWITCH_URL))
+            with self.assertRaises(DownloadError):
+                download_sections(YOUTUBE_URL, [(0, 10)], self.save_dir)
+        self.assertEqual(_FakeYoutubeDL.calls, 0)
+
+    def test_request_options_combine_client_and_polite_options(self):
+        options = youtube_block.request_options(YOUTUBE_URL)
+        self.assertIn("js_runtimes", options)
+        self.assertEqual(options["concurrent_fragment_downloads"], 1)
+
+    def test_cached_info_is_not_used_for_downloads_when_format_urls_expire_soon(self):
+        soon = int(time.time()) + 600
+        youtube_block.remember_info(YOUTUBE_URL, {"id": "abcdefghijk", "formats": [
+            {"url": f"https://rr1---sn.googlevideo.com/videoplayback?expire={soon}&id=x"}]})
+        self.assertIsNotNone(youtube_block.cached_info(YOUTUBE_URL))
+        self.assertIsNone(youtube_block.cached_info(YOUTUBE_URL, min_valid_sec=3600))
+        later = int(time.time()) + 5 * 3600
+        youtube_block.remember_info(YOUTUBE_URL, {"id": "abcdefghijk", "formats": [
+            {"url": f"https://rr1---sn.googlevideo.com/videoplayback?expire={later}&id=x"}]})
+        self.assertIsNotNone(youtube_block.cached_info(YOUTUBE_URL, min_valid_sec=3600))
+
+    def test_download_with_expiring_info_asks_again(self):
+        soon = int(time.time()) + 600
+        youtube_block.remember_info(YOUTUBE_URL, {"id": "abcdefghijk", "title": "t", "upload_date": "20261101",
+                                                  "formats": [{"url": f"https://x.googlevideo.com/v?expire={soon}"}]})
+        list(download_video(YOUTUBE_URL, self.save_dir))
+        self.assertEqual(_FakeYoutubeDL.calls, 1)  # a new lookup, then the download reuses that one
 
 
 if __name__ == "__main__":

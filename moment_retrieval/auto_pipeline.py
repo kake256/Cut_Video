@@ -1142,6 +1142,22 @@ class AutoPipeline:
             return
         self._log(job, f"  {index}本目: タイトル「{plan.hook_text}」・補足字幕{len(plan.notes)}件・効果音{len(plan.sound_effects)}か所")
 
+    def _suggest_tags(self, job: AutoJob, clip: Path) -> None:
+        """AI tags / hashtags into the clip's posting JSON (only when turned on in
+        data/posting_tags.json).  A failure never stops the upload."""
+        from . import posting_tags, youtube_upload
+
+        if not posting_tags.enabled() or youtube_upload.receipt_path(clip).is_file():
+            return
+        try:
+            result = posting_tags.apply_to_sidecar(clip)
+        except Exception as exc:
+            self._log(job, f"タグの提案を省略しました（{type(exc).__name__}: {exc}）"[:300])
+            return
+        if result:
+            self._log(job, f"タグ{len(result['tags'])}個とハッシュタグ {' '.join(result['hashtags'])} を付けました"
+                           f"（API料金 約{result['cost_usd']}ドル）")
+
     def _upload(self, job: AutoJob) -> None:
         from . import youtube_upload
 
@@ -1151,6 +1167,7 @@ class AutoPipeline:
             return
         for output in job.outputs:
             self._check_cancel(job)
+            self._suggest_tags(job, Path(output))
             receipt = None
             try:
                 for message, result in youtube_upload.upload_private(Path(output), privacy=job.privacy,

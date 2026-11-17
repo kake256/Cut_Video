@@ -7,6 +7,7 @@
 使い方（F:\\myapp\\cut で）:
   venv\\Scripts\\python.exe scripts\\jsdraw_rerender_face.py --check  <clip.mp4> ...   # 位置を探して確認画像だけ出す
   venv\\Scripts\\python.exe scripts\\jsdraw_rerender_face.py --backup D:\\myapp\\jsdraw_black_backup <clip.mp4> ...
+  （--stand-in を付けると、配信者を探さずに data\\jsdraw_stand_in の写真を小窓に使う）
 
 差し替える前の mp4 は --backup のフォルダへコピーする。素材フォルダ（data/jsdraw/<stem>）の顔カメラは上書きする。
 """
@@ -56,6 +57,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("clips", nargs="+", type=Path)
     ap.add_argument("--check", action="store_true", help="位置を探して確認画像を出すだけ（差し替えない）")
+    ap.add_argument("--stand-in", action="store_true", help="配信者を探さず、別の配信の写真（data/jsdraw_stand_in）を使う")
     ap.add_argument("--backup", type=Path, help="差し替える前の mp4 のコピー先")
     ap.add_argument("--out", type=Path, default=Path("D:/myapp/jsdraw_black_check"), help="確認画像の置き場所")
     args = ap.parse_args()
@@ -88,16 +90,21 @@ def main() -> int:
             scene = _scene(workdir)
             old_seconds = _duration(clip)
             length = js.Length(min(js.LONGEST_VIDEO_SEC, max(js.VIDEO_MAX_SEC, old_seconds + 0.05)))
-            meta = js.prepare(video, start, end, workdir, print, video_id=video_id)
+            meta = js.prepare(video, start, end, workdir, print, video_id=video_id,
+                              face="stand_in" if args.stand_in else "auto")
+            if meta["face_mode"] == "none":
+                raise js.JsDrawError("配信者が映っておらず写真も無いため、いまの描画コードでは小窓が空になります")
             tmp = clip.with_name(f".{clip.stem}.rerender.mp4")
             seconds = js.render(workdir, scene, tmp, print, length)
             args.backup.mkdir(parents=True, exist_ok=True)
             shutil.copy2(clip, args.backup / clip.name)
             tmp.replace(clip)
-            record["face_rerender"] = {"crop": meta["crop"], "face_coverage": meta["face_coverage"],
+            record["face_rerender"] = {"face_mode": meta["face_mode"], "crop": meta.get("crop"),
+                                       "face_coverage": meta.get("face_coverage"),
                                        "scene": scene.name, "seconds_before": round(old_seconds, 2)}
             record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-            row.update(crop=meta["crop"], face_coverage=meta["face_coverage"], seconds=round(seconds, 2),
+            row.update(face_mode=meta["face_mode"], crop=meta.get("crop"), face_coverage=meta.get("face_coverage"),
+                       seconds=round(seconds, 2),
                        seconds_before=round(old_seconds, 2), ok=True)
         except Exception as exc:  # 1本失敗しても残りは続ける
             row.update(ok=False, error=f"{type(exc).__name__}: {exc}")

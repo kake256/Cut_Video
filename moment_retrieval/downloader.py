@@ -317,7 +317,8 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
     from . import youtube_block
 
     youtube_block.check(url)
-    if youtube_block.is_youtube(url) and youtube_block.force_ipv4():
+    if (youtube_block.is_youtube(url) and youtube_block.current_family() == "ipv4"
+            and "ipv6" in youtube_block.available_families()):
         # Sections are cut by ffmpeg, which cannot be kept on IPv4; the format URLs are bound to
         # the IPv4 address, so ffmpeg over IPv6 gets 403.  The caller waits for the full video instead.
         raise DownloadError("IPv4だけで通信する設定のため、区間だけの取得はしません")

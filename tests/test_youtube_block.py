@@ -74,6 +74,13 @@ class YouTubeBlockTests(unittest.TestCase):
             gap = patch.object(youtube_block, name, 0)
             gap.start()
             self.addCleanup(gap.stop)
+        # One address family unless a test says otherwise (the PC running the tests may have both).
+        families = patch.object(youtube_block, "available_families", return_value=("ipv4",))
+        self.families = families.start()
+        self.addCleanup(families.stop)
+        environment = patch.dict(os.environ, {"CUT_VIDEO_YOUTUBE_FORCE_IPV4": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
         youtube_block.forget_info()
         self.addCleanup(youtube_block.forget_info)
 
@@ -259,14 +266,58 @@ class YouTubeBlockTests(unittest.TestCase):
         self.assertEqual(args["youtube"], {"player_client": ["mweb", "tv"]})
         self.assertEqual(args["youtubepot-bgutilscript"], {"server_home": [r"D:\bgutil\server"]})
 
-    def test_force_ipv4_binds_youtube_requests_and_skips_ffmpeg_sections(self):
-        with patch.dict(os.environ, {"CUT_VIDEO_YOUTUBE_FORCE_IPV4": "1"}):
-            self.assertEqual(youtube_block.client_options(YOUTUBE_URL)["source_address"], "0.0.0.0")
-            self.assertIn("--dns-result-order=ipv4first", os.environ["NODE_OPTIONS"])
-            self.assertNotIn("source_address", youtube_block.client_options(TWITCH_URL))
-            with self.assertRaises(DownloadError):
-                download_sections(YOUTUBE_URL, [(0, 10)], self.save_dir)
+    # ---- IPv4 / IPv6 ----
+
+    def test_single_family_pc_does_not_bind_an_address(self):
+        self.assertNotIn("source_address", youtube_block.client_options(YOUTUBE_URL))
+
+    def test_dual_stack_starts_on_ipv6_and_force_ipv4_puts_ipv4_first(self):
+        self.families.return_value = ("ipv6", "ipv4")
+        with patch.dict(os.environ, {"NODE_OPTIONS": ""}):
+            self.assertEqual(youtube_block.client_options(YOUTUBE_URL)["source_address"], "::")
+            self.assertIn("--dns-result-order=ipv6first", os.environ["NODE_OPTIONS"])
+            with patch.dict(os.environ, {"CUT_VIDEO_YOUTUBE_FORCE_IPV4": "1"}):
+                self.assertEqual(youtube_block.client_options(YOUTUBE_URL)["source_address"], "0.0.0.0")
+                self.assertEqual(os.environ["NODE_OPTIONS"], "--dns-result-order=ipv4first")
+                with self.assertRaises(DownloadError):  # ffmpeg cannot be kept on IPv4
+                    download_sections(YOUTUBE_URL, [(0, 10)], self.save_dir)
+        self.assertNotIn("source_address", youtube_block.client_options(TWITCH_URL))
         self.assertEqual(_FakeYoutubeDL.calls, 0)
+
+    def test_bot_check_on_one_family_switches_to_the_other(self):
+        self.families.return_value = ("ipv6", "ipv4")
+        _FakeYoutubeDL.error = BOT_ERROR
+        with self.assertRaises(YouTubeBlocked) as first:
+            list(download_video(YOUTUBE_URL, self.save_dir))
+        self.assertIn("IPv4で問い合わせます", str(first.exception))
+        self.assertIn(youtube_block.BOT_MARKER, str(first.exception))
+        self.assertEqual(youtube_block.blocked_until(), 0.0)  # IPv4 is still usable
+        self.assertEqual(youtube_block.current_family(), "ipv4")
+        self.assertEqual(youtube_block.client_options(YOUTUBE_URL)["source_address"], "0.0.0.0")
+
+        with self.assertRaises(YouTubeBlocked) as second:  # refused over IPv4 too: everything stops
+            list(download_video(YOUTUBE_URL, self.save_dir))
+        self.assertNotIn("問い合わせます", str(second.exception))
+        self.assertGreater(youtube_block.blocked_until(), time.time())
+        self.assertIsNone(youtube_block.current_family())
+        calls = _FakeYoutubeDL.calls
+        with self.assertRaises(YouTubeBlocked):
+            list(download_video(YOUTUBE_URL, self.save_dir))
+        self.assertEqual(_FakeYoutubeDL.calls, calls)
+
+    def test_success_forgets_only_expired_family_cooldowns(self):
+        self.families.return_value = ("ipv6", "ipv4")
+        youtube_block.record(BOT_ERROR, family="ipv6")
+        youtube_block.record(BOT_ERROR, family="ipv4", now=time.time() - youtube_block.COOLDOWN_SEC - 1)
+        self.assertEqual(youtube_block.current_family(), "ipv4")
+        list(download_video(YOUTUBE_URL, self.save_dir))
+        self.assertEqual(set(youtube_block.load()["families"]), {"ipv6"})
+
+    def test_old_single_record_blocks_every_family(self):
+        self.families.return_value = ("ipv6", "ipv4")
+        youtube_block._write({"since": time.time(), "until": time.time() + 3600, "error": BOT_ERROR})
+        self.assertGreater(youtube_block.blocked_until(), 0)
+        self.assertIsNone(youtube_block.current_family())
 
     def test_request_options_combine_client_and_polite_options(self):
         options = youtube_block.request_options(YOUTUBE_URL)

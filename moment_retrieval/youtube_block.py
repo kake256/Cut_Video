@@ -8,6 +8,10 @@ The first request after the cooldown is a single probe: success clears the
 record, another bot check starts a new cooldown.  Twitch and other sites are
 not affected.  Deleting the file ends the cooldown early.
 
+The cooldown is kept per address family: when this PC has both IPv6 and IPv4,
+a bot check on one moves the following requests to the other, and YouTube is
+left alone only while both are refused.
+
 Before that point is reached, requests are kept light (YouTube only):
 ``pace`` waits a random 5-10 s between the start of two requests,
 ``polite_options`` limits retries and parallel connections and waits longer
@@ -89,10 +93,69 @@ def load() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+# ---- IPv4 / IPv6 ----
+# A bot check can stick to one address family only (2026-11-17: IPv6 refused, IPv4 fine on the
+# same line), so each family has its own cooldown and requests move to the other one meanwhile.
+# YouTube is asked over IPv6 first when this PC has it (Windows' own preference), unless
+# CUT_VIDEO_YOUTUBE_FORCE_IPV4=1 puts IPv4 first.
+FAMILIES = ("ipv6", "ipv4")
+_FAMILY_LABEL = {"ipv4": "IPv4", "ipv6": "IPv6"}
+
+
+@functools.lru_cache(maxsize=1)
+def available_families() -> tuple[str, ...]:
+    """Address families this PC can reach the internet with (no packet is sent)."""
+    import socket
+
+    found = []
+    for family, name, probe in ((socket.AF_INET6, "ipv6", "2001:4860:4860::8888"),
+                                (socket.AF_INET, "ipv4", "8.8.8.8")):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect((probe, 53))  # UDP connect only picks a route
+            found.append(name)
+        except OSError:
+            pass
+    return tuple(found) or ("ipv4",)
+
+
+def force_ipv4() -> bool:
+    """CUT_VIDEO_YOUTUBE_FORCE_IPV4=1: ask YouTube over IPv4 first (IPv6 only while IPv4 is refused)."""
+    return os.environ.get("CUT_VIDEO_YOUTUBE_FORCE_IPV4", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def family_order() -> list[str]:
+    order = ["ipv4", "ipv6"] if force_ipv4() else ["ipv6", "ipv4"]
+    return [family for family in order if family in available_families()]
+
+
+def _blocks(data: dict, now: float) -> dict[str, float]:
+    """Family -> end of its running cooldown.  An old single record blocks every family."""
+    if data.get("until") is not None and "families" not in data:
+        until = float(data.get("until") or 0)
+        return {family: until for family in FAMILIES} if until > now else {}
+    found = {}
+    for family, entry in (data.get("families") or {}).items():
+        until = float((entry or {}).get("until") or 0)
+        if until > now:
+            found[family] = until
+    return found
+
+
+def current_family(now: float | None = None) -> str | None:
+    """The address family the next YouTube request uses (None while every one is refused)."""
+    blocks = _blocks(load(), time.time() if now is None else now)
+    return next((family for family in family_order() if family not in blocks), None)
+
+
 def blocked_until(now: float | None = None) -> float:
-    """End of the current cooldown (0 when YouTube may be asked)."""
-    until = float(load().get("until") or 0)
-    return until if until > (time.time() if now is None else now) else 0.0
+    """End of the current cooldown (0 when YouTube may be asked over some address family)."""
+    now = time.time() if now is None else now
+    blocks = _blocks(load(), now)
+    usable = family_order()
+    if any(family not in blocks for family in usable):
+        return 0.0
+    return min(blocks[family] for family in usable)
 
 
 def message(until: float) -> str:
@@ -101,16 +164,32 @@ def message(until: float) -> str:
             f"早めに試すときは {store_path()} を削除してください。")
 
 
-def record(error: BaseException | str, *, now: float | None = None) -> float:
-    now = time.time() if now is None else now
-    until = now + COOLDOWN_SEC
-    entry = {"since": now, "until": until, "error": " ".join(str(error).split())[:300]}
+def switch_message(refused: str, next_family: str) -> str:
+    return (f"YouTubeに{_FAMILY_LABEL.get(refused, refused)}でボット判定（{BOT_MARKER}）されたため、"
+            f"次からは{_FAMILY_LABEL.get(next_family, next_family)}で問い合わせます。")
+
+
+def _write(data: dict) -> None:
     with _lock:
         path = store_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(entry, ensure_ascii=False, indent=1), encoding="utf-8")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(temporary, path)
+
+
+def record(error: BaseException | str, *, now: float | None = None, family: str | None = None) -> float:
+    """Start a cooldown for ``family`` (default: the one requests are using now); returns its end."""
+    now = time.time() if now is None else now
+    family = family or current_family(now) or (family_order() or ["ipv4"])[0]
+    until = now + COOLDOWN_SEC
+    data = load()
+    families = {name: entry for name, entry in (data.get("families") or {}).items()
+                if name in _blocks(data, now)}
+    if data.get("until") is not None and "families" not in data:  # old single record: keep it per family
+        families = {name: {k: data.get(k) for k in ("since", "until", "error")} for name in _blocks(data, now)}
+    families[family] = {"since": now, "until": until, "error": " ".join(str(error).split())[:300]}
+    _write({"families": families})
     return until
 
 
@@ -132,16 +211,31 @@ def check(url: str) -> None:
 
 
 def note_failure(url: str, error: BaseException | str) -> YouTubeBlocked | None:
-    """After a failed YouTube request: start the cooldown on a bot check and return the error to raise."""
+    """After a failed YouTube request: start the cooldown on a bot check and return the error to raise.
+
+    When another address family is still usable, the error says so: the request
+    may be made again at once (the daily batch retries the video once).
+    """
     if not is_youtube(url) or not is_bot_check(error):
         return None
-    return YouTubeBlocked(message(record(error)))
+    refused = current_family()
+    until = record(error, family=refused)
+    following = current_family()
+    if following is not None:
+        return YouTubeBlocked(switch_message(refused or "", following))
+    return YouTubeBlocked(message(blocked_until() or until))
 
 
 def note_success(url: str) -> None:
-    """A YouTube request went through: end a cooldown that has already expired (probe succeeded)."""
-    if is_youtube(url) and store_path().exists() and not blocked_until():
+    """A YouTube request went through: forget cooldowns that have already ended (probe succeeded)."""
+    if not is_youtube(url) or not store_path().exists():
+        return
+    data = load()
+    blocks = _blocks(data, time.time())
+    if not blocks:
         clear()
+    elif "families" in data and set(data["families"]) - set(blocks):
+        _write({"families": {name: entry for name, entry in data["families"].items() if name in blocks}})
 
 
 def video_id(url: str) -> str:
@@ -200,14 +294,6 @@ def pot_provider_installed() -> bool:
         return False
 
 
-def force_ipv4() -> bool:
-    """Send YouTube requests over IPv4 only (CUT_VIDEO_YOUTUBE_FORCE_IPV4=1).
-
-    Windows prefers IPv6 when the line has it; a bot check can stick to the IPv6 side only.
-    """
-    return os.environ.get("CUT_VIDEO_YOUTUBE_FORCE_IPV4", "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def player_clients() -> list[str]:
     """YouTube player clients to ask for ([] = leave yt-dlp's defaults alone)."""
     configured = os.environ.get("CUT_VIDEO_YOUTUBE_PLAYER_CLIENTS")
@@ -222,12 +308,15 @@ def client_options(url: str) -> dict:
     options: dict = {"js_runtimes": {name: {} for name in JS_RUNTIMES}}
     if not is_youtube(url):
         return options
-    if force_ipv4():
-        options["source_address"] = "0.0.0.0"  # = --force-ipv4
-        # The PO token script (Node.js) makes its own requests; keep those on IPv4 as well.
-        node_options = os.environ.get("NODE_OPTIONS", "")
-        if "--dns-result-order" not in node_options:
-            os.environ["NODE_OPTIONS"] = (node_options + " --dns-result-order=ipv4first").strip()
+    family = current_family()
+    if family is not None and len(available_families()) > 1:
+        # Bind to the family in use, so a bot check is recorded against the right one.
+        options["source_address"] = "0.0.0.0" if family == "ipv4" else "::"  # = --force-ipv4 / --force-ipv6
+        # The PO token script (Node.js) makes its own requests; keep those on the same family.
+        flags = [item for item in os.environ.get("NODE_OPTIONS", "").split()
+                 if not item.startswith("--dns-result-order")]
+        flags.append(f"--dns-result-order={family}first")
+        os.environ["NODE_OPTIONS"] = " ".join(flags)
     extractor_args: dict = {}
     clients = player_clients()
     if clients:

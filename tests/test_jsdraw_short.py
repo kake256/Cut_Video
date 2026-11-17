@@ -122,3 +122,60 @@ def test_largest_component_ignores_small_specks():
     assert js._largest_component(mask) == (10, 5, 15, 10, 150)
     assert js._largest_component(np.zeros((4, 4), bool)) is None
 
+
+
+def test_fit_stand_in_places_person_like_the_face_camera():
+    import numpy as np
+    from PIL import Image
+
+    im = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
+    person = Image.new("RGBA", (400, 600), (200, 150, 120, 255))
+    im.paste(person, (500, 120))
+    face = js.fit_stand_in(im)
+    assert face.size == js.FACE_SIZE
+    alpha = np.asarray(face.split()[3]) > 127
+    ys, xs = np.nonzero(alpha)
+    px, py, pw, ph = js.FACE_PERSON_BOX
+    assert abs(ys.min() - py) <= 2  # 頭の上の余白は顔カメラと同じ
+    assert px - 2 <= xs.min() and xs.max() <= px + pw + 2  # 人物は枠の左右に収まる
+
+
+def _fake_stream(tmp_path):
+    src = tmp_path / "stream.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=gray:s=320x180:d=80",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=80", "-shortest", "-c:v", "libx264",
+                    "-c:a", "aac", str(src)], check=True)
+    return src
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg がない")
+def test_prepare_falls_back_to_stand_in_photo_then_to_no_window(tmp_path, monkeypatch):
+    from PIL import Image
+
+    src = _fake_stream(tmp_path)
+    monkeypatch.setattr(js.config, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(js, "_transcript", lambda *a, **k: [[10.0, 12.0, "テスト"]])
+
+    def no_streamer(*_args, **_kwargs):
+        raise js.JsDrawError("配信画面に配信者（顔カメラ）が見つかりませんでした。")
+
+    monkeypatch.setattr(js, "_prepare_live_face", no_streamer)
+    # 写真が無い：小窓なし
+    meta = js.prepare(str(src), 10.0, 70.0, tmp_path / "w1", lambda _m: None)
+    assert (meta["face_mode"], meta["nface"]) == ("none", 0)
+    assert "配信者" in meta["face_note"]
+    # 写真がある：写真1枚を小窓に
+    js.stand_in_dir().mkdir(parents=True)
+    person = Image.new("RGBA", (300, 400), (0, 0, 0, 0))
+    person.paste(Image.new("RGBA", (120, 300), (180, 140, 120, 255)), (90, 60))
+    person.save(js.stand_in_dir() / "a.png")
+    meta = js.prepare(str(src), 10.0, 70.0, tmp_path / "w2", lambda _m: None)
+    assert (meta["face_mode"], meta["nface"]) == ("stand_in", 1)
+    assert Image.open(tmp_path / "w2" / "face" / "00001.webp").size == js.FACE_SIZE
+    assert json.loads((tmp_path / "w2" / "meta.json").read_text(encoding="utf-8"))["face_mode"] == "stand_in"
+
+
+def test_rules_tell_the_ai_when_there_is_no_live_face():
+    assert "常に null" in js._rules(0, 60, face_mode="none")
+    assert "写真" in js._rules(0, 60, face_mode="stand_in")
+    assert "口の動きと声が合う" in js._rules(0, 60)

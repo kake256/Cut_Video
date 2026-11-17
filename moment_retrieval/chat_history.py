@@ -63,27 +63,33 @@ def fetch_youtube(url: str, *, log: Callable | None = None) -> list[list]:
 
     from . import youtube_block
 
+    from .downloader import process_cached_info
+
     youtube_block.check(url)
-    youtube_block.pace(url)
+    info = youtube_block.cached_info(url)  # the job usually looked the video up already
 
     with tempfile.TemporaryDirectory(prefix="cut_chat_") as tmp:
         options = {"quiet": True, "no_warnings": True, "noprogress": True, "skip_download": True, "noplaylist": True,
                    "writesubtitles": True, "subtitleslangs": ["live_chat"],
-                   "outtmpl": str(Path(tmp, "chat.%(ext)s")), "js_runtimes": {"deno": {}, "node": {}},
-                   **youtube_block.polite_options(url)}
+                   "outtmpl": str(Path(tmp, "chat.%(ext)s")), **youtube_block.request_options(url)}
         with YoutubeDL(options) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-            except Exception as exc:
-                blocked = youtube_block.note_failure(url, exc)
-                if blocked is not None:
-                    raise blocked from exc
-                raise
+            if info is None:
+                youtube_block.pace(url)
+                try:
+                    info = ydl.extract_info(url, download=False)
+                except Exception as exc:
+                    blocked = youtube_block.note_failure(url, exc)
+                    if blocked is not None:
+                        raise blocked from exc
+                    raise
+                youtube_block.note_success(url)
+                youtube_block.remember_info(url, info)
             if "live_chat" not in (info.get("subtitles") or {}):
                 raise ChatUnavailable("この動画にはチャットのリプレイがありません")
             if log:
                 log("YouTubeのチャットのリプレイを取得しています（長い配信では数分かかります）。")
-            ydl.process_info(info)
+            youtube_block.pace(url)  # the replay itself is fetched from YouTube page by page
+            process_cached_info(ydl, info)  # picks the live_chat track with these options and writes it
         files = list(Path(tmp).glob("*.live_chat.json"))
         if not files:
             raise ChatUnavailable("チャットのリプレイを取得できませんでした")

@@ -77,6 +77,23 @@ class DownloadCancelled(DownloadError):
     """cancel_event が立ったため中断した。"""
 
 
+def process_cached_info(ydl, info: dict, *, download: bool = True):
+    """Run ``ydl`` (format choice, sections, subtitles, download) on information fetched earlier.
+
+    The same as yt-dlp's ``--load-info-json``: nothing is asked of the site's
+    metadata API again, so one job's steps cost YouTube a single lookup.
+    """
+    import copy
+
+    # Like --load-info-json: a clean copy without the earlier run's chosen formats/files.
+    # (Copied first: yt-dlp adds keys to the dict it is given, and the cached one is shared.)
+    data = copy.deepcopy(info)
+    sanitize = getattr(ydl, "sanitize_info", None)
+    if callable(sanitize):
+        data = sanitize(data, True)
+    return ydl.process_ie_result(data, download=download)
+
+
 def audio_proxy_for(video_path: Path) -> list[Path]:
     """``<basename>.mp4`` に対応する音声だけのファイル (完成したものだけ)。"""
     video_path = Path(video_path)
@@ -134,16 +151,16 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
         if msg:
             msg_queue.put(msg)
 
-    # YouTube's EJS challenges need a JS runtime. yt-dlp enables only Deno
-    # by default; also allow a supported Node.js already installed on PATH.
-    # Runtime availability/version checks remain owned by yt-dlp.
-    runtime_options = {"js_runtimes": {"deno": {}, "node": {}}}
-    polite = youtube_block.polite_options(url)
-    info = youtube_block.cached_info(url)  # an earlier step of the same job may have asked already
+    # JS runtimes (Deno, else Node.js), player clients and, for YouTube, fewer
+    # retries / one connection: see youtube_block.client_options/polite_options.
+    request = youtube_block.request_options(url)
+    # An earlier step of the same job may have asked already; the download below
+    # reuses this information too, so its format URLs must stay valid for a while.
+    info = youtube_block.cached_info(url, min_valid_sec=youtube_block.DOWNLOAD_MIN_VALID_SEC)
     if info is None:
         youtube_block.pace(url)
         try:
-            with YoutubeDL({"noplaylist": True, "quiet": True, **runtime_options, **polite}) as ydl:
+            with YoutubeDL({"noplaylist": True, "quiet": True, **request}) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
             blocked = youtube_block.note_failure(url, e)
@@ -169,7 +186,6 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
             raise DownloadError("この動画には音声だけの形式がありません")
 
     ydl_opts = {
-        **runtime_options,
         **({"format": "bestaudio/Audio_Only"} if audio_only
            else {"format": "bestvideo+bestaudio/best", "merge_output_format": "mp4"}),
         "outtmpl": str(save_dir / (f"{basename}{AUDIO_SUFFIX}.%(ext)s" if audio_only else f"{basename}.%(ext)s")),
@@ -179,7 +195,7 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
         # once is much faster than one by one.
         "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
         "progress_hooks": [_hook],
-        **polite,  # YouTube: one connection, fewer retries with waits in between
+        **request,  # YouTube: one connection, fewer retries with waits in between
     }
 
     title = info.get("title", basename)
@@ -200,9 +216,13 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
     def _worker():
         try:
             youtube_block.check(url)
-            youtube_block.pace(url)
+            reuse = youtube_block.cached_info(url, min_valid_sec=youtube_block.DOWNLOAD_MIN_VALID_SEC)
             with YoutubeDL(ydl_opts) as ydl:
-                result["info"] = ydl.extract_info(url, download=True)
+                if reuse is not None:  # YouTube: download from the information above, no second metadata request
+                    result["info"] = process_cached_info(ydl, reuse)
+                else:
+                    youtube_block.pace(url)
+                    result["info"] = ydl.extract_info(url, download=True)
         except Exception as e:
             result["error"] = e
 
@@ -260,7 +280,7 @@ def download_video(url: str, save_dir: Path = Path("video"), *, audio_only: bool
 
 # 区間ダウンロードの同時実行数。YouTubeは1接続あたり1〜2MB/sに絞られるため並行で取る
 # （実測: 2分の区間4本を並行で91秒、1本ずつなら約80秒/本）。
-# ただしYouTubeには過剰に問い合わせないよう、常に1本ずつ取る（youtube_block.pace で間隔も空ける）。
+# ただしYouTubeには過剰に問い合わせないよう、常に1本ずつ取り、動画情報は1回だけ問い合わせて使い回す。
 SECTION_WORKERS = 4
 
 
@@ -297,6 +317,11 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
     from . import youtube_block
 
     youtube_block.check(url)
+    if (youtube_block.is_youtube(url) and youtube_block.current_family() == "ipv4"
+            and "ipv6" in youtube_block.available_families()):
+        # Sections are cut by ffmpeg, which cannot be kept on IPv4; the format URLs are bound to
+        # the IPv4 address, so ffmpeg over IPv6 gets 403.  The caller waits for the full video instead.
+        raise DownloadError("IPv4だけで通信する設定のため、区間だけの取得はしません")
     try:
         from yt_dlp import YoutubeDL
         from yt_dlp.utils import download_range_func
@@ -310,23 +335,43 @@ def download_sections(url: str, ranges: list, save_dir: Path, *, workers: int = 
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled("ダウンロードを中断しました")
 
+    # YouTube: look the video up once (or reuse the job's earlier lookup) and cut
+    # every section from that, instead of one metadata request per section.
+    info = None
+    if youtube_block.is_youtube(url):
+        info = youtube_block.cached_info(url, min_valid_sec=youtube_block.DOWNLOAD_MIN_VALID_SEC)
+        if info is None:
+            youtube_block.pace(url)
+            try:
+                with YoutubeDL({"noplaylist": True, "quiet": True, **youtube_block.request_options(url)}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                blocked = youtube_block.note_failure(url, e)
+                if blocked is not None:
+                    raise blocked from e
+                raise DownloadError(f"動画情報の取得に失敗しました: {e}") from e
+            youtube_block.note_success(url)
+            youtube_block.remember_info(url, info)
+
     def _one(item):
         index, (start, end) = item
         youtube_block.check(url)  # another section may have just been refused
-        youtube_block.pace(url)
         target = save_dir / f"section_{index:02d}.mp4"
         options = {
-            "js_runtimes": {"deno": {}, "node": {}},
             "format": "bestvideo+bestaudio/best", "merge_output_format": "mp4",
             "download_ranges": download_range_func(None, [(float(start), float(end))]),
             "outtmpl": str(save_dir / f"section_{index:02d}.%(ext)s"),
             "noplaylist": True, "quiet": True, "noprogress": True, "retries": 10,
             "progress_hooks": [_hook],
-            **youtube_block.polite_options(url),
+            **youtube_block.request_options(url),
         }
         try:
             with YoutubeDL(options) as ydl:
-                ydl.download([url])
+                if info is not None:
+                    process_cached_info(ydl, info)
+                else:
+                    youtube_block.pace(url)
+                    ydl.download([url])
         except Exception as e:
             if cancel_event is not None and cancel_event.is_set():
                 raise DownloadCancelled("ダウンロードを中断しました") from e

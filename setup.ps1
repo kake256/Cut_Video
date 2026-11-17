@@ -97,6 +97,14 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue) -and -not (Get-Command
         Write-Host "  警告: Node.js がありません。YouTube の取得に失敗する場合は https://nodejs.org/ から入れてください。" -ForegroundColor Yellow
     }
 }
+# YouTube の PO トークン生成スクリプト (bgutil)。失敗しても YouTube 取得自体は動くので警告だけ。
+if ((Get-Command node -ErrorAction SilentlyContinue) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+    Write-Host "  YouTube の PO トークン生成スクリプトを準備中..."
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "scripts\setup_pot_provider.ps1")
+    if ($LASTEXITCODE -ne 0) { Write-Host "  警告: PO トークン生成スクリプトを準備できませんでした (scripts\setup_pot_provider.ps1)。" -ForegroundColor Yellow }
+} else {
+    Write-Host "  PO トークン生成スクリプトは Node.js と git を入れた後に scripts\setup_pot_provider.ps1 で準備できます。"
+}
 
 Write-Host ""
 & $python -c "import torch; print('torch:', torch.__version__, '/ CUDA:', torch.cuda.is_available())"

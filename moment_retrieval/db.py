@@ -9,7 +9,10 @@ from typing import Iterable, Optional
 
 from . import config
 
-SCHEMA_VERSION = 12
+# Raise this whenever _migrate_legacy_schema learns a new step: a database already at
+# this version skips migration.  13: highlight_candidates.metadata_json (added without a
+# bump, so libraries at 12 failed every proposal with "no column named metadata_json").
+SCHEMA_VERSION = 13
 PUBLIC_ID_PREFIX = "vid_"
 
 _JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}

@@ -481,13 +481,13 @@ class AutoPipeline:
 
         youtube_block.check(job.source)  # refused recently: fail now without asking YouTube again
         self._log(job, "動画情報を取得しています。")
-        info = youtube_block.cached_info(job.source)
+        # Fresh enough for the downloads that follow, which reuse it instead of asking again.
+        info = youtube_block.cached_info(job.source, min_valid_sec=youtube_block.DOWNLOAD_MIN_VALID_SEC)
         if info is None:
             youtube_block.pace(job.source)
             try:
                 with YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True,
-                                "js_runtimes": {"deno": {}, "node": {}},
-                                **youtube_block.polite_options(job.source)}) as ydl:
+                                **youtube_block.request_options(job.source)}) as ydl:
                     info = ydl.extract_info(job.source, download=False)
             except Exception as exc:
                 blocked = youtube_block.note_failure(job.source, exc)

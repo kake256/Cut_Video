@@ -101,8 +101,15 @@ def _metadata_options() -> dict:
         "socket_timeout": _TIMEOUT_SEC,
         "retries": 0,
         "extractor_retries": 0,
-        "js_runtimes": {"deno": {}, "node": {}},
+        # JS runtimes and player clients shared with the rest of CUT (any watch URL is the same here).
+        **_client_options(),
     }
+
+
+def _client_options() -> dict:
+    from . import youtube_block
+
+    return youtube_block.client_options("https://www.youtube.com/")
 
 
 class _NoopLogger:

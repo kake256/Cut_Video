@@ -103,7 +103,10 @@ def fetch_missing(names: list[str], *, extract=None) -> int:
         from yt_dlp import YoutubeDL
 
         def extract(url):
-            options = {"quiet": True, "skip_download": True, "no_warnings": True, "logger": _QuietLogger()}
+            from . import youtube_block
+
+            options = {"quiet": True, "skip_download": True, "no_warnings": True, "logger": _QuietLogger(),
+                       **youtube_block.request_options(url)}
             with YoutubeDL(options) as ydl:
                 return ydl.extract_info(url, download=False, process=False)
     from . import youtube_block

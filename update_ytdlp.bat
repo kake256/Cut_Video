@@ -10,7 +10,7 @@ if not exist "%~dp0venv\Scripts\python.exe" (
 )
 
 echo Updating yt-dlp and its required dependencies...
-"%~dp0venv\Scripts\python.exe" -m pip install --upgrade "yt-dlp[default]>=2026.8.19"
+"%~dp0venv\Scripts\python.exe" -m pip install --upgrade "yt-dlp[default]>=2026.8.19" "bgutil-ytdlp-pot-provider>=2.0.2,<3"
 set "UPDATE_EXIT=%ERRORLEVEL%"
 
 if not "%UPDATE_EXIT%"=="0" (
@@ -28,6 +28,10 @@ if not "%VERSION_EXIT%"=="0" (
     pause
     exit /b %VERSION_EXIT%
 )
+
+rem The PO token script must match the plugin version; rebuild it when needed (warn only).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup_pot_provider.ps1"
+if not "%ERRORLEVEL%"=="0" echo [WARN] PO token script was not rebuilt. YouTube may still work without it.
 
 echo.
 echo [INFO] Update complete. Restart CUT before downloading a URL.

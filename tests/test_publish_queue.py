@@ -60,6 +60,44 @@ class PublishQueueTest(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual([item["not_before"] for item in added], [NOW, NOW + 3 * HOUR, NOW + 6 * HOUR])
 
+    def test_enqueue_keeps_to_publish_hours_and_rolls_over_to_the_next_day(self):
+        from datetime import datetime
+        clips = self.clips + [_uploaded(self.root, name) for name in ("d", "e")]
+        start = datetime(2026, 11, 18, 10, 30).timestamp()  # local time, inside 9-11
+        added, _ = publish_queue.enqueue(self._paths("a", "b", "c", "d", "e"), interval_hours=1, now=start,
+                                         clips=clips, publish_hours=publish_queue.parse_hours("9-11"))
+        self.assertEqual([datetime.fromtimestamp(item["not_before"]) for item in added], [
+            datetime(2026, 11, 18, 10, 30), datetime(2026, 11, 18, 11, 30),
+            datetime(2026, 11, 19, 9, 0), datetime(2026, 11, 19, 10, 0), datetime(2026, 11, 19, 11, 0)])
+        self.assertEqual(added[0]["publish_hours"], [9, 10, 11])
+
+    def test_enqueue_outside_publish_hours_waits_for_the_window(self):
+        from datetime import datetime
+        evening = datetime(2026, 11, 18, 20, 15).timestamp()
+        added, _ = publish_queue.enqueue(self._paths("a"), now=evening, clips=self.clips,
+                                         publish_hours=(9, 10, 11, 12))
+        self.assertEqual(datetime.fromtimestamp(added[0]["not_before"]), datetime(2026, 11, 19, 9, 0))
+
+    def test_respace_keeps_an_items_publish_hours(self):
+        from datetime import datetime
+        morning = datetime(2026, 11, 18, 9, 0).timestamp()
+        publish_queue.enqueue(self._paths("a", "b"), now=morning, clips=self.clips, publish_hours=(9,))
+        items = publish_queue.load_queue()
+        publish_queue._respace(items, datetime(2026, 11, 18, 9, 30).timestamp())
+        self.assertEqual([datetime.fromtimestamp(item["not_before"]) for item in items],
+                         [datetime(2026, 11, 18, 9, 30), datetime(2026, 11, 19, 9, 0)])
+
+    def test_parse_hours(self):
+        self.assertEqual(publish_queue.parse_hours("9-12"), (9, 10, 11, 12))
+        self.assertEqual(publish_queue.parse_hours("９〜１１, 21"), (9, 10, 11, 21))
+        self.assertEqual(publish_queue.parse_hours("22-1"), (0, 1, 22, 23))
+        self.assertEqual(publish_queue.parse_hours(""), ())
+        self.assertEqual(publish_queue.parse_hours("0-23"), ())
+        for bad in ("9-25", "朝", "9-10-11"):
+            with self.assertRaises(ValueError):
+                publish_queue.parse_hours(bad)
+        self.assertEqual(publish_queue.hours_label((9, 10, 11, 12, 21)), "9〜12時台・21時台")
+
     def test_js_drawn_clip_keeps_its_youtube_title_and_is_marked_for_the_app(self):
         from dataclasses import replace
         clips = [replace(self.clips[0], jsdraw=True)] + self.clips[1:]

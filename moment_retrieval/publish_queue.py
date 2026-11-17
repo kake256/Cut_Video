@@ -6,6 +6,8 @@ publishes them one by one, at least ``interval_hours`` apart:
 
 * The first one is due now (or ``interval_hours`` after the last one published or
   still waiting), each next one ``interval_hours`` later.
+* With publish hours (the app's default is 9–12), a time outside them moves to the
+  start of the next allowed hour, so a long queue fills those hours day after day.
 * Every item whose time is more than ``MIN_LEAD_SEC`` away is registered on YouTube as
   a publish time (private + ``status.publishAt``, see ``schedule_waiting``), so YouTube
   publishes it even while this app or the PC is off.  Such items are "scheduled".
@@ -22,11 +24,16 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from datetime import datetime, timedelta
+from typing import Callable, Iterable
 
 from . import config, made_clips, youtube_upload
 
 DEFAULT_INTERVAL_HOURS = 1.0
+# Hours of the day (PC local time) a clip may go public, as typed in the app.  Clips
+# published one at a time at 9–12 got hundreds to thousands of views, the rest of the
+# day mostly under 20 (scripts/report_publish_hours.py, Nov 2026).
+DEFAULT_PUBLISH_HOURS = "9-12"
 WORKER_POLL_SEC = 60
 # A publish time closer than this is published by the app right away instead of scheduled.
 MIN_LEAD_SEC = 10 * 60
@@ -65,6 +72,58 @@ def _save_queue(items: list[dict]) -> None:
     os.replace(temporary, target)
 
 
+def parse_hours(text: str | None) -> tuple[int, ...]:
+    """Start hours a clip may go public at, from "9-12", "9,10,21-23" or "22-1" (wraps).
+
+    Ranges include both ends.  Empty (or every hour) means no limit: ().
+    Raises ValueError for anything else."""
+    text = (text or "").translate(str.maketrans("０１２３４５６７８９ー〜～、，", "0123456789---,,")).strip()
+    hours: set[int] = set()
+    for part in filter(None, (part.strip() for part in text.replace(" ", "").split(","))):
+        ends = part.split("-")
+        if len(ends) > 2 or not all(end.isdigit() for end in ends):
+            raise ValueError(part)
+        first, last = int(ends[0]), int(ends[-1])
+        if not (0 <= first <= 23 and 0 <= last <= 23):
+            raise ValueError(part)
+        hour = first
+        hours.add(hour)
+        while hour != last:
+            hour = (hour + 1) % 24
+            hours.add(hour)
+    return () if len(hours) in (0, 24) else tuple(sorted(hours))
+
+
+def hours_label(hours: Iterable[int]) -> str:
+    """ "9〜12時台" style text for (9, 10, 11, 12); "" when unlimited."""
+    hours = sorted(set(hours))
+    if not hours:
+        return ""
+    runs: list[list[int]] = []
+    for hour in hours:
+        if runs and hour == runs[-1][-1] + 1:
+            runs[-1].append(hour)
+        else:
+            runs.append([hour])
+    return "・".join(f"{run[0]}時台" if len(run) == 1 else f"{run[0]}〜{run[-1]}時台" for run in runs)
+
+
+def fit_hours(at: float, hours: Iterable[int] | None) -> float:
+    """``at`` if its hour is allowed, else the start of the next allowed hour (local time)."""
+    allowed = set(hours or ())
+    if not allowed:
+        return at
+    moment = datetime.fromtimestamp(at)
+    if moment.hour in allowed:
+        return at
+    start = moment.replace(minute=0, second=0, microsecond=0)
+    for step in range(1, 25):
+        candidate = start + timedelta(hours=step)
+        if candidate.hour in allowed:
+            return candidate.timestamp()
+    return at
+
+
 def _last_published(items: list[dict]) -> float | None:
     times = [float(item["finished_at"]) for item in items if item.get("state") == "done" and item.get("finished_at")]
     return max(times) if times else None
@@ -86,14 +145,19 @@ def _respace(items: list[dict], now: float) -> None:
         slot = max(float(item["not_before"]), now)
         if previous is not None:
             slot = max(slot, previous + gap)
+        slot = fit_hours(slot, item.get("publish_hours"))
         item["not_before"] = slot
         previous = slot
 
 
 def enqueue(paths, *, interval_hours: float = DEFAULT_INTERVAL_HOURS, now: float | None = None,
-            clips: list | None = None) -> tuple[list[dict], list[tuple[str, str]]]:
-    """Queue uploaded, not yet public clips; returns (added items, [(name, reason) skipped])."""
+            clips: list | None = None, publish_hours: Iterable[int] | None = None,
+            ) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Queue uploaded, not yet public clips; returns (added items, [(name, reason) skipped]).
+
+    With ``publish_hours`` a time outside those hours moves to the start of the next one."""
     now = time.time() if now is None else now
+    publish_hours = sorted(set(publish_hours or ()))
     interval_hours = float(interval_hours) if interval_hours and float(interval_hours) > 0 else DEFAULT_INTERVAL_HOURS
     by_key = {_key(clip.path): clip for clip in (made_clips.list_clips() if clips is None else clips)}
     added, skipped = [], []
@@ -104,7 +168,7 @@ def enqueue(paths, *, interval_hours: float = DEFAULT_INTERVAL_HOURS, now: float
         last = _last_published(items)
         if last is not None:
             slots.append(last)
-        slot = max([now] + [at + interval_hours * 3600 for at in slots])
+        slot = fit_hours(max([now] + [at + interval_hours * 3600 for at in slots]), publish_hours)
         for path in paths or []:
             if not path:
                 continue
@@ -130,10 +194,12 @@ def enqueue(paths, *, interval_hours: float = DEFAULT_INTERVAL_HOURS, now: float
                     "state": "queued", "not_before": slot, "interval_hours": interval_hours,
                     "previous_privacy": str(clip.receipt.get("privacy_status") or "private"),
                     "queued_at": now, "message": ""}
+            if publish_hours:
+                item["publish_hours"] = publish_hours
             items.append(item)
             added.append(item)
             taken.add(key)
-            slot += interval_hours * 3600
+            slot = fit_hours(slot + interval_hours * 3600, publish_hours)
         if added:
             _save_queue(items)
     if added:

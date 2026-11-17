@@ -82,6 +82,12 @@ class Length:
     def longer(self) -> bool:
         return self.video_max > VIDEO_MAX_SEC + 1e-6
 FACE_CROP = (440, 320, 1480, 760)  # w, h, x, y（1920x1080 の配信画面の右下の顔カメラ）
+# FACE（顔カメラの画像）はいつもこの大きさ。描画コードは人物が (140, 80)〜(440, 320) にいる前提で切り取って使う。
+FACE_SIZE = (440, 320)
+FACE_PERSON_BOX = (140, 80, 300, 240)  # x, y, w, h：FACE の中で人物（頭から下）を置く枠
+# 素材の作り方を変えたら上げる。古い作り方の素材（顔カメラの位置が決め打ちだった頃）は使い回さない。
+MATERIAL_REV = 2
+FACE_MIN_COVERAGE = 0.02  # 背景抜きのあとで人物が占める割合がこれ未満なら、顔が映っていないとみなす
 RVM_URL = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx"
 REFERENCE_HTML = Path(__file__).resolve().parent / "jsdraw_reference.html"
 
@@ -121,8 +127,125 @@ def _rvm_model() -> Path:
     return path
 
 
-def _matte_faces(face_mp4: Path, out_dir: Path, size: tuple[int, int], progress: Progress) -> int:
-    """顔カメラの背景を抜き、1コマずつ RGBA の webp にする（00001.webp から）。"""
+def _probe_size(video_path: str) -> tuple[int, int]:
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                        "-of", "csv=p=0:s=x", str(video_path)], capture_output=True, text=True)
+    try:
+        w, h = r.stdout.strip().splitlines()[0].split("x")[:2]
+        return int(w), int(h)
+    except (IndexError, ValueError):
+        raise JsDrawError("元動画の解像度を読めませんでした: " + (r.stderr.strip()[-200:] or str(video_path)))
+
+
+def _largest_component(mask: np.ndarray) -> tuple[int, int, int, int, int] | None:
+    """mask（True の画素）の一番大きいかたまりの (x, y, w, h, 画素数)。"""
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best = None
+    for y0, x0 in zip(*np.nonzero(mask)):
+        if seen[y0, x0]:
+            continue
+        stack = [(y0, x0)]
+        seen[y0, x0] = True
+        xs, ys = [], []
+        while stack:
+            y, x = stack.pop()
+            xs.append(x)
+            ys.append(y)
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if best is None or len(xs) > best[4]:
+            best = (min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1, len(xs))
+    return best
+
+
+def crop_around_person(person: tuple[float, float, float, float], frame: tuple[int, int]) -> tuple[int, int, int, int]:
+    """人物の枠（元動画の画素、x, y, w, h）から、FACE_SIZE と同じ縦横比の切り出し枠 (w, h, x, y) を決める。
+
+    人物が FACE の FACE_PERSON_BOX に収まるように拡大率と位置を決め、画面の外へ出るときは内側へずらす。
+    """
+    fw, fh = FACE_SIZE
+    px, py, pw, ph = FACE_PERSON_BOX
+    bx, by, bw, bh = person
+    W, H = frame
+    scale = max(bw / pw, bh / ph)
+    scale = min(scale, W / fw, H / fh)
+    cw, ch = fw * scale, fh * scale
+    x = bx + bw / 2 - (px + pw / 2) * scale  # 人物の左右の中心を枠の中心に合わせる
+    y = by - py * scale                      # 頭の上に FACE_PERSON_BOX と同じ余白
+    x = min(max(x, 0.0), W - cw)
+    y = min(max(y, 0.0), H - ch)
+    cw, ch = int(cw) // 2 * 2, int(ch) // 2 * 2
+    return cw, ch, int(round(x)), int(round(y))
+
+
+def _rvm_alpha(sess, rgb: np.ndarray, ratio: float, repeat: int = 3) -> np.ndarray:
+    """1枚の画像の人物のアルファ（0〜1）。同じ画像を数回通して、前のコマの記憶（rec）を落ち着かせる。"""
+    rec = [np.zeros([1, 1, 1, 1], np.float32)] * 4
+    src = (rgb.astype(np.float32) / 255).transpose(2, 0, 1)[None]
+    pha = None
+    for _ in range(repeat):
+        _fgr, pha, *rec = sess.run(None, {"src": src, "r1i": rec[0], "r2i": rec[1], "r3i": rec[2], "r4i": rec[3],
+                                          "downsample_ratio": np.array([ratio], np.float32)})
+    return pha[0, 0]
+
+
+def find_face_crop(video_path: str, seek: float, dur: float, progress: Progress, samples: int = 10) -> tuple[int, int, int, int]:
+    """配信画面のどこに配信者（顔カメラ）が映っているかを探し、切り出し枠 (w, h, x, y) を返す。
+
+    区間から samples 枚のコマを取り、背景抜き（RVM）で人物らしさを出して平均する。
+    顔カメラは動かないので平均が高く残り、ゲーム画面のキャラクターなど動くものは薄まる。
+    1920x1080 で右下の決め打ちの枠に人がいれば、これまでどおり FACE_CROP を使う。
+    人が見つからなければ JsDrawError（自動作成では通常の仕上げに戻る）。
+    """
+    import onnxruntime as ort
+
+    W, H = _probe_size(video_path)
+    long_side = 768
+    sw = max(2, int(round(W * min(1.0, long_side / max(W, H)) / 2)) * 2)
+    sh = max(2, int(round(H * min(1.0, long_side / max(W, H)) / 2)) * 2)
+    sess = ort.InferenceSession(str(_rvm_model()), providers=["CPUExecutionProvider"])
+    progress("配信画面のどこに配信者が映っているかを探しています")
+    total, n = np.zeros((sh, sw), np.float32), 0
+    for k in range(samples):
+        t = seek + dur * (k + 0.5) / samples
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", str(video_path), "-frames:v", "1",
+                            "-vf", f"scale={sw}:{sh}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
+        if len(r.stdout) < sw * sh * 3:
+            continue
+        rgb = np.frombuffer(r.stdout[: sw * sh * 3], np.uint8).reshape(sh, sw, 3)
+        total += _rvm_alpha(sess, rgb, 0.5)
+        n += 1
+    if not n:
+        raise JsDrawError("配信画面のコマを読めませんでした。")
+    mask = total / n > 0.5
+    fx, fy = sw / W, sh / H
+    # かたまりを探すのは 1/4 に縮めた格子で（速さのため）
+    step = 4
+    small = mask[: sh // step * step, : sw // step * step].reshape(sh // step, step, sw // step, step).mean((1, 3)) > 0.5
+    best = _largest_component(small)
+    if best is None or best[4] * step * step < 0.005 * sw * sh:
+        raise JsDrawError("配信画面に配信者（顔カメラ）が見つかりませんでした。")
+    bx, by, bw, bh, _area = best
+    person = (bx * step / fx, by * step / fy, bw * step / fx, bh * step / fy)
+    if (W, H) == (1920, 1080):
+        # 人物の大半が決め打ちの枠（右下）に入っていれば、これまでと同じ切り出しにする
+        w, h, x, y = FACE_CROP
+        px, py, pw, ph = person
+        inter = max(0.0, min(px + pw, x + w) - max(px, x)) * max(0.0, min(py + ph, y + h) - max(py, y))
+        if inter >= 0.6 * pw * ph:
+            return FACE_CROP
+    crop = crop_around_person(person, (W, H))
+    progress(f"配信者の位置：{W}x{H} の画面の x={crop[2]}, y={crop[3]}（幅{crop[0]}）")
+    return crop
+
+
+def _matte_faces(face_mp4: Path, out_dir: Path, size: tuple[int, int], progress: Progress) -> tuple[int, float]:
+    """顔カメラの背景を抜き、1コマずつ RGBA の webp にする（00001.webp から）。
+
+    戻り値は (コマ数, 人物が占める割合の平均)。割合は1秒に1コマ見て、アルファが半分を超える画素の割合。"""
     import onnxruntime as ort
     from PIL import Image
 
@@ -134,6 +257,7 @@ def _matte_faces(face_mp4: Path, out_dir: Path, size: tuple[int, int], progress:
                             stdout=subprocess.PIPE)
     out_dir.mkdir(parents=True, exist_ok=True)
     n = 0
+    coverage = []
     try:
         while True:
             buf = proc.stdout.read(w * h * 3)
@@ -144,6 +268,8 @@ def _matte_faces(face_mp4: Path, out_dir: Path, size: tuple[int, int], progress:
             _fgr, pha, *rec = sess.run(None, {"src": src, "r1i": rec[0], "r2i": rec[1], "r3i": rec[2],
                                               "r4i": rec[3], "downsample_ratio": ratio})
             alpha = (pha[0, 0] * 255).clip(0, 255).astype(np.uint8)
+            if n % FPS == 0:
+                coverage.append(float((alpha > 127).mean()))
             n += 1
             Image.fromarray(np.dstack([frame, alpha]), "RGBA").save(out_dir / f"{n:05d}.webp", quality=88)
             if n % 300 == 0:
@@ -151,7 +277,7 @@ def _matte_faces(face_mp4: Path, out_dir: Path, size: tuple[int, int], progress:
     finally:
         proc.stdout.close()
         proc.wait()
-    return n
+    return n, (sum(coverage) / len(coverage) if coverage else 0.0)
 
 
 def _transcript(video_path: str, start: float, end: float, video_id: str = "") -> list[list]:
@@ -169,11 +295,13 @@ def _transcript(video_path: str, start: float, end: float, video_id: str = "") -
 
 
 def prepare(video_path: str, start: float, end: float, workdir: Path, progress: Progress,
-            crop: tuple[int, int, int, int] = FACE_CROP, *, video_id: str = "", media_offset: float = 0.0) -> dict:
+            crop: tuple[int, int, int, int] | None = None, *, video_id: str = "", media_offset: float = 0.0) -> dict:
     """区間 [start, end]（元配信の秒）の素材を workdir に用意する。
 
     ``video_path`` が元配信の一部分だけのファイルのときは、その 0 秒が元配信の ``media_offset`` 秒。
     文字起こしは ``video_id``（ライブラリの動画）から読む。
+    ``crop``（w, h, x, y）を省くと、配信画面から配信者の位置を探して決める（find_face_crop）。
+    顔カメラはいつも FACE_SIZE に揃える。背景を抜いても人がほとんど残らなければ JsDrawError。
     """
     if end - start < 50:
         raise JsDrawError("区間は50秒以上にしてください（その中から約55秒に詰めます）。")
@@ -182,15 +310,18 @@ def prepare(video_path: str, start: float, end: float, workdir: Path, progress: 
     workdir.mkdir(parents=True, exist_ok=True)
     off = max(0.0, start - 8.0)
     dur = end - off + 8.0
-    w, h, x, y = crop
     transcript = _transcript(video_path, start, end, video_id)
     seek = max(0.0, off - media_offset)
+    if crop is None:
+        crop = find_face_crop(video_path, seek, dur, progress)
+    w, h, x, y = crop
+    fw, fh = FACE_SIZE
     (workdir / "transcript.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
     progress("音声と顔カメラを切り出しています")
     _ffmpeg("-ss", f"{seek:.3f}", "-t", f"{dur:.3f}", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "48000",
             str(workdir / "src.wav"))
     _ffmpeg("-ss", f"{seek:.3f}", "-t", f"{dur:.3f}", "-i", str(video_path), "-an",
-            "-vf", f"crop={w}:{h}:{x}:{y},fps={FPS}", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
+            "-vf", f"crop={w}:{h}:{x}:{y},scale={fw}:{fh}:flags=lanczos,fps={FPS}", "-c:v", "libx264", "-crf", "12", "-preset", "fast",
             str(workdir / "face.mp4"))
     thumbs = workdir / "thumbs"
     thumbs.mkdir(exist_ok=True)
@@ -206,8 +337,13 @@ def prepare(video_path: str, start: float, end: float, workdir: Path, progress: 
     n = len(pcm) // hop
     env = 20 * np.log10(np.sqrt((pcm[: n * hop].reshape(n, hop) ** 2).mean(1)) + 1)
     (workdir / "env.json").write_text(json.dumps([round(float(v), 1) for v in env]), encoding="utf-8")
-    nface = _matte_faces(workdir / "face.mp4", workdir / "face", (w, h), progress)
-    meta = {"video": str(video_path), "start": start, "end": end, "off": off, "nface": nface, "crop": crop}
+    face_dir = workdir / "face"
+    shutil.rmtree(face_dir, ignore_errors=True)  # 古い作り方のコマが残らないように
+    nface, coverage = _matte_faces(workdir / "face.mp4", face_dir, (fw, fh), progress)
+    if coverage < FACE_MIN_COVERAGE:
+        raise JsDrawError(f"切り出した顔カメラに配信者が映っていません（人物の割合 {coverage:.1%}）。")
+    meta = {"video": str(video_path), "start": start, "end": end, "off": off, "nface": nface, "crop": list(crop),
+            "face_coverage": round(coverage, 4), "rev": MATERIAL_REV}
     (workdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     return meta
 
@@ -646,7 +782,8 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     out_dir = Path(out_dir or Path("exports") / "jsdraw")
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = work / "meta.json"
-    if meta_path.is_file() and json.loads(meta_path.read_text(encoding="utf-8")).get("nface"):
+    cached = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    if cached.get("nface") and cached.get("rev") == MATERIAL_REV:
         progress("素材は用意済みのものを使います")
     else:
         prepare(video_path, start, end, work, progress, video_id=video_id, media_offset=media_offset)

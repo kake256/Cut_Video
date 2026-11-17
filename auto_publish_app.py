@@ -1324,11 +1324,24 @@ def upload_clips(paths, privacy: str):
         gr.Info(f"{done}本をアップロードしました。")
 
 
-def publish_clips_from_ui(paths, interval_hours=None):
+def saved_publish_hours() -> str:
+    """The publish hours typed last time ("" = all day), or the default."""
+    from moment_retrieval import publish_queue
+
+    try:
+        saved = json.loads(_ui_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    text = saved.get("publish_hours") if isinstance(saved, dict) else None
+    return text if isinstance(text, str) else publish_queue.DEFAULT_PUBLISH_HOURS
+
+
+def publish_clips_from_ui(paths, interval_hours=None, publish_hours_text=None):
     """Schedule the checked clips on YouTube to go public one at a time, ``interval_hours`` apart.
 
-    The first one is published by the app right away; the rest get a YouTube publish time
-    (private until then), so they go public even while the app or the PC is off."""
+    Times outside ``publish_hours_text`` (e.g. "9-12") move to the next allowed hour.  A clip
+    due right away is published by the app; the rest get a YouTube publish time (private
+    until then), so they go public even while the app or the PC is off."""
     from moment_retrieval import publish_queue
 
     picked = [str(item) for item in (paths or []) if item]
@@ -1339,13 +1352,21 @@ def publish_clips_from_ui(paths, interval_hours=None):
     except (TypeError, ValueError):
         hours = None
     hours = hours or publish_queue.DEFAULT_INTERVAL_HOURS
-    added, skipped = publish_queue.enqueue(picked, interval_hours=hours)
+    text = saved_publish_hours() if publish_hours_text is None else str(publish_hours_text)
+    try:
+        allowed = publish_queue.parse_hours(text)
+    except ValueError:
+        raise gr.Error("公開する時間帯は「9-12」や「9,10,21-23」のように時（0〜23）で入力してください。空欄なら一日中です。")
+    _write_ui_settings({"publish_hours": text.strip()})
+    added, skipped = publish_queue.enqueue(picked, interval_hours=hours, publish_hours=allowed)
     scheduled, kept = publish_queue.schedule_waiting(paths=[item["path"] for item in added]) if added else ([], [])
     lines = []
     if added:
         first = datetime.fromtimestamp(added[0]["not_before"])
-        lines.append(f"- {len(added)}本を公開待ちに入れました。{hours:g}時間おきに1本ずつ公開します"
-                     f"（最初は{first:%m/%d %H:%M}ごろ、全部終わるまで約{max(0, len(added) - 1) * hours:g}時間）。")
+        last = datetime.fromtimestamp(added[-1]["not_before"])
+        window = f"{publish_queue.hours_label(allowed)}だけに、" if allowed else ""
+        lines.append(f"- {len(added)}本を公開待ちに入れました。{window}{hours:g}時間おきに1本ずつ公開します"
+                     f"（最初は{first:%m/%d %H:%M}ごろ、最後は{last:%m/%d %H:%M}ごろ）。")
         if scheduled:
             lines.append(f"- {len(scheduled)}本はYouTubeに公開予約しました。予定時刻まで非公開になり、"
                          "アプリやPCを止めていても予定時刻に公開されます。")
@@ -1703,7 +1724,9 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
             publish_result_md = gr.Markdown("")
             with gr.Accordion("公開待ち（チェックした動画をYouTubeに公開予約し、1本ずつ間隔をあけて公開します）", open=True):
                 with gr.Row():
-                    publish_interval = gr.Number(value=1, minimum=0.1, label="公開の間隔（時間）", scale=1)
+                    publish_interval = gr.Number(value=0.5, minimum=0.1, label="公開の間隔（時間）", scale=1)
+                    publish_hours = gr.Textbox(value=saved_publish_hours, label="公開する時間帯（時）",
+                                               placeholder="例: 9-12（空欄なら一日中）", scale=1)
                     publish_queue_refresh_btn = gr.Button("公開待ちを更新", size="sm", scale=1)
                     publish_queue_move_btn = gr.Button("アプリの公開待ちをYouTubeの予約に移す", size="sm", scale=1)
                     publish_queue_cancel_btn = gr.Button("公開待ちを取り消す", size="sm", scale=1)
@@ -1780,13 +1803,13 @@ with gr.Blocks(title="CUT 自動投稿") as demo:
                                 publish_picked = gr.Button("チェックした動画を公開")
                                 publish_all = gr.Button("このジョブの全部を公開")
                             publish_picked.click(
-                                publish_clips_from_ui, inputs=[picked, publish_interval],
+                                publish_clips_from_ui, inputs=[picked, publish_interval, publish_hours],
                                 outputs=[publish_result_md, auto_uploads_sig],
                                 concurrency_id="youtube-publish", concurrency_limit=1,
                             ).then(publish_queue_markdown, outputs=[publish_queue_md])
                             publish_all.click(
                                 partial(publish_clips_from_ui, tuple(path for _title, path in private)),
-                                inputs=[publish_interval], outputs=[publish_result_md, auto_uploads_sig],
+                                inputs=[publish_interval, publish_hours], outputs=[publish_result_md, auto_uploads_sig],
                                 concurrency_id="youtube-publish", concurrency_limit=1,
                             ).then(publish_queue_markdown, outputs=[publish_queue_md])
 

@@ -280,6 +280,48 @@ def _matte_faces(face_mp4: Path, out_dir: Path, size: tuple[int, int], progress:
     return n, (sum(coverage) / len(coverage) if coverage else 0.0)
 
 
+# 文字起こしの1行の区切り方。音声認識の区間（15〜20秒の塊のことがある）のままだと、AI が字幕の時刻を
+# 文字数で比例配分するしかなく、話す速さが変わる所で数秒ずれる。単語の時刻で短い発話ごとに分けて渡す。
+LINE_GAP_SEC = 0.25    # 単語の間がこれ以上空いたら行を分ける（息継ぎ・間）
+LINE_MAX_CHARS = 16    # 1行の文字数の目安（字幕1枚が14文字前後）
+LINE_MAX_SEC = 3.5     # 1行の長さの上限
+
+
+def transcript_lines(rows, start: float, end: float) -> list[list]:
+    """文字起こしの行（start_sec, end_sec, text, words_json）を、単語の時刻で短い発話ごとの [開始, 終了, 本文] にする。
+
+    単語の時刻が無い行はそのまま1行にする。[start, end] にかからない発話は外す。
+    """
+    lines: list[list] = []
+
+    def add(a: float, b: float, text: str) -> None:
+        text = text.strip()
+        if text and b > start and a < end:
+            lines.append([round(a, 2), round(b, 2), text])
+
+    for row in rows:
+        try:
+            words = json.loads(row["words_json"] or "[]")
+        except (KeyError, IndexError, TypeError, ValueError):
+            words = []
+        words = [w for w in words if str(w.get("word", "")).strip() and w.get("end", 0) >= w.get("start", 0)]
+        if not words:
+            add(float(row["start_sec"]), float(row["end_sec"]), row["text"])
+            continue
+        cur: list[dict] = []
+        for w in words:
+            if cur:
+                text = "".join(x["word"] for x in cur).strip()
+                if (w["start"] - cur[-1]["end"] >= LINE_GAP_SEC or len(text) >= LINE_MAX_CHARS
+                        or w["end"] - cur[0]["start"] > LINE_MAX_SEC):
+                    add(cur[0]["start"], cur[-1]["end"], text)
+                    cur = []
+            cur.append(w)
+        if cur:
+            add(cur[0]["start"], cur[-1]["end"], "".join(x["word"] for x in cur))
+    return lines
+
+
 def _transcript(video_path: str, start: float, end: float, video_id: str = "") -> list[list]:
     conn = db.get_conn()
     try:
@@ -289,9 +331,10 @@ def _transcript(video_path: str, start: float, end: float, video_id: str = "") -
         rows = db.get_segments_in_range(conn, video["video_id"], start, end)
     finally:
         conn.close()
-    if not rows:
+    lines = transcript_lines(rows, start, end)
+    if not lines:
         raise JsDrawError("この区間に文字起こしがありません。")
-    return [[round(r["start_sec"], 2), round(r["end_sec"], 2), r["text"]] for r in rows]
+    return lines
 
 
 def stand_in_dir() -> Path:
@@ -457,7 +500,7 @@ def _rules(lo: float, hi: float, length: Length | None = None, face_mode: str = 
     return f"""## ハーネスとの約束（必ず守る）
 - `<canvas width="1080" height="1920">` を1つ置き、`window.SEGS` と `function draw(t, s, tEnd)` をグローバルに定義する。
 - `window.SEGS`：使う音声の区間（元配信の秒）のリスト。ハーネスが順につないで音声にする。{total}、区間は3〜{length.max_segs}個まで。
-  区間は{lo:.0f}〜{hi:.0f}秒の中から。切れ目は文字起こしの区間の境目（発話の切れ目）に合わせる。文の途中で切らない。
+  区間は{lo:.0f}〜{hi:.0f}秒の中から。切れ目は文字起こしの行の境目のうち、文が終わる所に合わせる。文の途中で切らない。
   ハーネスが切れ目を近くの無音へ最大0.6秒ずらすので、字幕は SEGS ではなく s（元配信の秒）で出し入れする。
 - `draw(t, s, tEnd)`：t=出力動画の秒、s=いま流れている音声の元配信の秒、tEnd=動画の長さ。毎フレーム全面を描き直す（t と s だけで決まる）。
 {FACE_RULES.get(face_mode, FACE_RULES['live'])}
@@ -474,7 +517,7 @@ def _spec(title: str, story: str, lo: float, hi: float, length: Length | None = 
 下に元配信の文字起こし（音声認識、元配信の秒）{FACE_ATTACHED.get(face_mode, '')}を付けます。
 
 {_rules(lo, hi, length, face_mode)}
-- 字幕：SUBS を自分で作る。文字起こしの区間の時刻に合わせ、長い区間は文字数の位置で比例配分。1枚14文字前後。音声認識の誤りは文脈で直してよい。
+- 字幕：SUBS を自分で作る。文字起こしの各行は短い発話で、時刻は音声から測ったもの（元配信の秒）。字幕1枚は1行か隣り合う数行をつないだもので、出す時刻は最初の行の開始、消す時刻は最後の行の終了をそのまま使う（行の中で2枚に分けるときだけ文字数で比例配分）。時刻を丸めたり前後にずらしたりしない。1枚14文字前後。音声認識の誤りは文脈で直してよい。
 
 ## 期待する絵
 参考に別の話で作った scene.html を付けます（絵柄と完成度の目安。場面をそのまま流用しない）。
@@ -883,6 +926,14 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     if cached.get("rev") == MATERIAL_REV and (cached.get("nface") or cached.get("face_mode") == "none"):
         progress("素材は用意済みのものを使います")
         meta = cached
+        # 文字起こしだけは読み直す（作り直しや区切り方の変更を反映する。DB を読むだけで軽い）
+        try:
+            lines = _transcript(video_path, start, end, video_id)
+        except JsDrawError:
+            if not (work / "transcript.json").is_file():
+                raise
+        else:
+            (work / "transcript.json").write_text(json.dumps(lines, ensure_ascii=False), encoding="utf-8")
     else:
         meta = prepare(video_path, start, end, work, progress, video_id=video_id, media_offset=media_offset)
     face_mode = meta.get("face_mode", "live")
@@ -894,8 +945,8 @@ def make_short(video_path: str, start: float, end: float, *, model: str = DEFAUL
     if REFERENCE_HTML.is_file():
         parts.append(("text", "## 参考 scene.html（別の話）\n```html\n" + REFERENCE_HTML.read_text(encoding="utf-8") + "\n```"))
     transcript = json.loads((work / "transcript.json").read_text(encoding="utf-8"))
-    parts += [("text", "## 文字起こし（[開始秒, 終了秒, 本文]）\n" + json.dumps(transcript, ensure_ascii=False)),
-              ]
+    parts += [("text", "## 文字起こし（[開始秒, 終了秒, 本文]。短い発話ごと）\n"
+                       + "\n".join(json.dumps(line, ensure_ascii=False) for line in transcript))]
     if face_mode == "live":
         parts.append(("text", "## 顔カメラ（元配信の秒）"))
         for p in sorted((work / "thumbs").glob("s*.jpg"), key=lambda p: int(p.stem[1:])):

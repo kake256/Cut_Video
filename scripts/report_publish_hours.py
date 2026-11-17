@@ -31,6 +31,8 @@ FEW = 5  # fewer clips than this in a slot: say it is too few to judge
 
 def singles(videos: list[dict], *, since: float, now: float) -> list[dict]:
     """Public Shorts published alone since ``since`` and at least a day ago, oldest first."""
+    # The uploads playlist can list one video twice; count each once.
+    videos = list({video["id"]: video for video in videos}.values())
     public = sorted((video for video in videos if video["privacy"] == "public"
                      and 0 < video["seconds"] <= channel_performance.MAX_SHORT_SEC),
                     key=lambda video: video["published_at"])
